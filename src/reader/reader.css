@@ -1,0 +1,506 @@
+/* Citecat 文档阅读器 —— 外壳样式（设计系统同源：蓝 #4e75df / 细边框 / 轻阴影）。
+   划词工具条 / 标注浮层 / 聊天窗样式来自共享的 FLOAT_UI_CSS（reader.js 注入）。 */
+
+:root {
+  color-scheme: light;
+  --indigo: #4e75df;
+  --indigo-soft: rgba(78, 117, 223, 0.10);
+  --border: rgba(0, 0, 0, 0.08);
+  --muted: #6b6b73;
+  --muted-soft: #92929b;
+  --bg: #fafafa;
+  --panel: #ffffff;
+  --text: #18181b;
+}
+
+* { box-sizing: border-box; }
+
+/* 关键：作者样式（display:flex 等）会覆盖 UA 的 [hidden]{display:none}，
+   导致隐藏元素仍然占位/显示（上传后空状态不消失、渲染区不可见）。
+   用 !important 强制兜底。 */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0; padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+}
+
+/* ---- 头部 ---- */
+.rd-head {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.rd-brand { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.rd-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.rd-file {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 8px;
+}
+.rd-filename {
+  font-size: 13px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rd-badge {
+  font-size: 10px; font-weight: 600;
+  color: #4267c4; background: var(--indigo-soft);
+  padding: 1px 8px; border-radius: 9999px; flex-shrink: 0;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.rd-meta { font-size: 11.5px; color: var(--muted); flex-shrink: 0; }
+.rd-actions { flex-shrink: 0; }
+.rd-btn {
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: transparent; color: var(--text);
+  font-size: 12.5px; font-weight: 500; font-family: inherit;
+  padding: 6px 16px; border-radius: 9999px; cursor: pointer;
+  transition: all 120ms;
+}
+.rd-btn:hover { border-color: rgba(78, 117, 223, 0.4); color: var(--indigo); background: var(--indigo-soft); }
+.rd-btn-primary {
+  background: var(--primary, #4e75df);
+  border-color: var(--primary, #4e75df);
+  color: #fff;
+}
+.rd-btn-primary:hover { color: #fff; background: #4267c4; border-color: #4267c4; }
+.rd-btn-primary:disabled { opacity: 0.6; cursor: default; }
+
+/* ---- 主体 ---- */
+.rd-body { height: calc(100% - 57px); position: relative; }
+
+.rd-empty {
+  height: 100%;
+  display: flex; align-items: center; justify-content: center;
+}
+.rd-drop {
+  width: min(520px, 86%);
+  border: 1.5px dashed rgba(0, 0, 0, 0.16);
+  border-radius: 18px;
+  padding: 56px 32px;
+  text-align: center;
+  color: var(--muted-soft);
+  transition: border-color 180ms, background 180ms;
+  cursor: pointer;
+}
+.rd-drop:hover, .rd-drop.dragover {
+  border-color: rgba(78, 117, 223, 0.55);
+  background: var(--indigo-soft);
+}
+.rd-drop svg { margin-bottom: 10px; }
+.rd-drop-title { font-size: 14.5px; font-weight: 600; color: var(--text); margin: 0 0 6px; }
+.rd-drop-sub { font-size: 12px; margin: 2px 0; }
+
+.rd-viewer {
+  height: 100%; overflow: auto;
+  padding: 24px 20px 60px;
+  display: flex; flex-direction: column; align-items: center;
+  /* 文档打开时聚焦模糊渐显（PDF/docx/xlsx 统一入场） */
+  animation: rdFocusIn 420ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+.rd-viewer:empty::after {
+  content: '加载中…';
+  color: var(--muted-soft); font-size: 13px;
+}
+
+@keyframes rdFocusIn {
+  from { opacity: 0; filter: blur(10px) saturate(1.25); }
+  to   { opacity: 1; filter: none; }
+}
+
+/* ---- 编辑模式容器（Univer / docx OOXML 手术引擎） ---- */
+.rd-editor-host {
+  height: 100%;
+  overflow: hidden;
+  background: var(--panel);
+  /* hidden 属性切换（进入/退出编辑模式）时重播入场动画 */
+  animation: rdFocusIn 320ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+/* docx 手术引擎渲染容器：host 是 overflow:hidden，滚动必须由本容器承担
+   （docx-preview 分页 section 撑高后靠这里滚动翻页），模型同只读 .rd-viewer */
+.rd-editor-host .docx-edit-render {
+  height: 100%;
+  overflow: auto;
+  background: #525659;
+}
+.rd-editor-host .univer-container,
+.rd-editor-host .tiptap {
+  height: 100%;
+}
+/* Tiptap 编辑区排版 */
+.rd-editor-host .tiptap {
+  overflow: auto;
+  padding: 28px 48px 80px;
+  max-width: 880px;
+  margin: 0 auto;
+  box-sizing: border-box;
+  outline: none;
+  line-height: 1.75;
+  font-size: 14.5px;
+}
+.rd-editor-host .tiptap h1 { font-size: 1.9em; margin: 0.8em 0 0.4em; }
+.rd-editor-host .tiptap h2 { font-size: 1.5em; margin: 0.8em 0 0.4em; }
+.rd-editor-host .tiptap h3 { font-size: 1.25em; margin: 0.8em 0 0.4em; }
+.rd-editor-host .tiptap p { margin: 0.5em 0; }
+.rd-editor-host .tiptap ul, .rd-editor-host .tiptap ol { padding-left: 1.6em; }
+.rd-editor-host .tiptap table {
+  border-collapse: collapse; width: 100%; margin: 0.8em 0;
+}
+.rd-editor-host .tiptap td, .rd-editor-host .tiptap th {
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  padding: 5px 10px; min-width: 60px; vertical-align: top;
+}
+.rd-editor-host .tiptap th { background: rgba(0, 0, 0, 0.04); font-weight: 600; }
+.rd-editor-host .tiptap img { max-width: 100%; }
+/* 深色模式适配 */
+
+html[data-theme="dark"] .rd-editor-host { background: #26262b; }
+html[data-theme="dark"] .rd-editor-host .tiptap td,
+html[data-theme="dark"] .rd-editor-host .tiptap th { border-color: rgba(255, 255, 255, 0.18); }
+html[data-theme="dark"] .rd-editor-host .tiptap th { background: rgba(255, 255, 255, 0.06); }
+
+
+/* ---- 自定义确认弹层（退出编辑未保存时） ---- */
+.rd-confirm-overlay {
+  position: fixed; inset: 0; z-index: 2147483647;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex; align-items: center; justify-content: center;
+}
+.rd-confirm {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  max-width: 320px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  animation: rdFocusIn 300ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+.rd-confirm-msg { font-size: 13.5px; line-height: 1.6; margin-bottom: 14px; }
+.rd-confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* ---- PDF 页 ---- */
+.pdf-page {
+  position: relative;
+  flex-shrink: 0; /* 关键：flex column 容器里默认 flex-shrink:1 会把页面压缩进
+                     可视高度（多页全部压扁叠加）—— 必须禁止收缩，让滚动接管 */
+  margin: 0 auto 18px;
+  background: #fff;
+  box-shadow: 0 2px 14px rgba(16, 24, 40, 0.10);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.pdf-page canvas { display: block; }
+.pdf-page .textLayer { position: absolute; inset: 0; }
+
+/* PDF 文本高亮（span 级，不动 textLayer 的绝对定位布局） */
+.textLayer span.citecat-pdf-hl { background: rgba(217, 119, 6, 0.30); border-radius: 2px; }
+.textLayer span.citecat-pdf-ul {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(78, 117, 223, 0.6);
+}
+
+/* ---- XLSX/CSV 表格 ---- */
+.sheet-wrap {
+  width: 100%; max-width: 1200px;
+  flex-shrink: 0; /* 同 .pdf-page：防 flex 压缩 */
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: auto;
+  padding: 4px;
+  animation: rdFocusIn 320ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+/* 切换 sheet 时 .sheet-table 重建：聚焦模糊渐显 */
+.sheet-wrap .sheet-table {
+  animation: rdFocusIn 280ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+/* 多 sheet 切换条 */
+.sheet-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+}
+.sheet-tab {
+  border: 1px solid var(--border);
+  background: transparent;
+  border-radius: 6px;
+  padding: 3px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+}
+.sheet-tab:hover { background: rgba(78, 117, 223, 0.08); }
+.sheet-tab.active {
+  background: var(--primary, #4e75df);
+  border-color: var(--primary, #4e75df);
+  color: #fff;
+}
+.sheet-wrap table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: nowrap;
+}
+.sheet-wrap th, .sheet-wrap td {
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  padding: 4px 12px;
+  text-align: left;
+}
+.sheet-wrap th {
+  background: #f4f4f5;
+  font-weight: 600;
+  position: sticky; top: 0;
+  z-index: 1;
+}
+.sheet-wrap tr:nth-child(even) td { background: rgba(0, 0, 0, 0.015); }
+.sheet-wrap td:empty::after { content: '·'; color: transparent; }
+
+/* ---- DOCX ---- */
+.docx-wrap {
+  width: 100%; max-width: 840px;
+  flex-shrink: 0; /* 同 .pdf-page：防 flex 压缩 */
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 2px 14px rgba(16, 24, 40, 0.10);
+  padding: 36px 48px 48px;
+  line-height: 1.7;
+  animation: rdFocusIn 320ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+.docx-wrap p { margin: 0.4em 0; }
+.docx-wrap img { max-width: 100%; }
+/* docx-preview 自带 .docx-wrapper { background: gray; padding: 30px }
+   会包一层灰色背景块 —— 覆盖为透明，由外层 .docx-wrap 承担纸面效果 */
+.docx-wrap .docx-wrapper { background: transparent !important; padding: 0 !important; }
+
+.doc-text-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 15px;
+  font-family: "Times New Roman", "SimSun", "Songti SC", serif;
+}
+
+/* ---- 状态条 ---- */
+.rd-status {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  background: #18181b; color: #fafafa;
+  font-size: 12px; padding: 7px 16px; border-radius: 9999px;
+  z-index: 2147483646;
+  box-shadow: 0 8px 28px rgba(16, 24, 40, 0.18);
+}
+
+/* ---- 全局拖拽提示层（把文件拖到窗口任意位置都能上传） ---- */
+.rd-drag-overlay {
+  position: fixed; inset: 0; z-index: 2147483645;
+  display: none; align-items: center; justify-content: center;
+  background: rgba(78, 117, 223, 0.07);
+  border: 2px dashed rgba(78, 117, 223, 0.6);
+  pointer-events: none;
+  font-size: 15px; font-weight: 600; color: #4267c4;
+  font-family: inherit;
+}
+.rd-drag-overlay.show { display: flex; }
+
+/* 深色模式 */
+
+html[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #18181b;
+    --panel: #1e1e22;
+    --border: rgba(255, 255, 255, 0.09);
+    --text: #f4f4f5;
+    --muted: #9d9da6;
+    --muted-soft: #7c7c86;
+    --indigo-soft: rgba(138, 167, 242, 0.14);
+  }
+html[data-theme="dark"] .rd-btn { border-color: rgba(255, 255, 255, 0.16); }
+html[data-theme="dark"] .rd-btn:hover { color: #aac0f7; background: rgba(138, 167, 242, 0.12); }
+html[data-theme="dark"] .rd-badge { color: #aac0f7; }
+html[data-theme="dark"] .rd-drop { border-color: rgba(255, 255, 255, 0.16); }
+html[data-theme="dark"] .pdf-page,
+html[data-theme="dark"] .docx-wrap,
+html[data-theme="dark"] .sheet-wrap { background: #26262b; box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35); }
+html[data-theme="dark"] .sheet-wrap th { background: #2c2c31; }
+html[data-theme="dark"] .sheet-wrap th,
+html[data-theme="dark"] .sheet-wrap td { border-color: rgba(255, 255, 255, 0.09); }
+html[data-theme="dark"] .sheet-wrap tr:nth-child(even) td { background: rgba(255, 255, 255, 0.02); }
+html[data-theme="dark"] .sheet-tabs { background: #26262b; }
+html[data-theme="dark"] .sheet-tab { color: #d4d4d8; }
+html[data-theme="dark"] .sheet-tab:hover { background: rgba(138, 167, 242, 0.14); }
+
+
+/* ---- 审阅修订（doc_review）：修订痕迹 + 修订面板 ---- */
+
+/* 修订痕迹：del 红色删除线+淡红底；ins 绿色下划线+淡绿底 */
+.rd-editor-host { position: relative; }
+.rd-editor-host .tiptap del {
+  text-decoration: line-through;
+  text-decoration-color: #dc2626;
+  color: #991b1b;
+  background: rgba(220, 38, 38, 0.08);
+  border-radius: 3px;
+}
+.rd-editor-host .tiptap ins {
+  text-decoration: underline;
+  text-decoration-color: #15803d;
+  color: #14532d;
+  background: rgba(22, 163, 74, 0.10);
+  border-radius: 3px;
+}
+
+/* 修订面板：编辑器右上角浮动，可收起 */
+.review-panel {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 320px;
+  max-width: calc(100% - 20px);
+  max-height: 60%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(16, 24, 40, 0.14);
+  z-index: 10;
+  overflow: hidden;
+  font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  animation: rdFocusIn 300ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+.review-panel .rp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.review-panel .rp-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.review-panel .rp-count { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.review-panel .rp-spacer { flex: 1; }
+.review-panel .rp-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 3px 8px;
+  border-radius: 9999px;
+  cursor: pointer;
+}
+.review-panel .rp-btn:hover:not(:disabled) { color: var(--text); border-color: rgba(78, 117, 223, 0.4); }
+.review-panel .rp-btn:disabled { opacity: 0.4; cursor: default; }
+.review-panel .rp-list { overflow-y: auto; padding: 8px; }
+.review-panel.collapsed .rp-list { display: none; }
+.review-panel .rp-empty { font-size: 12px; color: var(--muted-soft); text-align: center; padding: 16px 8px; }
+.rp-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  background: var(--bg);
+}
+.rp-item:hover { border-color: rgba(78, 117, 223, 0.35); }
+.rp-item.rp-accepted, .rp-item.rp-rejected { opacity: 0.55; }
+.rp-item:last-child { margin-bottom: 0; }
+.rp-item-head { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.rp-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: #4267c4;
+  background: rgba(78, 117, 223, 0.10);
+  border-radius: 9999px;
+  padding: 1px 8px;
+  flex-shrink: 0;
+}
+.rp-actions { margin-left: auto; display: flex; gap: 4px; }
+.rp-actions button {
+  border: 1px solid var(--border);
+  background: transparent;
+  font-size: 11px;
+  font-family: inherit;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  cursor: pointer;
+}
+.rp-actions .rp-ok { color: #15803d; border-color: rgba(22, 163, 74, 0.4); }
+.rp-actions .rp-ok:hover { background: rgba(22, 163, 74, 0.10); }
+.rp-actions .rp-no { color: #dc2626; border-color: rgba(220, 38, 38, 0.4); }
+.rp-actions .rp-no:hover { background: rgba(220, 38, 38, 0.08); }
+.rp-status { margin-left: auto; font-size: 11px; color: var(--muted-soft); }
+.rp-desc { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 12.5px; line-height: 1.6; }
+.rp-desc .rp-del { color: #991b1b; text-decoration: line-through; }
+.rp-desc .rp-ins { color: #14532d; }
+.rp-desc .rp-arrow { color: var(--muted-soft); }
+.rp-note {
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-style: italic;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 6px;
+  padding: 4px 8px;
+  line-height: 1.5;
+}
+
+
+html[data-theme="dark"] .rd-editor-host .tiptap del { color: #fca5a5; background: rgba(220, 38, 38, 0.16); }
+html[data-theme="dark"] .rd-editor-host .tiptap ins { color: #86efac; background: rgba(22, 163, 74, 0.16); }
+html[data-theme="dark"] .review-panel { box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45); }
+html[data-theme="dark"] .rp-item { background: #1e1e22; }
+html[data-theme="dark"] .rp-badge { color: #aac0f7; background: rgba(138, 167, 242, 0.14); }
+html[data-theme="dark"] .rp-desc .rp-del { color: #fca5a5; }
+html[data-theme="dark"] .rp-desc .rp-ins { color: #86efac; }
+html[data-theme="dark"] .rp-note { background: rgba(255, 255, 255, 0.06); }
+
+
+/* 尊重系统「减少动效」设置：关闭聚焦模糊入场动画 */
+@media (prefers-reduced-motion: reduce) {
+  .rd-viewer,
+  .rd-editor-host,
+  .rd-confirm,
+  .review-panel,
+  .sheet-wrap,
+  .sheet-wrap .sheet-table,
+  .docx-wrap {
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* 待审修订徽标（建议 A：导出/打开时自证修订完整性） */
+.rd-rev-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  vertical-align: middle;
+}
+
+html[data-theme="dark"] .rd-rev-badge {
+    color: #fcd34d;
+    background: rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.5);
+  }
+

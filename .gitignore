@@ -1,0 +1,11 @@
+node_modules/
+dist.rar
+.claude/
+.tmp-settings.mjs
+*.log
+.DS_Store
+Thumbs.db
+
+# 私钥不进 git（丢了没法补，建议 U 盘/密码管理器另存一份）
+dist.pem
+license-server/keys/

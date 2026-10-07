@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Citecat</title>
+  <link rel="icon" href="../../icon/logo.png" type="image/png">
+  <script src="../lib/theme-boot.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="license-pending">
+  <div id="app">
+    <!-- Panel container with slide animation -->
+    <div id="panelContainer" class="panel-container">
+      <!-- Panel 0: 采集 -->
+      <section id="panelCollect" class="panel active lib-collapsed preview-collapsed ws-stage-0" role="tabpanel" aria-labelledby="tab-btn-0">
+        <!-- 左列：AI 对话 -->
+        <div id="chatCol" class="chat-col">
+          <div class="chat-header">
+            <div class="chat-title-group">
+              <span class="chat-title">AI 对话</span>
+              <span id="chatTokenMeter" class="chat-token-meter" title="本对话累计 tokens"><span class="ctm-num">0</span><span class="ctm-label">tokens</span></span>
+            </div>
+            <div class="chat-header-actions">
+              <button id="toggleLibBtn" class="cmd-icon-btn" title="展开/收起工作区" aria-label="展开/收起工作区">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg>
+              </button>
+              <button id="chatExportBtn" class="cmd-icon-btn" title="导出对话" aria-label="导出对话">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              </button>
+              <button id="cmdClearBtn" class="cmd-icon-btn" title="清空对话">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="chatMessages" class="chat-messages"></div>
+          <div id="heartbeatDrawer" class="heartbeat-shell" aria-hidden="true" inert>
+            <div class="heartbeat-shell-clip">
+              <div class="heartbeat-drawer">
+                <div class="hb-head">
+                  <span class="hb-title">心跳任务</span>
+                  <button type="button" id="hbAddBtn" class="hb-text-btn">新建</button>
+                </div>
+                <div id="heartbeatList" class="hb-list"></div>
+              </div>
+            </div>
+          </div>
+          <div id="commandBar" class="command-bar">
+            <div class="cmd-input-wrap">
+              <div id="cmdAttachChips" class="cmd-attach-chips" hidden></div>
+              <textarea id="cmdInput" rows="1" placeholder="戳戳 Citecat，说说想干嘛…" aria-label="指令输入框"></textarea>
+              <div id="cmdMentionMenu" class="cmd-mention-menu" hidden></div>
+              <div class="cmd-composer-foot">
+                <div class="cmd-foot-left">
+                  <button type="button" id="cmdAttachBtn" class="cmd-icon-btn composer-tool" title="上传" aria-label="上传">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                  </button>
+                  <button type="button" id="cmdHeartbeatBtn" class="cmd-icon-btn composer-tool" title="心跳定时任务" aria-label="心跳定时任务" aria-expanded="false">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                  </button>
+                  <div class="chat-channel-wrap">
+                    <button id="chatChannelSwitch" type="button" class="chat-channel-trigger"
+                      aria-haspopup="menu" aria-expanded="false" title="切换模型"></button>
+                  </div>
+                </div>
+                <button id="cmdSendBtn" class="cmd-icon-btn send">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- 横向 resizer -->
+        <div id="chatDivider" class="chat-divider" title="拖动调整宽度"></div>
+        <!-- 右列：项目工作区（来源 / 笔记 / 产出） -->
+        <div class="collect-main" id="workspaceRoot">
+          <header class="header ws-header">
+            <div class="toolbar ws-toolbar">
+              <div class="ws-title-group">
+                <span class="ws-title">工作区</span>
+                <span id="wsProjectName" class="ws-project-name"></span>
+                <button type="button" id="wsBackChatBtn" class="cmd-icon-btn ws-back-chat" title="返回对话" aria-label="返回对话" hidden>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                </button>
+              </div>
+              <div class="toolbar-search ws-search">
+                <svg class="toolbar-search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                <input type="search" id="wsSearchInput" placeholder="搜索来源、笔记、产出" aria-label="搜索工作区">
+              </div>
+              <button id="wsImportBtn" class="btn btn-secondary btn-icon-only" title="上传" aria-label="上传">
+                <svg class="btn-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 8 12 3 17 8"/><path d="M5 21h14"/></svg>
+              </button>
+              <div class="export-btn-wrap">
+                <button id="exportAllBtn" class="btn btn-primary btn-icon-only" title="导出全部" aria-label="导出全部" disabled>
+                  <svg class="btn-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                </button>
+              </div>
+              <div class="export-btn-wrap">
+                <button id="exportSelectedBtn" class="btn btn-secondary btn-icon-only" title="导出选中" aria-label="导出选中" disabled>
+                  <svg class="btn-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/><path d="M12 3v11"/></svg>
+                </button>
+              </div>
+              <div class="export-btn-wrap">
+                <button id="clearAllBtn" class="btn btn-danger btn-icon-only" title="按类别清空工作区" aria-label="清空工作区">
+                  <svg class="btn-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
+              </div>
+            </div>
+          </header>
+          <div class="ws-body">
+            <div id="wsTree" class="ws-tree" role="listbox" aria-label="工作区三主干"></div>
+            <div id="wsPreviewSplit" class="ws-preview-split" title="拖动调整预览宽度"></div>
+            <div id="wsPreview" class="ws-preview">
+              <div class="ws-preview-head">
+                <div class="ws-preview-head-main">
+                  <button type="button" id="wsPreviewBack" class="ws-preview-back" title="返回项目概览 (Esc)" aria-label="返回项目概览" hidden>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+                    <span>项目概览</span>
+                  </button>
+                  <div id="wsPreviewTitle" class="ws-preview-title">项目概览</div>
+                  <div id="wsPreviewMeta" class="ws-preview-meta"></div>
+                </div>
+                <div id="wsPreviewActs" class="ws-preview-acts" hidden></div>
+              </div>
+              <div id="wsPreviewBody" class="ws-preview-body"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 1: 订阅 -->
+      <section id="panelFeed" class="panel" style="display:none" role="tabpanel" aria-labelledby="tab-btn-1">
+        <div class="feed-layout">
+          <div class="feed-sidebar" id="feedSidebar">
+            <div class="feed-sidebar-header">
+              <span class="feed-sidebar-title">订阅源</span>
+              <div class="feed-sidebar-actions">
+                <button id="feedRefreshAllBtn" class="btn btn-sm btn-icon-only" title="刷新全部">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                </button>
+                <button id="feedExportBtn" class="btn btn-sm btn-icon-only" title="导出">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                </button>
+                <button id="feedDeleteAllItemsBtn" class="btn btn-sm btn-icon-only" title="清空新闻">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+                </button>
+                <button id="feedAddBtn" class="btn btn-sm btn-icon-only" title="添加订阅源">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+              </div>
+            </div>
+            <div id="feedIndexProgress" class="feed-index-progress" hidden>
+              <div class="feed-index-progress-track"><div class="feed-index-progress-bar"></div></div>
+              <div class="feed-index-progress-label">正在构建搜索索引…</div>
+            </div>
+            <div id="feedSourceList" class="feed-source-list">
+              <div class="feed-source-skeleton">加载中...</div>
+            </div>
+          </div>
+          <div class="feed-sidebar-resizer" id="feedSidebarResizer" title="拖动调整宽度"></div>
+          <div class="feed-main">
+            <div class="feed-toolbar">
+              <div class="feed-filter-tabs">
+                <button class="feed-filter-btn active" data-filter="all">全部</button>
+                <button class="feed-filter-btn" data-filter="starred">星标</button>
+              </div>
+              <div class="feed-main-search">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                <input type="search" id="feedSearchInput" placeholder="搜索条目..." aria-label="搜索订阅条目">
+              </div>
+            </div>
+            <div id="feedItemList" class="feed-item-list">
+              <div class="feed-empty-state" id="feedEmptyState">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.3"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+                <p>尚未添加订阅源</p>
+              </div>
+            </div>
+            <div class="feed-selected-bar" id="feedSelectedBar" hidden>
+              <span id="feedSelectedCount">已选 0 项</span>
+              <div class="feed-selected-actions">
+                <button id="feedCollectBtn" class="btn btn-primary btn-sm">加入来源</button>
+                <button id="feedClearSelectedBtn" class="btn btn-sm">取消</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Add feed dialog -->
+        <div id="feedAddDialog" class="feed-dialog-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="feedAddDialogTitle">
+          <div class="feed-dialog">
+            <div class="feed-dialog-header">
+              <span id="feedAddDialogTitle">添加订阅源</span>
+              <button id="feedDialogCloseBtn" class="feed-dialog-close" aria-label="关闭">&times;</button>
+            </div>
+            <div class="feed-dialog-body">
+              <div class="feed-dialog-field">
+                <label for="feedUrlInput">订阅地址</label>
+                <textarea id="feedUrlInput" rows="6" placeholder="https://example.com/rss&#10;https://site.com（自动发现）&#10;/bilibili/user/dynamic/12345 （RSSHub 路由）&#10;rsshub:twitter/user/elonmusk"></textarea>
+              </div>
+              <div class="feed-dialog-field">
+                <label>或导入 OPML 文件</label>
+                <div class="feed-dialog-opml">
+                  <button type="button" id="feedOpmlPickBtn" class="btn btn-sm">选择 OPML 文件</button>
+                  <span id="feedOpmlName" class="feed-opml-name"></span>
+                </div>
+              </div>
+              <div class="feed-dialog-field">
+                <label>作用域</label>
+                <div class="feed-dialog-radio-group">
+                  <label><input type="radio" name="feedScope" value="global" checked> 全局（所有项目可见）</label>
+                  <label><input type="radio" name="feedScope" value="project"> 当前项目专属</label>
+                </div>
+              </div>
+              <div id="feedDialogStatus" class="feed-dialog-status"></div>
+              <div id="feedDialogResults" class="feed-dialog-results" hidden></div>
+            </div>
+            <div class="feed-dialog-actions">
+              <button id="feedDialogAddBtn" class="btn btn-primary">添加</button>
+              <button id="feedDialogCancelBtn" class="btn">取消</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Edit feed dialog -->
+        <div id="feedEditDialog" class="feed-dialog-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="feedEditDialogTitle">
+          <div class="feed-dialog">
+            <div class="feed-dialog-header">
+              <span id="feedEditDialogTitle">编辑订阅源</span>
+              <button id="feedEditCloseBtn" class="feed-dialog-close" aria-label="关闭">&times;</button>
+            </div>
+            <div class="feed-dialog-body">
+              <div class="feed-dialog-field">
+                <label for="feedEditTitle">名称</label>
+                <input type="text" id="feedEditTitle" placeholder="显示名称">
+              </div>
+              <div class="feed-dialog-field">
+                <label for="feedEditUrl">URL</label>
+                <input type="url" id="feedEditUrl" placeholder="https://...">
+              </div>
+              <div class="feed-dialog-field">
+                <label for="feedEditMax">每次拉取最多条数</label>
+                <input type="number" id="feedEditMax" min="1" max="500" placeholder="50">
+              </div>
+              <div class="feed-dialog-row">
+                <div class="feed-dialog-field">
+                  <label for="feedEditFrom">起始日期</label>
+                  <input type="date" id="feedEditFrom">
+                </div>
+                <div class="feed-dialog-field">
+                  <label for="feedEditTo">结束日期</label>
+                  <input type="date" id="feedEditTo">
+                </div>
+              </div>
+              <div class="feed-dialog-field">
+                <label class="feed-dialog-checkbox">
+                  <input type="checkbox" id="feedEditAutoTranslate">
+                  <span>自动翻译为中文</span>
+                </label>
+              </div>
+              <div id="feedEditStatus" class="feed-dialog-status"></div>
+            </div>
+            <div class="feed-dialog-actions">
+              <button id="feedEditSaveBtn" class="btn btn-primary">保存</button>
+              <button id="feedEditDeleteBtn" class="btn btn-danger">删除此源</button>
+              <button id="feedEditCancelBtn" class="btn">取消</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 2: 库管理 -->
+      <section id="panelLibrary" class="panel" style="display:none" role="tabpanel" aria-labelledby="tab-btn-2">
+        <div class="library-inner">
+          <div id="libraryList" class="library-list"></div>
+          <div class="library-add">
+            <input type="text" id="newLibraryInput" placeholder="新建项目名称..." aria-label="新建项目名称">
+            <button id="addLibraryBtn" class="btn btn-primary btn-sm">新建</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 2: 设置 -->
+      <section id="panelSettings" class="panel" style="display:none" role="tabpanel" aria-labelledby="tab-btn-3">
+        <div class="settings-inner">
+          <!-- 层级原则：常开=日常高频（渠道切换/外观）；折叠=低频高级配置 -->
+          <div class="settings-section">
+            <h3>接入渠道</h3>
+            <div id="channelList" class="channel-list"></div>
+            <div class="form-actions">
+              <button id="addChannelBtn" class="btn btn-primary btn-sm">新增渠道</button>
+              <span id="channelStatus" class="status-msg"></span>
+            </div>
+
+            <div id="channelEditor" hidden>
+              <div class="form-group">
+                <label>快速填充</label>
+                <div id="chPresetChips" class="preset-chips"></div>
+              </div>
+              <div class="form-group">
+                <label for="chName">名称</label>
+                <input type="text" id="chName" placeholder="如 DeepSeek 主力">
+              </div>
+              <div class="form-group">
+                <label for="chProtocol">协议</label>
+                <select id="chProtocol">
+                  <option value="openai">OpenAI 兼容（绝大多数厂商）</option>
+                  <option value="anthropic">Anthropic Messages</option>
+                  <option value="gemini">Google Gemini 原生</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="chBaseUrl">Base URL</label>
+                <input type="text" id="chBaseUrl" placeholder="https://api.deepseek.com/chat/completions">
+              </div>
+              <div class="form-group">
+                <label for="chApiKey">API Key</label>
+                <input type="password" id="chApiKey" placeholder="sk-...">
+              </div>
+              <div class="form-group">
+                <label>模型</label>
+                <div id="chModelList" class="ch-model-list"></div>
+                <button type="button" id="addChannelModelBtn" class="btn btn-sm ch-model-add">添加模型</button>
+              </div>
+              <div class="form-actions">
+                <button id="saveChannelBtn" class="btn btn-primary btn-sm">保存渠道</button>
+                <button id="saveAsNewChannelBtn" class="btn btn-sm" hidden>另存为新渠道</button>
+                <button id="testChannelBtn" class="btn btn-sm">测试连接</button>
+                <button id="cancelChannelBtn" class="btn btn-sm" hidden>取消</button>
+                <span id="chStatus" class="status-msg"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h3>外观</h3>
+            <div class="form-group">
+              <label for="colorSchemeSelect">颜色</label>
+              <select id="colorSchemeSelect">
+                <option value="light">白天</option>
+                <option value="dark">黑夜</option>
+                <option value="auto">自动</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="uiScaleSelect">界面缩放</label>
+              <select id="uiScaleSelect">
+                <option value="auto">自动</option>
+                <option value="0.25">25%</option><option value="0.3">30%</option><option value="0.4">40%</option>
+                <option value="0.5">50%</option><option value="0.6">60%</option><option value="0.7">70%</option>
+                <option value="0.8">80%</option><option value="0.85">85%</option><option value="0.9">90%</option>
+                <option value="0.95">95%</option><option value="1">100%</option><option value="1.05">105%</option>
+                <option value="1.1">110%</option><option value="1.15">115%</option><option value="1.2">120%</option>
+                <option value="1.3">130%</option><option value="1.4">140%</option><option value="1.5">150%</option>
+              </select>
+            </div>
+            <div class="form-actions"><span id="colorSchemeStatus" class="status-msg"></span><span id="uiScaleStatus" class="status-msg"></span></div>
+          </div>
+
+          <details class="settings-fold">
+            <summary>视觉模型</summary>
+            <div class="fold-body">
+              <div class="form-group">
+                <label for="visionApiKey">API Key</label>
+                <input type="password" id="visionApiKey" placeholder="免费注册后获取">
+              </div>
+              <div class="form-group">
+                <label for="visionBaseUrl">Base URL</label>
+                <input type="text" id="visionBaseUrl" placeholder="https://open.bigmodel.cn/api/paas/v4/chat/completions">
+              </div>
+              <div class="form-group">
+                <label for="visionModel">模型</label>
+                <input type="text" id="visionModel" placeholder="glm-4v-flash">
+              </div>
+              <div class="form-group">
+                <label for="visionMaxTokens">max_tokens 上限</label>
+                <input type="number" id="visionMaxTokens" placeholder="1024" min="128" max="32768">
+              </div>
+              <div class="form-group">
+                <label for="visionProtocol">协议</label>
+                <select id="visionProtocol">
+                  <option value="openai">OpenAI 兼容</option>
+                  <option value="anthropic">Anthropic Messages</option>
+                  <option value="gemini">Google Gemini 原生</option>
+                </select>
+              </div>
+              <div class="form-actions">
+                <button id="saveVisionConfigBtn" class="btn btn-primary btn-sm">保存</button>
+                <button id="testVisionBtn" class="btn btn-sm">测试连接</button>
+                <span id="visionStatus" class="status-msg"></span>
+              </div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>外部 API</summary>
+            <div class="fold-body">
+              <p style="font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 12px">保存后会出现在对话上下文里，提醒 AI 有这条渠道可调。免费、无需 Key 的也可以保存（鉴权选「无」）。有密钥的只留在本机，调用时自动注入。</p>
+              <div id="apiConnectorList" class="channel-list"></div>
+              <div class="form-actions">
+                <button type="button" id="addApiConnectorBtn" class="btn btn-primary btn-sm">新增连接</button>
+                <span id="apiConnectorStatus" class="status-msg"></span>
+              </div>
+              <div id="apiConnectorEditor" hidden>
+                <div class="form-group">
+                  <label>快速填充</label>
+                  <div id="apiPresetChips" class="preset-chips"></div>
+                </div>
+                <div class="form-group">
+                  <label for="apiConnName">名称</label>
+                  <input type="text" id="apiConnName" placeholder="如 CoinGecko、FRED">
+                </div>
+                <div class="form-group">
+                  <label for="apiConnBase">Base URL</label>
+                  <input type="text" id="apiConnBase" placeholder="https://api.stlouisfed.org">
+                </div>
+                <div class="form-group">
+                  <label for="apiConnAuth">鉴权</label>
+                  <select id="apiConnAuth">
+                    <option value="none">无（免费 / 公开，无需 Key）</option>
+                    <option value="bearer">Bearer</option>
+                    <option value="header">自定义 Header</option>
+                    <option value="query">Query 参数（FRED 的 api_key）</option>
+                    <option value="basic">HTTP Basic</option>
+                    <option value="hmac_sha256">HMAC-SHA256（Binance 风格）</option>
+                  </select>
+                </div>
+                <div class="form-group" id="apiConnKeyWrap">
+                  <label for="apiConnKey">API Key（免费接口可留空）</label>
+                  <input type="password" id="apiConnKey" placeholder="无需 Key 可留空" autocomplete="off">
+                </div>
+                <div class="form-group" id="apiConnSecretWrap" hidden>
+                  <label for="apiConnSecret">Secret / 密码</label>
+                  <input type="password" id="apiConnSecret" placeholder="HMAC secret 或 Basic 密码" autocomplete="off">
+                </div>
+                <div class="form-group" id="apiConnHeaderWrap" hidden>
+                  <label for="apiConnHeader">Header 名</label>
+                  <input type="text" id="apiConnHeader" placeholder="X-Api-Key">
+                </div>
+                <div class="form-group" id="apiConnQueryWrap" hidden>
+                  <label for="apiConnQuery">Query 参数名</label>
+                  <input type="text" id="apiConnQuery" placeholder="api_key">
+                </div>
+                <div class="form-group">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="apiConnWrite">
+                    <span>允许写入（POST/PUT/PATCH/DELETE，如下单）</span>
+                  </label>
+                </div>
+                <div class="form-group">
+                  <label for="apiConnNotes">给 AI 的说明</label>
+                  <textarea id="apiConnNotes" rows="3" placeholder="常用路径、参数。免费接口也请写清，方便模型直接调用。"></textarea>
+                </div>
+                <div class="form-actions">
+                  <button type="button" id="saveApiConnectorBtn" class="btn btn-primary btn-sm">保存</button>
+                  <button type="button" id="testApiConnectorBtn" class="btn btn-sm">测试 GET</button>
+                  <button type="button" id="cancelApiConnectorBtn" class="btn btn-sm">取消</button>
+                  <span id="apiConnEditStatus" class="status-msg"></span>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>搜索与提示词</summary>
+            <div class="fold-body">
+              <p style="font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 12px">和接入渠道一样：可以保存多家搜索，点一行就是当前使用的那家。Key 只留在本机。没填 Key 会直接告诉你；其它失败会改用网页抓取。</p>
+              <div id="searchChannelList" class="channel-list"></div>
+              <div class="form-actions">
+                <button type="button" id="addSearchChannelBtn" class="btn btn-primary btn-sm">新增搜索</button>
+                <span id="searchChannelStatus" class="status-msg"></span>
+              </div>
+              <div id="searchChannelEditor" hidden>
+                <div class="form-group">
+                  <label>快速填充</label>
+                  <div id="searchPresetChips" class="preset-chips"></div>
+                </div>
+                <div class="form-group">
+                  <label for="schName">名称</label>
+                  <input type="text" id="schName" placeholder="如 Tavily 主力">
+                </div>
+                <div class="form-group" id="schKeyWrap">
+                  <label for="schApiKey">API Key</label>
+                  <input type="password" id="schApiKey" placeholder="tvly-..." autocomplete="off">
+                </div>
+                <div class="form-group" id="schBaseWrap" hidden>
+                  <label for="schBaseUrl">Base URL</label>
+                  <input type="text" id="schBaseUrl" placeholder="https://searx.example" autocomplete="off">
+                </div>
+                <p id="schHint" class="ch-model-hint"></p>
+                <div class="form-actions">
+                  <button type="button" id="saveSearchChannelBtn" class="btn btn-primary btn-sm">保存</button>
+                  <button type="button" id="testSearchChannelBtn" class="btn btn-sm">测试搜索</button>
+                  <button type="button" id="cancelSearchChannelBtn" class="btn btn-sm">取消</button>
+                  <span id="schStatus" class="status-msg"></span>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="promptTemplate">采集摘要提示词模板</label>
+                <textarea id="promptTemplate" rows="4" spellcheck="false"></textarea>
+                <button id="resetPromptBtn" class="btn btn-sm" style="margin-top:4px">恢复默认</button>
+              </div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>订阅与翻译</summary>
+            <div class="fold-body">
+              <div class="form-group">
+                <label for="rsshubInstance">RSSHub 实例</label>
+                <input type="url" id="rsshubInstance" placeholder="https://rsshub.app 或 rsshub:twitter/user/xxx">
+              </div>
+              <div class="form-actions" style="margin-bottom:14px;">
+                <button id="saveRsshubBtn" class="btn btn-sm">保存实例</button>
+                <span id="rsshubStatus" class="status-msg"></span>
+              </div>
+              <div class="form-group">
+                <label for="feedRefreshInterval">自动刷新间隔（分钟）</label>
+                <input type="number" id="feedRefreshInterval" min="5" max="1440" step="5" placeholder="30">
+              </div>
+              <div class="form-actions" style="margin-bottom:14px;">
+                <button id="saveRefreshIntervalBtn" class="btn btn-sm">保存间隔</button>
+                <span id="refreshIntervalStatus" class="status-msg"></span>
+              </div>
+              <div class="form-group">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="feedAutoTranslate">
+                  <span>新订阅源默认启用自动翻译</span>
+                </label>
+              </div>
+              <div class="form-group">
+                <label for="translateProvider">首选翻译服务</label>
+                <select id="translateProvider">
+                  <option value="google">Google（免费，可能限流）</option>
+                  <option value="tencent">腾讯 TMT（500 万字符/月免费）</option>
+                  <option value="local">Chrome 本地翻译（离线）</option>
+                </select>
+              </div>
+              <div class="form-group" id="tencentCredGroup">
+                <label for="tencentSecretId">腾讯 SecretId</label>
+                <input type="text" id="tencentSecretId" placeholder="AKID...">
+                <label for="tencentSecretKey" style="margin-top:6px;">SecretKey</label>
+                <input type="password" id="tencentSecretKey" placeholder="留空表示不修改">
+                <label for="tencentRegion" style="margin-top:6px;">地域</label>
+                <select id="tencentRegion">
+                  <option value="ap-shanghai">华东（上海）</option>
+                  <option value="ap-beijing">华北（北京）</option>
+                  <option value="ap-guangzhou">华南（广州）</option>
+                  <option value="ap-hongkong">港澳台（香港）</option>
+                  <option value="ap-singapore">亚太东南（新加坡）</option>
+                </select>
+                <div class="form-actions" style="margin-top:6px;">
+                  <button id="testTencentBtn" class="btn btn-sm">测试连接</button>
+                  <span id="tencentTestStatus" class="status-msg"></span>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="feedTargetLang">目标语言</label>
+                <select id="feedTargetLang">
+                  <option value="zh-Hans">简体中文</option>
+                  <option value="zh-Hant">繁體中文</option>
+                  <option value="en">English</option>
+                  <option value="ja">日本語</option>
+                  <option value="ko">한국어</option>
+                  <option value="fr">Français</option>
+                  <option value="de">Deutsch</option>
+                  <option value="es">Español</option>
+                  <option value="pt">Português</option>
+                  <option value="it">Italiano</option>
+                  <option value="ru">Русский</option>
+                  <option value="ar">العربية</option>
+                  <option value="hi">हिन्दी</option>
+                  <option value="vi">Tiếng Việt</option>
+                  <option value="th">ไทย</option>
+                  <option value="id">Bahasa Indonesia</option>
+                  <option value="tr">Türkçe</option>
+                  <option value="pl">Polski</option>
+                  <option value="nl">Nederlands</option>
+                </select>
+              </div>
+              <div class="form-actions">
+                <button id="saveFeedPrefsBtn" class="btn btn-primary btn-sm">保存翻译设置</button>
+                <button id="retryFailedTranslationsBtn" class="btn btn-sm">重试失败条目</button>
+                <span id="feedPrefsStatus" class="status-msg"></span>
+              </div>
+              <div class="form-group" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+                <label>全文搜索索引维护</label>
+                <div class="form-actions">
+                  <button id="feedRebuildIndexBtn" class="btn btn-sm">重建全文索引</button>
+                  <span id="feedIndexStatus" class="status-msg"></span>
+                </div>
+              </div>
+              <div id="translateProgressArea" class="translate-progress-area" hidden>
+                <div class="translate-progress-label" id="translateProgressLabel">准备翻译…</div>
+                <div class="translate-progress-bar"><div id="translateProgressFill" class="translate-progress-fill"></div></div>
+              </div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>DOCX 导出模板 <span id="templateStatusBadge" class="template-status-badge" hidden>已就绪</span></summary>
+            <div class="fold-body">
+              <div id="templateDrop" class="template-drop">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                <p>拖入或选择 DOCX</p>
+                <span id="templatePickBtn" class="btn btn-sm">选择文件</span>
+              </div>
+              <div id="templateStructArea" class="template-struct-area" hidden>
+                <div class="template-struct-header"><span>识别结果</span></div>
+                <div id="templateStructList" class="template-struct-list"></div>
+                <div class="template-struct-actions">
+                  <button id="buildTemplateBtn" class="btn btn-primary btn-sm">确认使用此格式</button>
+                  <button id="cancelStructBtn" class="btn btn-sm">取消</button>
+                </div>
+              </div>
+              <div id="templateInfo" class="template-info" hidden>
+                <div class="template-active-indicator"><span class="template-active-dot"></span>已激活</div>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <button id="clearTemplateBtn" class="btn btn-sm">更换格式</button>
+                  <button id="resetToDefaultBtn" class="btn btn-sm">恢复默认</button>
+                </div>
+              </div>
+              <div style="margin-top:4px"><span id="templateStatus" class="status-msg"></span></div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>采集黑名单</summary>
+            <div class="fold-body">
+              <div class="input-row">
+                <input type="text" id="newDomainInput" placeholder="example.com 或 *.example.com" aria-label="输入域名">
+                <button id="addDomainBtn" class="btn btn-primary btn-sm">添加</button>
+                <button id="addCurrentBtn" class="btn btn-sm">当前网站</button>
+              </div>
+              <textarea id="blacklistTextarea" rows="8" spellcheck="false" placeholder="每行一个域名"></textarea>
+              <div class="textarea-actions">
+                <button id="saveBlacklistBtn" class="btn btn-primary btn-sm">保存黑名单</button>
+                <span id="blacklistStatus" class="status-msg"></span>
+              </div>
+            </div>
+          </details>
+
+                    <details class="settings-fold">
+            <summary>AI 记忆</summary>
+            <div class="fold-body">
+              <div id="memoryList" style="max-height:300px;overflow:auto;"></div>
+              <div class="form-actions">
+                <button id="clearMemoryBtn" class="btn btn-sm btn-secondary">清空全部记忆</button>
+                <span id="memoryCount" class="status-msg"></span>
+              </div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>数据维护</summary>
+            <div class="fold-body">
+              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
+                清空所有项目的内容：来源、产出、文档原件、证据、笔记、标签和会话存档。保留 AI 记忆与订阅内容。清空后 4 秒内可撤销。
+              </p>
+              <div class="form-actions">
+                <button id="purgeAllLibraryBtn" class="btn btn-sm btn-secondary">清空所有库内容</button>
+                <span id="purgeAllStatus" class="status-msg"></span>
+              </div>
+            </div>
+          </details>
+
+          <details class="settings-fold">
+            <summary>子代理</summary>
+            <div class="fold-body">
+              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
+                控制一次最多派出几个子代理，以及每个子代理同时能打开多少个网页。关掉旧页后可以再开新的。
+              </p>
+              <div class="form-group">
+                <label for="sgMaxParallel">单一批次最多子代理个数</label>
+                <input type="number" id="sgMaxParallel" min="1" max="12" step="1" placeholder="3">
+              </div>
+              <div class="form-group">
+                <label for="sgMaxTabs">子代理最多打开网页个数</label>
+                <input type="number" id="sgMaxTabs" min="1" max="20" step="1" placeholder="6">
+              </div>
+              <div class="form-actions" style="margin-bottom:14px">
+                <button type="button" id="sgLimitsSaveBtn" class="btn btn-primary btn-sm">保存限额</button>
+                <span id="sgLimitsStatus" class="status-msg"></span>
+              </div>
+              <div id="builtinAgentList" class="sg-builtin"></div>
+              <div id="customAgentList" class="sg-custom"></div>
+              <div class="form-group" style="margin-top:12px">
+                <label for="sgName">名称</label>
+                <input type="text" id="sgName" placeholder="reviewer">
+              </div>
+              <div class="form-group">
+                <label for="sgDesc">何时委派</label>
+                <input type="text" id="sgDesc" placeholder="什么时候调用这个子代理">
+              </div>
+              <div class="form-group">
+                <label for="sgPrompt">系统说明</label>
+                <textarea id="sgPrompt" rows="4" placeholder="身份与交回格式"></textarea>
+              </div>
+              <div class="form-group">
+                <label for="sgTools">工具</label>
+                <input type="text" id="sgTools" value="*" placeholder="* 或 search_web,read_tab,fetch_entry">
+              </div>
+              <div class="form-group">
+                <label for="sgChannel">渠道</label>
+                <select id="sgChannel"><option value="">跟随当前</option></select>
+              </div>
+              <div class="form-actions">
+                <button id="sgSaveBtn" class="btn btn-primary btn-sm">保存自定义子代理</button>
+                <span id="sgStatus" class="status-msg"></span>
+              </div>
+            </div>
+          </details>
+
+<details class="settings-fold">
+            <summary>关于与更新</summary>
+            <div class="fold-body">
+              <div class="form-group">
+                <label>许可证</label>
+                <p id="licenseStatusLine" class="ch-model-hint">检查中…</p>
+              </div>
+              <div class="form-actions">
+                <span>v<span id="extVersion">0.1.0</span></span>
+                <button id="checkUpdateBtn" class="btn btn-sm btn-primary">检查更新</button>
+                <span id="updateStatus" class="status-msg"></span>
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
+    </div>
+
+    <nav class="tab-bar" id="tabBar" role="tablist" aria-label="主导航">
+      <span class="tab-slider" id="tabSlider" aria-hidden="true"></span>
+      <button class="tab-btn active" data-panel="0" id="tab-btn-0" role="tab" aria-selected="true" aria-controls="panelCollect" title="采集" aria-label="采集">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+      </button>
+      <button class="tab-btn" data-panel="1" id="tab-btn-1" role="tab" aria-selected="false" aria-controls="panelFeed" title="订阅" aria-label="订阅">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+      </button>
+      <button class="tab-btn" data-panel="2" id="tab-btn-2" role="tab" aria-selected="false" aria-controls="panelLibrary" title="项目" aria-label="项目">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      </button>
+      <button class="tab-btn" data-panel="3" id="tab-btn-3" role="tab" aria-selected="false" aria-controls="panelSettings" title="设置" aria-label="设置">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </nav>
+  </div>
+
+  <div id="licenseGate" class="license-gate" hidden>
+    <div class="license-card">
+      <div class="license-mark">Citecat</div>
+      <h2>需要授权</h2>
+      <p>此副本需要许可证才能使用。向发放人索取授权码。</p>
+      <input id="licenseKeyInput" type="text" placeholder="CC-XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" aria-label="授权码">
+      <button id="licenseActivateBtn" class="btn btn-primary" type="button">激活</button>
+      <span id="licenseGateStatus" class="status-msg"></span>
+    </div>
+  </div>
+
+  
+  <script type="module" src="../../sidepanel/panel.js"></script>
+</body>
+</html>

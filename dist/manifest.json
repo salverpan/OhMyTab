@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Citecat",
+  "version": "0.3.0",
+  "description": "Citecat - 采集网页、AI摘要、导出DOCX",
+  "update_url": "http://47.104.128.124/citecat/update.xml",
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "tabs",
+    "scripting",
+    "webNavigation",
+    "alarms",
+    "debugger",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/global.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_title": "Citecat"
+  },
+  "icons": {
+    "16": "icon/logo.png",
+    "48": "icon/logo.png",
+    "128": "icon/logo.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/plot-runtime.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

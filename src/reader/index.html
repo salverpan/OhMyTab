@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Citecat 文档阅读器</title>
+  <script src="../lib/theme-boot.js"></script>
+  <link rel="stylesheet" href="./reader.css">
+</head>
+<body>
+  <header class="rd-head">
+    <div class="rd-brand">
+      <span class="rd-name">Citecat 文档阅读器</span>
+    </div>
+    <div class="rd-file" id="fileMeta" hidden>
+      <span class="rd-filename" id="fileName"></span>
+      <span class="rd-badge" id="formatBadge"></span>
+      <span class="rd-meta" id="docMeta"></span>
+    </div>
+    <div class="rd-actions">
+      <button class="rd-btn" id="chatBtn" hidden title="AI">AI</button>
+      <button class="rd-btn rd-btn-primary" id="editBtn" hidden title="编辑">编辑</button>
+      <button class="rd-btn rd-btn-primary" id="saveBtn" hidden title="保存">保存</button>
+      <button class="rd-btn" id="doneBtn" hidden title="完成">完成</button>
+      <span id="revBadge" class="rd-rev-badge" hidden title="待审修订"></span>
+    </div>
+  </header>
+
+  <main class="rd-body">
+    <!-- 空状态 -->
+    <div class="rd-empty" id="emptyState">
+      <div class="rd-drop" id="dropZone">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </div>
+    </div>
+    <!-- 只读渲染容器 -->
+    <div class="rd-viewer" id="viewer" hidden></div>
+    <!-- 编辑模式容器（xlsx: Univer / docx: Tiptap，懒加载） -->
+    <div class="rd-editor-host" id="editorHost" hidden></div>
+  </main>
+
+  <div class="rd-status" id="statusBar" hidden></div>
+  <script type="module" src="./reader.js"></script>
+</body>
+</html>

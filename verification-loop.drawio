@@ -1,0 +1,127 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="verify-loop" name="验证闭环">
+    <mxGraphModel dx="1000" dy="800" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1240" pageHeight="1120" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="t" value="来源 → 笔记 → 产出 · 验证闭环" style="text;html=1;fontSize=15;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="10" width="560" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="lg" value="实线＝数据流　红虚线＝拦截 / 降级　绿虚线＝循环回路　灰虚线＝人工动作" style="text;html=1;fontSize=11;align=right;verticalAlign=middle;fontColor=#595959;" vertex="1" parent="1">
+          <mxGeometry x="640" y="10" width="560" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="c1" value="① 来源层 —— 证据怎么进来" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="50" width="300" height="34" as="geometry"/>
+        </mxCell>
+        <mxCell id="a1" value="子代理深读网页&#xa;auto-ingest：≥1200 字 · 仅首读" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="220" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="a2" value="用户主动 ingest&#xa;（来源条目 / 标签页）" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="290" y="110" width="220" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="a3" value="AI 产出 / 任意文本&#xa;✗ 不能作为可核验证据入库" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#f8cecc;strokeColor=#b85450;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="110" width="260" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="art" value="证据库 artifact（IDB）&#xa;doc_id ＋ 分块锚点 doc_id#cN" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="290" y="230" width="420" height="72" as="geometry"/>
+        </mxCell>
+        <mxCell id="c2" value="② 笔记本 —— 结论怎么立住" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="350" width="300" height="34" as="geometry"/>
+        </mxCell>
+        <mxCell id="n1" value="notebook(add)&#xa;claim ＋ sources[]（必填）&#xa;空出处 → 工具层直接拦截" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="410" width="240" height="96" as="geometry"/>
+        </mxCell>
+        <mxCell id="n2" value="笔记：claim · confidence · status&#xa;open / verified / refuted / dropped&#xa;supersedes 修正链&#xa;心跳：observation → judgment" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="330" y="410" width="300" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="n3" value="verified 门（canVerifySources）&#xa;doc 存在 · 本项目 · trustClass=source&#xa;⚠ 只查引注格式，≠ 内容属实" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="690" y="410" width="330" height="110" as="geometry"/>
+        </mxCell>
+        <mxCell id="c3" value="③ 循环 —— 结论被复用与核实" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="300" height="34" as="geometry"/>
+        </mxCell>
+        <mxCell id="d1" value="digest 每轮注入提示词&#xa;（1600 字上限，超出指向 list）" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="40" y="660" width="230" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="d2" value="下一轮调研&#xa;先查笔记本，避免重复读" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="310" y="660" width="230" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="d3" value="有缺口 → read_section&#xa;(doc_id#anchor) 回读原文" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="580" y="660" width="250" height="86" as="geometry"/>
+        </mxCell>
+        <mxCell id="out" value="产出：回答 ＋ 注明来源" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="310" y="800" width="230" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="hu" value="真伪终审：点开锚点亲眼看&#xa;（机器只能查格式）" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="580" y="800" width="250" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="ec" value="收益：结论近似常数、证据按需展开&#xa;token 不随调研深度线性增长" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=middle;fontSize=11;fontStyle=2;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="800" width="230" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="c4" value="④ 防腐 —— 验证状态不腐烂" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="940" width="300" height="34" as="geometry"/>
+        </mxCell>
+        <mxCell id="x1" value="触发：删除来源条目&#xa;项目恢复 / 导入" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1000" width="280" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="x2" value="机制：级联删 artifact ＋ 原件&#xa;逐条重验出处（revalidateNotes）" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="370" y="1000" width="330" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="x3" value="效果：verified 退回 open&#xa;history 留痕" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="750" y="1000" width="330" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;" edge="1" parent="1" source="a1" target="art">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;" edge="1" parent="1" source="a2" target="art">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="防毒门：禁止入库" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#b85450;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="a3" target="art">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;" edge="1" parent="1" source="n1" target="n2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" value="要标 verified 时" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n2" target="n3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="不合格 → 保持 open" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#b85450;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n3" target="n2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="每轮 digest 注入" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n2" target="d1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;" edge="1" parent="1" source="d1" target="d2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" value="有缺口" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="d2" target="d3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e10" value="按锚点回读原文" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#82b366;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="d3" target="art">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e11" value="核实后 update" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#82b366;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="d3" target="n2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e12" value="新结论 add，循环" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#82b366;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="d2" target="n1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e13" value="作答" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="d2" target="out">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e14" value="点开 doc_id#anchor" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#999999;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="out" target="hu">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;" edge="1" parent="1" source="x1" target="x2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#595959;strokeWidth=1.5;" edge="1" parent="1" source="x2" target="x3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e17" value="出处失效 → 退回 open" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#b85450;dashed=1;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="x3" target="n2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,44 @@
+{
+  "name": "trusted-source-collector",
+  "version": "0.1.0",
+  "description": "可信信源信息采集器 - Chrome Extension",
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:smoke",
+    "test:smoke": "node test/workspace-smoke.mjs && node test/plan-smoke.mjs && node test/project-concurrency-smoke.mjs && node test/subagent-smoke.mjs && node test/agent-pipeline-smoke.mjs && node test/providers-smoke.mjs && node test/memory-retrieve-smoke.mjs && node test/search-smoke.mjs && node test/heartbeat-smoke.mjs && node test/scope-quiz-smoke.mjs && node test/plot-spec-smoke.mjs && node test/api-call-smoke.mjs && node test/vision-probe-smoke.mjs && node test/rss-tools-smoke.mjs && node test/license-smoke.mjs && node test/doc-text-smoke.mjs && node test/timeline-smoke.mjs && node test/activity-smoke.mjs && node test/trace-smoke.mjs && node test/docx-headless-smoke.mjs && node test/xlsx-headless-smoke.mjs && node test/pdf-repair-smoke.mjs && node test/docx-chart-smoke.mjs",
+    "build": "node build.js",
+    "dev": "node build.js && echo 'Load dist/ folder in chrome://extensions'"
+  },
+  "dependencies": {
+    "@dagrejs/dagre": "^3.1.1",
+    "@mozilla/readability": "^0.6.0",
+    "@tiptap/core": "^2.27.2",
+    "@tiptap/extension-table": "^2.27.2",
+    "@tiptap/extension-table-cell": "^2.27.2",
+    "@tiptap/extension-table-header": "^2.27.2",
+    "@tiptap/extension-table-row": "^2.27.2",
+    "@tiptap/pm": "^2.27.2",
+    "@tiptap/starter-kit": "^2.27.2",
+    "@univerjs/presets": "^0.25.1",
+    "@xmldom/xmldom": "^0.9.11",
+    "@xyflow/react": "^12.12.0",
+    "defuddle": "^0.19.1",
+    "docx": "^9.1.0",
+    "docx-preview": "^0.4.0",
+    "echarts": "^5.6.0",
+    "fast-xml-parser": "^5.9.3",
+    "gsap": "^3.15.0",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.12.0",
+    "marked": "^18.0.7",
+    "pdfjs-dist": "^6.2.108",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "thinking-orbs": "^0.2.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "pdf-lib": "^1.17.1",
+    "vite": "^6.0.0"
+  }
+}
