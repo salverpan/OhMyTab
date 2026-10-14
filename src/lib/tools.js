@@ -991,6 +991,55 @@ const CHAT_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'place_images',
+      description:
+        '把页面上的图取来交给对话、网页编辑器或正在写的文档。来源只做中转，交货后默认删掉，不要让用户自己复制粘贴。' +
+        '能拉原图（jpg/jpeg/png/webp/gif）就拉；跨域/防盗链失败则对元素截图。一次最多 8 张。' +
+        'to=chat：图出现在当前对话。to=editor：插入指定标签页的可编辑区（公众号正文、邮件正文等），先让用户打开该页或传 editor_tab_id；点进正文再调更稳，可用 selector。' +
+        'to=document：写入已有 doc_id，或带 title 新建 docx；两者都没有则返回 ![说明](img:id)。写研报/方案时，把材料里有意义的流程图、示意图、折线/柱状图这样取来，引用行原样写进 write_document 的 brief（format=docx），不要用 plot_chart 重画已有的图。' +
+        '指定 urls / selectors / entry_ids 则取这些原图。' +
+        '用户说截屏/截图/screenshot 时必须 screenshot=true：先截当前视口交给对话和模型看，同时返回可见大图 candidates，看完再按 src/selector 取原图。' +
+        '不要在用户只要截屏时去扒页面 <img>。',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: {
+            type: 'string',
+            enum: ['chat', 'editor', 'document'],
+            description: 'chat=显示在对话；editor=插入网页编辑器；document=写入 Word。默认 chat。',
+          },
+          tab_id: { type: 'number', description: '取图的标签页。省略=当前页。' },
+          editor_tab_id: { type: 'number', description: 'to=editor 时插入的标签页。省略=当前页或 tab_id。' },
+          selector: { type: 'string', description: 'to=editor 时编辑器 CSS 选择器。省略=当前焦点或第一个 contenteditable。' },
+          urls: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '要取的图片地址（img src）。',
+          },
+          selectors: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '要取的图片/容器 CSS 选择器。',
+          },
+          entry_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '已经在来源里的图片条目 id。',
+          },
+          screenshot: {
+            type: 'boolean',
+            description: 'true=立刻截当前视口（用户说截屏时用这个），不再扒 <img>。截图会给用户看，也会作为下一轮视觉输入。看完若要原图，再用 urls/selectors 调一次。',
+          },
+          doc_id: { type: 'string', description: 'to=document 时写入的已有文档 id。' },
+          title: { type: 'string', description: 'to=document 且没有 doc_id 时，用这个标题新建 docx。' },
+          keep: { type: 'boolean', description: 'true=交货后仍留在来源。默认 false（用完即弃）。' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'call_api',
       description:
         '调用任意 HTTPS API（Fed/FRED、数据库 REST、交易所、OpenAPI 等），不必为每个源改扩展。' +
@@ -1306,11 +1355,11 @@ const CHAT_TOOLS = [
         properties: {
           genre: { type: 'string', description: '体裁，如策划方案、纪要、研报、对比、档案。决定章节，不套固定研报结构。' },
           audience: { type: 'string', description: '读者是谁。' },
-          brief: { type: 'string', description: '这份文档要写什么、怎样算好、范围口径。写作阶段看不到对话，这里要写全。' },
+          brief: { type: 'string', description: '这份文档要写什么、怎样算好、范围口径。材料里的流程图/示意图/数据图先 place_images 取到，再把 ![说明](img:id) 原样写在这里。写作阶段看不到对话，这里要写全。' },
           must_cover: { type: 'array', items: { type: 'string' }, description: '必须覆盖的要点。' },
           title: { type: 'string', description: '文档标题。留空从正文取。' },
           task_ids: { type: 'array', items: { type: 'string' }, description: '只用这些子任务的段落。会话里有无关旧任务时必须传。' },
-          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md。用户要 Word 时 docx。' },
+          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md。用户要 Word、或 brief 里有 img: 引用时用 docx，图才会嵌进文件。' },
           tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
         },
         required: ['genre', 'brief'],
@@ -1432,6 +1481,7 @@ const TOOL_LABELS = {
   manage_tabs: 'Managing tabs',
   create_document: 'Creating document',
   plot_chart: 'Plotting chart',
+  place_images: 'Placing images',
   call_api: 'Calling API',
   save_memory: 'Saving memory',
   doc_edit: 'Editing document',

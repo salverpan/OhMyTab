@@ -165,6 +165,7 @@ let pendingDelete = null; // { entry, timeout } for undo
 let undoToast = null;
 let pendingSuggestions = null; // AI suggest_actions tool stores here
 let pendingCharts = [];
+let pendingImages = [];
 let pendingScopeQuiz = null; // AI ask_research_scope tool stores here
 
 /* 共享执行器的宿主上下文（accessor property：执行器读写的就是本文件的
@@ -191,6 +192,17 @@ const toolCtx = {
   set pendingScopeQuiz(v) { pendingScopeQuiz = v; },
   get pendingCharts() { return pendingCharts; },
   set pendingCharts(v) { pendingCharts = Array.isArray(v) ? v : []; },
+  get pendingImages() { return pendingImages; },
+  set pendingImages(v) { pendingImages = Array.isArray(v) ? v : []; },
+  onImage: (image) => {
+    const last = chatMessages[chatMessages.length - 1];
+    if (last && last.role === 'ai') {
+      last.images = [...(last.images || []).filter((x) => x.id !== image.id), image];
+    }
+    if (!activeAiBubbleEl) return;
+    appendPlacedImageInMessage(activeAiBubbleEl, image);
+    if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  },
   onChart: (chart) => {
     const last = chatMessages[chatMessages.length - 1];
     if (last && last.role === 'ai') {
@@ -224,6 +236,7 @@ const toolCtx = {
       pendingSuggestions = null;
       pendingScopeQuiz = null;
       pendingCharts = [];
+      pendingImages = [];
       pendingAttachments = [];
       liveSubagentCards.clear();
       toolCtx.subagentSessions = new Map();
@@ -312,6 +325,46 @@ function stampPendingChartsOn(msg, run) {
   }
 }
 
+function stampPendingImagesOn(msg, run) {
+  const images = run ? run.pendingImages : pendingImages;
+  if (!msg || msg.role !== 'ai' || !images || !images.length) return;
+  const have = new Set((msg.images || []).map((x) => x.id));
+  msg.images = [...(msg.images || []), ...images.filter((x) => !have.has(x.id))];
+  if (run) {
+    run.pendingImages = [];
+    if (viewing(run)) pendingImages = [];
+  } else {
+    pendingImages = [];
+  }
+}
+
+function appendPlacedImageInMessage(bubbleEl, image) {
+  if (!bubbleEl || !image || !image.dataUrl) return;
+  let stack = bubbleEl.querySelector('.chat-placed-images');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.className = 'chat-placed-images';
+    const before = bubbleEl.querySelector('.chat-live-charts') || bubbleEl.querySelector('.scope-quiz-host');
+    if (before) bubbleEl.insertBefore(stack, before);
+    else bubbleEl.appendChild(stack);
+  }
+  if (stack.querySelector(`[data-placed-id="${image.id}"]`)) return;
+  const img = document.createElement('img');
+  img.dataset.placedId = image.id;
+  img.src = image.dataUrl;
+  img.alt = image.alt || '';
+  stack.appendChild(img);
+}
+
+function chatPlacedImagesHtml(msg) {
+  if (!msg || !msg.images || !msg.images.length) return '';
+  const imgs = msg.images
+    .filter((x) => x && x.dataUrl)
+    .map((x) => `<img data-placed-id="${escAttr(x.id)}" src="${escAttr(x.dataUrl)}" alt="${escAttr(x.alt || '')}">`)
+    .join('');
+  return imgs ? `<div class="chat-placed-images">${imgs}</div>` : '';
+}
+
 /* ---- 任务清单卡（单实例：数据上只留最新一条 AI 消息的 plan 字段，DOM 上只留一张卡）---- */
 function applyPlanUpdate(plan, run) {
   const msgs = run ? run.messages : chatMessages;
@@ -392,11 +445,15 @@ function finalizeLiveAiBubble(bubbleEl, lastMsg, { fullText = '', interrupted = 
   const stream = bubbleEl.querySelector(':scope > .chat-stream-body');
   if (stream && fullText) stream.innerHTML = renderChatText(fullText);
   stampPendingChartsOn(lastMsg);
+  stampPendingImagesOn(lastMsg);
   if (lastMsg && lastMsg.charts && lastMsg.charts.length) {
     const have = new Set([...bubbleEl.querySelectorAll('[data-chart-id]')].map((el) => el.getAttribute('data-chart-id')));
     for (const chart of lastMsg.charts) {
       if (chart && chart.id && !have.has(chart.id)) appendChartInMessage(bubbleEl, chart);
     }
+  }
+  if (lastMsg && lastMsg.images && lastMsg.images.length) {
+    for (const image of lastMsg.images) appendPlacedImageInMessage(bubbleEl, image);
   }
   if (interrupted && !bubbleEl.querySelector('.msg-interrupted')) {
     bubbleEl.insertAdjacentHTML('beforeend', '<div class="msg-interrupted">(已中断)</div>');
@@ -1477,6 +1534,7 @@ function ensureRun(pid) {
       pendingSuggestions: null,
       pendingScopeQuiz: null,
       pendingCharts: [],
+      pendingImages: [],
       liveCards: new Map(),
       subagentSessions: new Map(),
       runningSubagents: new Set(),
@@ -1506,6 +1564,7 @@ function ensureRun(pid) {
     };
     projectRuns.set(id, run);
   }
+  if (!Array.isArray(run.pendingImages)) run.pendingImages = [];
   return run;
 }
 
@@ -1524,6 +1583,7 @@ function adoptVisible(run) {
   run.pendingSuggestions = pendingSuggestions;
   run.pendingScopeQuiz = pendingScopeQuiz;
   run.pendingCharts = pendingCharts;
+  run.pendingImages = pendingImages;
   run.liveCards = liveSubagentCards;
   run.subagentSessions = toolCtx.subagentSessions;
   run.runningSubagents = toolCtx.runningSubagents;
@@ -1562,6 +1622,7 @@ function bindVisibleRun(run) {
   pendingSuggestions = run.pendingSuggestions;
   pendingScopeQuiz = run.pendingScopeQuiz;
   pendingCharts = run.pendingCharts;
+  pendingImages = run.pendingImages;
   liveSubagentCards = run.liveCards;
   toolCtx.subagentSessions = run.subagentSessions;
   toolCtx.runningSubagents = run.runningSubagents;
@@ -1694,6 +1755,7 @@ function mirrorScalars(run) {
   pendingSuggestions = run.pendingSuggestions;
   pendingScopeQuiz = run.pendingScopeQuiz;
   pendingCharts = run.pendingCharts;
+  pendingImages = run.pendingImages;
   chatCost = run.cost;
   previewId = run.previewId;
   pendingCollect = run.pendingCollect;
@@ -1838,6 +1900,22 @@ function makeRunCtx(run) {
       run.pendingCharts = Array.isArray(v) ? v : [];
       if (viewing(run)) pendingCharts = run.pendingCharts;
     },
+    get pendingImages() { return run.pendingImages; },
+    set pendingImages(v) {
+      run.pendingImages = Array.isArray(v) ? v : [];
+      if (viewing(run)) pendingImages = run.pendingImages;
+    },
+    onImage: (image) => {
+      const last = run.messages[run.messages.length - 1];
+      if (last && last.role === 'ai') {
+        last.images = [...(last.images || []).filter((x) => x.id !== image.id), image];
+      }
+      if (!viewing(run)) return;
+      const bubble = run.activeAiBubbleEl;
+      if (!bubble || !bubble.isConnected) return;
+      appendPlacedImageInMessage(bubble, image);
+      if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    },
     onChart: (chart) => {
       const last = run.messages[run.messages.length - 1];
       if (last && last.role === 'ai') {
@@ -1870,6 +1948,7 @@ function makeRunCtx(run) {
         run.pendingSuggestions = null;
         run.pendingScopeQuiz = null;
         run.pendingCharts = [];
+        run.pendingImages = [];
         run.liveCards = new Map();
         run.subagentSessions = new Map();
         run.pendingFollowups = [];
@@ -1887,6 +1966,7 @@ function makeRunCtx(run) {
         pendingSuggestions = null;
         pendingScopeQuiz = null;
         pendingCharts = [];
+        pendingImages = [];
         liveSubagentCards = run.liveCards;
         toolCtx.subagentSessions = run.subagentSessions;
         pendingSubagentFollowups = run.pendingFollowups;
@@ -2453,10 +2533,12 @@ async function sendChatMessage(text, opts = {}) {
   run.pendingSuggestions = null;
   run.pendingScopeQuiz = null;
   run.pendingCharts = [];
+  run.pendingImages = [];
   if (viewing(run)) {
     pendingSuggestions = null;
     pendingScopeQuiz = null;
     pendingCharts = [];
+    pendingImages = [];
     settleOpenScopeQuizzes();
   } else {
     for (const m of run.messages) {
@@ -2801,7 +2883,7 @@ async function sendChatMessage(text, opts = {}) {
   if (run.discarded) return;
   // 等用户点范围卡 / 建议按钮时，即使模型没写正文也要留下气泡挂卡，
   // 不能走「已执行操作」摘要（调研航升常见：search_web 后 ask_research_scope、无 stream 文本）。
-  if (!fullText && !run.pendingScopeQuiz && !run.pendingSuggestions && !run.pendingCharts.length && !run.turnSpawned.size) {
+  if (!fullText && !run.pendingScopeQuiz && !run.pendingSuggestions && !run.pendingCharts.length && !(run.pendingImages || []).length && !run.turnSpawned.size) {
     if (viewing(run)) {
       unmountThinkingOrb();
       unmountToolOrb();
@@ -2862,6 +2944,7 @@ async function sendChatMessage(text, opts = {}) {
       run.pendingScopeQuiz = null;
     }
     stampPendingChartsOn(lastMsg, run);
+    stampPendingImagesOn(lastMsg, run);
   }
   run.activeAiBubbleEl = null;
   if (viewing(run)) activeAiBubbleEl = null;
@@ -3004,7 +3087,7 @@ function renderChat() {
     const quizHost = m.scopeQuiz ? '<div class="scope-quiz-host"></div>' : '';
     const cards = subagentListHtml(m.subagents, 'chat');
     const body = m.flow === 'text-first' ? `${text}${cards}` : `${cards}${text}`;
-    return `<div class="chat-msg ai${last}" data-msg-idx="${i}">${body}${chatChartsHtml(m)}${chatDocEditsHtml(m)}${chatPlanHtml(m)}${chips}${quizHost}${cost}</div>`;
+    return `<div class="chat-msg ai${last}" data-msg-idx="${i}">${body}${chatPlacedImagesHtml(m)}${chatChartsHtml(m)}${chatDocEditsHtml(m)}${chatPlanHtml(m)}${chips}${quizHost}${cost}</div>`;
   }).join('');
   if (chatQueue.length > 0) chatQueue.forEach((q) => appendQueuedBubble(q.id, q.text));
   if (chatMessagesEl) {
@@ -4328,6 +4411,7 @@ function resetChatRuntimeState() {
   pendingSuggestions = null;
   pendingScopeQuiz = null;
   pendingCharts = [];
+  pendingImages = [];
   liveSubagentCards.clear();
   toolCtx.subagentSessions = new Map();
   pendingSubagentFollowups = [];

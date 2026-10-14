@@ -13,7 +13,7 @@ import {
   BorderStyle, ExternalHyperlink, LineRuleType, PageBreak, ImageRun,
 } from 'docx';
 import { htmlToText } from './html-utils.js';
-import { findChartRefs, chartTokensInLine, fitImagePx } from './create-docx.js';
+import { findChartRefs, findMediaRefs, chartTokensInLine, fitImagePx } from './create-docx.js';
 import { getDocFile } from './doc-store.js';
 import { chartBlobKey, loadChartRefs } from './chart-store.js';
 
@@ -30,16 +30,36 @@ let currentFigCount = 0; // 「图 N」按文档内出现顺序编号（多条�
 
 /** 收集 markdown 引用到的图表图片（含题注/来源），尺寸等比压进可打印宽度。 */
 async function resolveChartImages(markdown) {
-  const ids = findChartRefs(markdown);
-  if (!ids.length) return null;
+  const media = findMediaRefs(markdown);
+  if (!media.length) return null;
   const refs = await loadChartRefs();
   const map = new Map();
-  for (const id of ids) {
-    const bytes = await getDocFile(chartBlobKey(id)).catch(() => null);
+  for (const item of media) {
+    if (item.kind === 'img') {
+      const bytes = await getDocFile(item.id).catch(() => null);
+      if (!bytes) continue;
+      let width = 800;
+      let height = 450;
+      if (typeof createImageBitmap === 'function') {
+        try {
+          const bmp = await createImageBitmap(new Blob([bytes]));
+          width = bmp.width;
+          height = bmp.height;
+          try { bmp.close(); } catch (_) {}
+        } catch (_) { /* 用默认尺寸 */ }
+      }
+      const fitted = fitImagePx(width, height);
+      map.set(item.id, {
+        bytes, width: fitted.width, height: fitted.height,
+        caption: item.caption || '', source: '',
+      });
+      continue;
+    }
+    const bytes = await getDocFile(chartBlobKey(item.id)).catch(() => null);
     if (!bytes) continue;
-    const meta = refs[id] || {};
+    const meta = refs[item.id] || {};
     const { width, height } = fitImagePx(meta.width, meta.height);
-    map.set(id, { bytes, width, height, caption: meta.caption || '', source: meta.source || '' });
+    map.set(item.id, { bytes, width, height, caption: meta.caption || item.caption || '', source: meta.source || '' });
   }
   return map.size ? map : null;
 }
@@ -48,7 +68,7 @@ async function resolveChartImages(markdown) {
 function wholeLineChartRef(token) {
   if (!token) return null;
   if (token.type === 'image') {
-    const m = /^chart:([A-Za-z0-9_:-]+)$/.exec(String(token.href || ''));
+    const m = /^(?:chart|img):([A-Za-z0-9_:-]+)$/.exec(String(token.href || ''));
     return m ? { id: m[1], caption: String(token.text || '').trim() } : null;
   }
   if (token.type !== 'paragraph' && token.type !== 'text') return null;

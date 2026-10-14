@@ -25,14 +25,14 @@ export function isViewportShotMessage(message) {
     && String(part.text || '').startsWith(VIEWPORT_SHOT_PREFIX));
 }
 
-export function viewportShotMessage(dataUrl) {
+export function viewportShotMessage(dataUrl, text) {
+  const caption = String(text || '').trim().startsWith(VIEWPORT_SHOT_PREFIX)
+    ? String(text).trim()
+    : `${VIEWPORT_SHOT_PREFIX}与上一条 browser_act 编号表是同一视口。点选用表中编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。`;
   return {
     role: 'user',
     content: [
-      {
-        type: 'text',
-        text: `${VIEWPORT_SHOT_PREFIX}与上一条 browser_act 编号表是同一视口。点选用表中编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。`,
-      },
+      { type: 'text', text: caption },
       { type: 'image_url', image_url: { url: dataUrl } },
     ],
   };
@@ -47,20 +47,27 @@ function demoteViewportShot() {
  * api 与 history 不是同一数组时，像素只进 api，历史不写。
  * 同一数组（子代理）只 push 一次。本轮里最多留 VIEWPORT_SHOT_KEEP 张，更早的改成一句省略说明。
  */
+function normalizeShot(item) {
+  if (typeof item === 'string' && item.startsWith('data:image')) return { url: item, text: '' };
+  if (item && typeof item.url === 'string' && item.url.startsWith('data:image')) {
+    return { url: item.url, text: item.text || '' };
+  }
+  return null;
+}
+
 export function appendViewportShots(apiMessages, historyMessages, dataUrls) {
-  const urls = (dataUrls || []).filter((url) => typeof url === 'string' && url.startsWith('data:image'));
-  if (!urls.length || !Array.isArray(apiMessages)) return;
+  const incoming = (dataUrls || []).map(normalizeShot).filter(Boolean).slice(-VIEWPORT_SHOT_KEEP);
+  if (!incoming.length || !Array.isArray(apiMessages)) return;
   const withImage = [];
   for (let i = 0; i < apiMessages.length; i++) {
     const message = apiMessages[i];
     if (!isViewportShotMessage(message)) continue;
     if (message.content.some((part) => part && part.type === 'image_url')) withImage.push(i);
   }
-  const incoming = urls.slice(-VIEWPORT_SHOT_KEEP);
   const room = Math.max(0, VIEWPORT_SHOT_KEEP - incoming.length);
   const demoteCount = Math.max(0, withImage.length - room);
   for (let n = 0; n < demoteCount; n++) apiMessages[withImage[n]] = demoteViewportShot();
-  for (const url of incoming) apiMessages.push(viewportShotMessage(url));
+  for (const shot of incoming) apiMessages.push(viewportShotMessage(shot.url, shot.text));
   // historyMessages 与 api 分离时故意不写入像素。同一引用已随 api push 带上。
   void historyMessages;
 }

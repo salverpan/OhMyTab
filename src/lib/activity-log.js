@@ -54,7 +54,7 @@ const TOOL_ZH = {
   list_feeds: '列出订阅源', query_feed_items: '查询订阅', fetch_feed_item: '读取订阅条目',
   fetch_feed_items: '批量读取订阅', collect_feed_items: '采集订阅条目', refresh_feeds: '刷新订阅',
   suggest_actions: '给出建议', ask_research_scope: '确认调研范围', manage_tabs: '管理标签页',
-  create_document: '创建文档', plot_chart: '绘制图表', call_api: '调用 API', save_memory: '保存记忆',
+  create_document: '创建文档', plot_chart: '绘制图表', place_images: '投放图片', call_api: '调用 API', save_memory: '保存记忆',
   doc_edit: '编辑文档', doc_review: '审阅文档', manage_heartbeat: '管理定时任务', ingest: '入库',
   read_section: '读取章节', search_workspace: '搜索工作区', notebook: '笔记本', plan: '任务清单',
   task: '派出子代理', submit_report: '提交报告', section_job: '章节作业', write_document: '撰写文档', compose_report: '撰写文档',

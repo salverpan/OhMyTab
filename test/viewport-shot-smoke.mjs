@@ -57,4 +57,8 @@ const gemUsers = gem.contents.filter((m) => m.role === 'user');
 ok(gemUsers.length === 1, 'Gemini 截图并进 functionResponse 那条 user');
 ok(gemUsers[0].parts.some((p) => p.functionResponse) && gemUsers[0].parts.some((p) => p.inline_data), 'Gemini 同时有结果和图片');
 
+const noted = [];
+appendViewportShots(noted, noted, [{ url: shot('n'), text: '【视口截图】刚截的当前页。' }]);
+ok(noted[0].content.some((p) => p.type === 'text' && p.text.includes('刚截的当前页')), '可带自定义说明');
+
 console.log(`viewport-shot-smoke: ${passed} passed`);

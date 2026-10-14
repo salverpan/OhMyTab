@@ -209,12 +209,15 @@ function validateSwBundle() {
     let match;
     pattern.lastIndex = 0;
     while ((match = pattern.exec(stripped)) !== null) {
+      // Find the corresponding line in the original code for a helpful message
+      const lineNum = code.slice(0, match.index).split('\n').length;
+      const fullLine = code.split('\n')[lineNum - 1] || '';
+      const snippet = fullLine.trim().slice(0, 120);
       // OOXML 部件名 document.xml 不是 DOM；xmldom 的 window.parseInt 兜底在 SW 里走不到
       if (ref === 'document.' && match[1] === 'xml') continue;
       if (ref === 'window.' && (match[1] === 'parseInt' || match[1] === 'parseFloat')) continue;
-      // Find the corresponding line in the original code for a helpful message
-      const lineNum = code.slice(0, match.index).split('\n').length;
-      const snippet = code.split('\n')[lineNum - 1]?.trim()?.slice(0, 120);
+      // JSZip 浏览器包把 setimmediate 垫片打成一行；SW 有 setTimeout，走不到 document
+      if (ref === 'document.' && fullLine.includes('setImmediate$')) continue;
       issues.push(`  Line ${lineNum}: ${ref} — ${snippet || '(not found)'}`);
     }
   }

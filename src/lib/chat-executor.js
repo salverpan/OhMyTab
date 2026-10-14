@@ -56,7 +56,10 @@ import {
 import { saveDocFile, getDocFile } from './doc-store.js';
 import { loadChartRefs, saveChartRef } from './chart-store.js';
 import { aoaToXlsxBuffer, rowsFromCreateDocumentArgs } from './create-xlsx.js';
-import { markdownToDocxBuffer, encodeUtf8, findChartRefs } from './create-docx.js';
+import { markdownToDocxBuffer, encodeUtf8, findMediaRefs } from './create-docx.js';
+import {
+  runPlaceImages, loadImageSource, discardEmbeddedPlaceImages,
+} from './place-images.js';
 import { readerUrlForRemote } from './doc-kind.js';
 import {
   autoIngestRead, ingestTool, readSectionTool, searchWorkspaceTool, notebookTool,
@@ -128,7 +131,7 @@ export function isContextOverflowError(err) {
 export const WRITE_TOOLS = new Set([
   'delete_entry', 'update_entry', 'reorder_entries',
   'collect_content', 'confirm_collect', 'cancel_collect', 'create_document',
-  'collect_feed_items', 'compose_report', 'write_document',
+  'collect_feed_items', 'compose_report', 'write_document', 'place_images',
 ]);
 
 /* 默认消息桥：panel 场景（发消息到 SW）。SW 场景用 ctx.bridge 覆盖为直调自身 handler。 */
@@ -193,9 +196,9 @@ function notifyOriginalChanged(ctx, docId) {
 /**
  * 按 format 把正文写成 IDB 原件（create_document / update_entry 共用）。
  * xlsx 会整表重建（单表）；docx 从 markdown 重建；md/txt/csv 存 UTF-8 文本。
- * docx 正文里 `![说明](chart:ID)` 的引用会去 doc-store 取光栅化 PNG 一并嵌入。
+ * docx 正文里 `![说明](chart:ID)` / `![说明](img:ID)` 的引用会取图一并嵌入。
  */
-async function writeEntryOriginal(entry, { content, structured_data, format, title } = {}) {
+async function writeEntryOriginal(entry, { content, structured_data, format, title, projectId } = {}) {
   const fmt = format || entry.format;
   const docId = entry.docId || entry.id;
   const stem = safeFileStem(entry.fileName || title || entry.aiTitle, '文档');
@@ -216,11 +219,12 @@ async function writeEntryOriginal(entry, { content, structured_data, format, tit
     fullText = csv;
     fileName = /\.xlsx$/i.test(fileName || '') ? fileName : stem + '.xlsx';
   } else if (fmt === 'docx') {
-    const { images, missing } = await collectChartImages(text);
+    const { images, missing } = await collectDocImages(text, projectId);
     ab = await markdownToDocxBuffer(text, { title: title || entry.aiTitle || '', images });
     fileName = /\.docx$/i.test(fileName || '') ? fileName : stem + '.docx';
-    if (images.size) chartNote += ` 已嵌入 ${images.size} 张图表图片（含题注与来源行）。`;
-    if (missing.length) chartNote += ` 有 ${missing.length} 个图表引用取不到图片（${missing.slice(0, 3).join('、')}）：正文里留了占位行，请重新 plot_chart(deliver="docx") 出图后再引用。`;
+    if (images.size) chartNote += ` 已嵌入 ${images.size} 张图片（含题注与来源行）。`;
+    if (missing.length) chartNote += ` 有 ${missing.length} 个图片引用取不到（${missing.slice(0, 3).join('、')}）。`;
+    if (projectId) await discardEmbeddedPlaceImages(projectId, text).catch(() => 0);
   } else if (fmt === 'md' || fmt === 'txt' || fmt === 'csv') {
     ab = encodeUtf8(text);
     const ext = fmt === 'md' ? '.md' : (fmt === 'txt' ? '.txt' : '.csv');
@@ -248,23 +252,43 @@ async function writeEntryOriginal(entry, { content, structured_data, format, tit
 
 const CHART_BLOB_PREFIX = 'chart:';
 
-/** 收集 markdown 引用到的图表字节 + 题注/来源；取不到的记进 missing（正文里会留占位行）。 */
-async function collectChartImages(markdown) {
+/** 收集 markdown 引用到的图表 / 来源图片；取不到的记进 missing。 */
+async function collectDocImages(markdown, projectId) {
   const images = new Map();
   const missing = [];
   const refs = await loadChartRefs();
-  for (const id of findChartRefs(markdown)) {
-    const bytes = await getDocFile(CHART_BLOB_PREFIX + id).catch(() => null);
-    if (!bytes) {
-      missing.push(id);
+  for (const item of findMediaRefs(markdown)) {
+    if (item.kind === 'img') {
+      const loaded = projectId ? await loadImageSource(projectId, item.id) : null;
+      if (!loaded) { missing.push(item.id); continue; }
+      let width = 800;
+      let height = 450;
+      try {
+        const bmp = await createImageBitmap(new Blob([loaded.bytes], { type: loaded.mime }));
+        width = bmp.width;
+        height = bmp.height;
+        try { bmp.close(); } catch (_) {}
+      } catch (_) { /* 用默认尺寸 */ }
+      images.set(item.id, {
+        bytes: loaded.bytes,
+        width,
+        height,
+        caption: loaded.entry.aiTitle || item.caption || '',
+        source: loaded.entry.url || '',
+      });
       continue;
     }
-    const meta = refs[id] || {};
-    images.set(id, {
+    const bytes = await getDocFile(CHART_BLOB_PREFIX + item.id).catch(() => null);
+    if (!bytes) {
+      missing.push(item.id);
+      continue;
+    }
+    const meta = refs[item.id] || {};
+    images.set(item.id, {
       bytes,
       width: Number(meta.width) || PRINT_CHART_WIDTH,
       height: Number(meta.height) || PRINT_CHART_HEIGHT,
-      caption: meta.caption || '',
+      caption: meta.caption || item.caption || '',
       source: meta.source || '',
     });
   }
@@ -396,7 +420,10 @@ async function finishBrowserAct(ctx, tab, text) {
 
 /** 全员默认页面循环（Main / general / browser）。不抢前台。 */
 export async function executeBrowserAct(args, ctx = {}) {
-  if (ctx) ctx._viewportShot = null;
+  if (ctx) {
+    ctx._viewportShot = null;
+    ctx._viewportShotNote = '';
+  }
   const op = String((args && args.op) || '').trim();
   if (!BROWSER_ACT_OPS.includes(op)) {
     return `browser_act 不支持 op=${op || '(空)'}。可用：${BROWSER_ACT_OPS.join(', ')}`;
@@ -819,7 +846,11 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
     }
     const toolResult = await executeToolCall(tc.name, tc.arguments, ctx);
     const image = ctx && typeof ctx._viewportShot === 'string' ? ctx._viewportShot : '';
-    if (ctx) ctx._viewportShot = null;
+    const imageNote = ctx && typeof ctx._viewportShotNote === 'string' ? ctx._viewportShotNote : '';
+    if (ctx) {
+      ctx._viewportShot = null;
+      ctx._viewportShotNote = '';
+    }
     hooks.done?.(label);
     logToolCall({ ctx, name: tc.name, args: tc.arguments, result: toolResult, durationMs: Date.now() - t0 });
     const elapsed = Date.now() - t0;
@@ -830,9 +861,13 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
       write: WRITE_TOOLS.has(tc.name),
       name: tc.name,
       image,
+      imageNote,
     };
   } catch (err) {
-    if (ctx) ctx._viewportShot = null;
+    if (ctx) {
+      ctx._viewportShot = null;
+      ctx._viewportShotNote = '';
+    }
     console.warn('[Citecat] tool failed:', tc.name, err);
     const errContent = `Error: ${err.message}`;
     hooks.fail?.(label);
@@ -936,7 +971,10 @@ export async function processRoundToolCalls({
     }
   }
   commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs);
-  appendViewportShots(apiMessages, historyMessages, slots.map((slot) => slot && slot.image));
+  appendViewportShots(apiMessages, historyMessages, slots.map((slot) => slot && slot.image && ({
+    url: slot.image,
+    text: slot.imageNote || '',
+  })));
 }
 
 async function runDocumentWrite(args, ctx) {
@@ -1713,6 +1751,7 @@ export async function executeToolCall(name, args, ctx = {}) {
             structured_data: args.structured_data !== undefined ? args.structured_data : target.structuredData,
             format: fmt,
             title: args.title || target.aiTitle,
+            projectId: pid,
           });
           if (orig) {
             const { chartNote, ...entryFields } = orig;
@@ -2073,6 +2112,7 @@ export async function executeToolCall(name, args, ctx = {}) {
             structured_data: args.structured_data,
             format,
             title,
+            projectId: ctx.projectId,
           });
           if (orig) {
             const { chartNote: note, ...fields } = orig;
@@ -2257,6 +2297,44 @@ export async function executeToolCall(name, args, ctx = {}) {
     case 'compose_report': {
       if (ctx.subagentKind) return JSON.stringify({ ok: false, error: 'write_document 仅供主代理使用。' });
       return runDocumentWrite(args, ctx);
+    }
+    case 'place_images': {
+      return runPlaceImages(args, ctx, {
+        updateDocument: async ({ docId, append }) => {
+          const all = await getEntries(ctx.projectId);
+          const target = all.find((e) => e && (e.id === docId || e.docId === docId));
+          if (!target) return { ok: false, error: `找不到文档 ${docId}` };
+          const next = `${String(target.fullText || '').trim()}\n\n${append}`.trim();
+          try {
+            const orig = await writeEntryOriginal(target, {
+              content: next,
+              structured_data: target.structuredData,
+              format: target.format || 'docx',
+              title: target.aiTitle,
+              projectId: ctx.projectId,
+            });
+            const patch = { fullText: next };
+            if (orig) {
+              const { chartNote: _n, ...fields } = orig;
+              Object.assign(patch, fields);
+            }
+            await updateEntry(target.id, patch, ctx.projectId);
+            ctx.entries = await getEntries(ctx.projectId);
+            ctx.onEntriesChanged && ctx.onEntriesChanged();
+            return { ok: true };
+          } catch (err) {
+            return { ok: false, error: err.message || String(err) };
+          }
+        },
+        createDocument: async ({ title, content }) => {
+          return executeToolCall('create_document', {
+            title, content, format: 'docx', summary: '插入的图片',
+          }, ctx).then((text) => {
+            const ok = String(text).startsWith('已创建文档');
+            return { ok, error: ok ? '' : String(text) };
+          });
+        },
+      });
     }
     case 'plot_chart': {
       const built = buildPlotOption(args);

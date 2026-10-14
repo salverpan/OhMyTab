@@ -26,26 +26,30 @@ const DRAW_NS = ` xmlns:r="${OD}"`
   + ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
   + ' xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"';
 
-/** 两种写法都收：`![任意说明](chart:ID)`（主推，读起来仍是标准图片语法）与 `![chart:ID]` / `[[chart:ID]]`。 */
-const CHART_TOKEN_RES = [
-  /!\[([^\]]*)\]\(chart:([A-Za-z0-9_:-]+)\)/g,
-  /!?\[{1,2}chart:([A-Za-z0-9_:-]+)\]{1,2}/g,
+/** `![说明](chart:ID)` / `![说明](img:ID)`，以及 `![chart:ID]` / `[[img:ID]]`。 */
+const MEDIA_TOKEN_RES = [
+  /!\[([^\]]*)\]\((chart|img):([A-Za-z0-9_:-]+)\)/g,
+  /!?\[{1,2}(chart|img):([A-Za-z0-9_:-]+)\]{1,2}/g,
 ];
 
-/** 一行里所有图表引用（含位置与说明文字；容忍一行放多个）。 */
-function chartTokensIn(line) {
+/** 一行里所有图片引用（图表或来源图）。 */
+function mediaTokensIn(line) {
   const s = String(line || '');
   const hits = [];
-  for (const re of CHART_TOKEN_RES) {
+  for (const re of MEDIA_TOKEN_RES) {
     re.lastIndex = 0;
     let m;
     while ((m = re.exec(s))) {
-      hits.push(m.length > 2
-        ? { index: m.index, length: m[0].length, id: m[2], caption: String(m[1] || '').trim() }
-        : { index: m.index, length: m[0].length, id: m[1], caption: '' });
+      hits.push(m.length > 3
+        ? { index: m.index, length: m[0].length, kind: m[2], id: m[3], caption: String(m[1] || '').trim() }
+        : { index: m.index, length: m[0].length, kind: m[1], id: m[2], caption: '' });
     }
   }
   return hits.sort((a, b) => a.index - b.index);
+}
+
+function chartTokensIn(line) {
+  return mediaTokensIn(line);
 }
 
 /** 供其它转换器（md-to-docx）复用的同一份引用解析 */
@@ -53,18 +57,24 @@ export function chartTokensInLine(line) {
   return chartTokensIn(line);
 }
 
-/** markdown 里引用到的全部图表 id（按首次出现顺序去重）；执行器用它判断缺图。 */
-export function findChartRefs(markdown) {
+/** markdown 里引用到的全部媒体（chart / img），按首次出现去重。 */
+export function findMediaRefs(markdown) {
   const out = [];
   const seen = new Set();
   for (const line of String(markdown || '').split('\n')) {
-    for (const t of chartTokensIn(line)) {
-      if (seen.has(t.id)) continue;
-      seen.add(t.id);
-      out.push(t.id);
+    for (const t of mediaTokensIn(line)) {
+      const key = `${t.kind}:${t.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ kind: t.kind, id: t.id, caption: t.caption });
     }
   }
   return out;
+}
+
+/** markdown 里引用到的全部图表 id（按首次出现顺序去重）；执行器用它判断缺图。 */
+export function findChartRefs(markdown) {
+  return findMediaRefs(markdown).filter((t) => t.kind === 'chart').map((t) => t.id);
 }
 
 /** 等比缩到可打印宽度内（图片按逻辑像素给尺寸，超宽按比例压缩）。 */
@@ -226,7 +236,8 @@ export function planChartImages(markdown, imageSrc) {
   const media = [];
   if (!imageSrc) return { plans, media };
   let n = 0;
-  for (const id of findChartRefs(markdown)) {
+  for (const ref of findMediaRefs(markdown)) {
+    const id = ref.id;
     const src = typeof imageSrc.get === 'function' ? imageSrc.get(id) : imageSrc[id];
     if (!src || !src.bytes) continue;
     n += 1;

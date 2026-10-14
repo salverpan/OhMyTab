@@ -6,7 +6,7 @@
 import assert from 'node:assert';
 import JSZip from 'jszip';
 import {
-  markdownToBodyXml, markdownToDocxBuffer, findChartRefs, fitImagePx,
+  markdownToBodyXml, markdownToDocxBuffer, findChartRefs, findMediaRefs, fitImagePx,
   PX_TO_EMU, PRINT_IMAGE_MAX_PX,
 } from '../src/lib/create-docx.js';
 import {
@@ -26,6 +26,8 @@ ok(JSON.stringify(findChartRefs('[[chart:cht_c]]')) === '["cht_c"]', '[[chart:id
 ok(JSON.stringify(findChartRefs('![销量走势](chart:cht_d)\n\n正文\n\n![图](chart:cht_d)')) === '["cht_d"]', '同 id 只算一次');
 ok(findChartRefs('正文里提到 chart:cht_x 但没有方括号').length === 0, '裸 chart: 不算引用（避免误吞正文）');
 ok(findChartRefs('').length === 0 && findChartRefs(null).length === 0, '空输入安全');
+ok(JSON.stringify(findMediaRefs('![现场](img:img_a)').map((x) => `${x.kind}:${x.id}`)) === '["img:img_a"]', 'img: 引用被识别');
+ok(JSON.stringify(findMediaRefs('![图](chart:c1)\n![现场](img:i1)').map((x) => `${x.kind}:${x.id}`)) === '["chart:c1","img:i1"]', 'chart 与 img 可同文共存');
 
 /* ---------- 2) 尺寸换算 ---------- */
 ok(PX_TO_EMU === 9525, '1 逻辑像素 = 9525 EMU');

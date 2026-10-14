@@ -3728,6 +3728,7 @@ function handleChatPortMessage(m) {
     }
     if (m.scopeQuiz) renderScopeQuiz(m.scopeQuiz);
     if (m.chart) appendFloatChart(m.chart);
+    if (m.image) appendFloatImage(m.image);
     if (m.plan !== undefined) upsertFloatPlan(m.plan);
     if (m.docEdit) upsertFloatDocEdit(m.docEdit);
   }
@@ -4035,6 +4036,32 @@ function renderScopeQuiz(quiz) {
     sendChatMessage();
   };
   attachScopeQuiz(host, quiz, { compact: true, onComplete: send });
+  body.scrollTop = body.scrollHeight;
+}
+
+function appendFloatImage(image) {
+  const win = INSPECT.chatWin;
+  const body = win && win.querySelector('.cw-body');
+  if (!body || !image || !image.dataUrl) return;
+  armChatWatchdog();
+  const ai = body.querySelector('.cw-msg.ai:last-of-type');
+  if (!ai) return;
+  let stack = ai.querySelector('.chat-placed-images');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.className = 'chat-placed-images';
+    const before = ai.querySelector('.chat-live-charts')
+      || ai.querySelector('.cw-thinking-row')
+      || ai.querySelector('.scope-quiz-host');
+    if (before) ai.insertBefore(stack, before);
+    else ai.appendChild(stack);
+  }
+  if (stack.querySelector(`[data-placed-id="${image.id}"]`)) return;
+  const img = document.createElement('img');
+  img.dataset.placedId = image.id;
+  img.src = image.dataUrl;
+  img.alt = image.alt || '';
+  stack.appendChild(img);
   body.scrollTop = body.scrollHeight;
 }
 

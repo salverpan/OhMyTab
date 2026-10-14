@@ -220,6 +220,7 @@ const written = await writeDocument(
 );
 ok(written.ok && written.title === '试点方案' && /假设/.test(written.markdown), '按体裁写成并采用改稿');
 ok(docCalls[0].includes('策划方案') && docCalls[1].includes('<<<DOC>>>'), '写作与改稿分两次');
+ok(docCalls[0].includes('img:id') && docCalls[1].includes('img:id'), '写作与改稿都保留材料原图引用');
 const held = await writeDocument(
   { genre: '策划方案', brief: '三个月试点' },
   {

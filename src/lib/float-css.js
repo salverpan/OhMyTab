@@ -325,6 +325,11 @@ export const FLOAT_UI_CSS = `
     100% { background-position: -100% 0; }
   }
   .cw-err { color: #dc2626; font-size: 12px; padding: 2px; }
+  .chat-placed-images { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 4px; width: 100%; }
+  .chat-placed-images img {
+    display: block; max-width: 100%; max-height: 220px; object-fit: contain;
+    border-radius: 8px; border: 1px solid rgba(0,0,0,0.08); background: #f7f4ee;
+  }
   .chat-live-charts { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 4px; width: 100%; }
   .chat-chart-card {
     background: #f7f4ee; border: 1px solid rgba(0,0,0,0.08);

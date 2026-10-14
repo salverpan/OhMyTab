@@ -2000,6 +2000,23 @@ html[data-theme="dark"] { --peek-line: #52525b; }
   text-align: right;
 }
 
+.chat-placed-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 4px;
+  width: 100%;
+  max-width: 100%;
+}
+.chat-placed-images img {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-cream, #f7f4ee);
+}
 .chat-live-charts {
   display: flex;
   flex-direction: column;

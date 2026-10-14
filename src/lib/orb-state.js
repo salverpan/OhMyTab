@@ -81,6 +81,7 @@ export const ORB_STATE_BY_TOOL = {
   // ---- composing：创作 ----
   create_document: 'composing',
   plot_chart: 'composing',
+  place_images: 'composing',
 
   // ---- breathing：轻量瞬时/等待 ----
   delete_entry: 'breathing',

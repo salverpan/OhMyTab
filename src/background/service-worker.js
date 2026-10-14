@@ -19,6 +19,7 @@ import { testCloudProvider } from '../lib/translator-cloud.js';
 import { buildPageData, buildTabSnapshot, isReadableTab, tabListMeta, formatReaderSessionNote, TAB_SNAPSHOT_BUDGET_MS, TAB_SNAPSHOT_TAB_MS } from '../lib/page-data.js';
 import { isDocumentFileUrl, readerUrlForRemote, fileNameFromUrl } from '../lib/doc-kind.js';
 import { saveDocFile } from '../lib/doc-store.js';
+import { loadImageSource, bytesToDataUrl } from '../lib/place-images.js';
 import { sessionPool, initDebuggerDispatch } from '../lib/tab-session.js';
 // 浮动聊天与侧栏 AI 平价：共用同一执行器（38 工具含 task/plan）与同一提示词/动态前言
 import { processRoundToolCalls, buildEntriesDigest, retrieveMemories, HISTORY_KEEP_TAIL_TOKENS, contextCompactBudget } from '../lib/chat-executor.js';
@@ -733,6 +734,7 @@ chrome.runtime.onConnect.addListener((port) => {
     pendingSuggestions: null,
     pendingScopeQuiz: null,
     pendingCharts: [],
+    pendingImages: [],
     subagentSessions: new Map(),
     runningSubagents: new Set(),
   };
@@ -760,6 +762,9 @@ chrome.runtime.onConnect.addListener((port) => {
     get pendingCharts() { return portState.pendingCharts; },
     set pendingCharts(v) { portState.pendingCharts = Array.isArray(v) ? v : []; },
     onChart: (chart) => { try { port.postMessage({ type: 'ui', chart }); } catch (_) {} },
+    get pendingImages() { return portState.pendingImages; },
+    set pendingImages(v) { portState.pendingImages = Array.isArray(v) ? v : []; },
+    onImage: (image) => { try { port.postMessage({ type: 'ui', image }); } catch (_) {} },
     onPlan: (plan) => { try { port.postMessage({ type: 'ui', plan }); } catch (_) {} },
     onDocEdit: (card) => { try { port.postMessage({ type: 'ui', docEdit: card }); } catch (_) {} },
     // 图表导出到 docx 要真 DOM：SW 自己没有，向发起聊天的那一页（内容脚本/阅读器）借
@@ -850,6 +855,7 @@ chrome.runtime.onConnect.addListener((port) => {
     portState.pendingSuggestions = null;
     portState.pendingScopeQuiz = null;
     portState.pendingCharts = [];
+    portState.pendingImages = [];
     let roundText = '';
     let savedFinal = false;
     let showedQuiz = false;
@@ -1113,6 +1119,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     case 'COLLECT_IMAGE':
       handleCollectImage(message.data).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
+      return true;
+    case 'GET_IMAGE_SOURCE':
+      handleGetImageSource(message.data).then(sendResponse).catch((err) => sendResponse({ ok: false, error: err.message }));
       return true;
     // 原网页/阅读器删除标注时联动：删掉关联的 snippet 条目（幂等）
     case 'DELETE_SNIPPET_BY_ANNOTATION':
@@ -1862,6 +1871,19 @@ function dataUrlToBuffer(dataUrl) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return { mime: match[1], bytes: bytes.buffer };
+}
+
+async function handleGetImageSource({ id, projectId } = {}) {
+  const pid = projectId || (await chrome.storage.sync.get('currentProject')).currentProject || 'default';
+  const loaded = await loadImageSource(pid, id);
+  if (!loaded) return { ok: false, error: '找不到该图片' };
+  return {
+    ok: true,
+    id: loaded.entry.id,
+    alt: loaded.entry.aiTitle || '',
+    mime: loaded.mime,
+    dataUrl: bytesToDataUrl(loaded.bytes, loaded.mime),
+  };
 }
 
 async function handleCollectImage({ url, title, imageUrl, dataUrl, alt, mime }) {

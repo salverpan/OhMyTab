@@ -28,12 +28,13 @@ const names = CHAT_TOOLS.map((t) => t.function.name);
 ok(names.includes('task'), 'CHAT_TOOLS 含 task');
 ok(names.includes('ask_research_scope'), 'CHAT_TOOLS 含 ask_research_scope');
 ok(names.includes('plot_chart'), 'CHAT_TOOLS 含 plot_chart');
+ok(names.includes('place_images'), 'CHAT_TOOLS 含 place_images');
 ok(names.includes('refresh_feeds'), 'CHAT_TOOLS 含 refresh_feeds');
 ok(names.includes('call_api'), 'CHAT_TOOLS 含 call_api');
 ok(names.includes('browser_act'), 'CHAT_TOOLS 含 browser_act');
 ok(names.includes('plan'), 'CHAT_TOOLS 含 plan');
 ok(names.includes('write_document'), 'CHAT_TOOLS 含 write_document');
-ok(names.length === 40, '40 个工具');
+ok(names.length === 41, '41 个工具');
 ok(buildChatTools(BUILTIN_AGENTS).some((t) => t.function.name === 'task' && /explore/.test(t.function.description)), 'buildChatTools 注入类型列表');
 ok(/最多 3/.test(buildChatTools(BUILTIN_AGENTS).find((t) => t.function.name === 'task').function.description), 'task 描述默认并行上限');
 ok(/最多 5/.test(buildChatTools(BUILTIN_AGENTS, { maxParallel: 5 }).find((t) => t.function.name === 'task').function.description), 'task 描述写入自定义并行上限');
@@ -59,6 +60,7 @@ ok(exploreTools.includes('refresh_feeds') && exploreTools.includes('query_feed_i
 ok(/query_feed_items/.test(BUILTIN_AGENTS[0].prompt), 'explore 提示词 RSS 优先');
 ok(!exploreTools.includes('notebook'), 'explore 不能写笔记本（父级专属）');
 ok(!exploreTools.includes('plot_chart'), 'explore 不能画图');
+ok(!exploreTools.includes('place_images'), 'explore 不能交货图片');
 ok(exploreTools.includes('call_api'), 'explore 可只读调 API');
 
 const generalTools = filterToolsForAgent(BUILTIN_AGENTS[1], CHAT_TOOLS).map((t) => t.function.name);
@@ -68,6 +70,7 @@ ok(PARENT_ONLY_TOOLS.has('suggest_actions'), '父级专属含 suggest_actions');
 ok(PARENT_ONLY_TOOLS.has('ask_research_scope'), '父级专属含 ask_research_scope');
 ok(PARENT_ONLY_TOOLS.has('save_memory'), '父级专属含 save_memory');
 ok(PARENT_ONLY_TOOLS.has('plot_chart'), '父级专属含 plot_chart');
+ok(PARENT_ONLY_TOOLS.has('place_images'), '父级专属含 place_images');
 
 const browserTools = filterToolsForAgent(BUILTIN_AGENTS[2], CHAT_TOOLS).map((t) => t.function.name);
 ok(browserTools.includes('browser_act') && browserTools.includes('interact_page') && !browserTools.includes('collect_content'), 'browser 默认可 browser_act，逃生口 interact_page，不能入库');
