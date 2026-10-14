@@ -4,8 +4,10 @@
  * Groq / xAI / Mistral / 本地 Ollama·vLLM·LM Studio / one-api 中转等。
  * 请求/响应格式与收口前 ai-client.js#streamChatWithTools 完全一致（行为零变化）。 */
 
-import { ApiError, readSseLines, parseSseData } from './util.js';
+import { ApiError, readSseLines, parseSseData, normalizeFinishReason } from './util.js';
 import { applyOpenAIReasoning } from './reasoning.js';
+import { resolveChatMaxTokens } from '../model-limits.js';
+import { estimateRequestTokens } from '../token-estimate.js';
 
 /** 由用户填的 Base URL 推导完整端点。兼容四种填法：
  *  - 完整端点 https://api.deepseek.com/chat/completions → 原样使用
@@ -38,14 +40,14 @@ function buildBody(cfg, messages, tools, opts = {}) {
   const body = { model: cfg.model, messages };
   if (Array.isArray(tools) && tools.length > 0) body.tools = tools;
   if (opts.stream) body.stream = true;
-  if (isReasoningModel(cfg.model)) {
-    // 上限参数沿用调用方语义：流式聊天默认 16384，非流式按 opts.maxTokens
-    const cap = opts.maxTokens ?? 16384;
-    if (cap != null) body.max_completion_tokens = cap;
-  } else {
-    body.temperature = opts.temperature ?? 0.7;
-    if (opts.maxTokens != null) body.max_tokens = opts.maxTokens;
-    else if (opts.stream) body.max_tokens = 16384;
+  if (!isReasoningModel(cfg.model)) body.temperature = opts.temperature ?? 0.7;
+  // 未显式指定时：min(目录满额, 25.6 万, 窗口减去本轮已占用)。未知模型用 3.2 万，避免厂商默认 8K。
+  const cap = resolveChatMaxTokens(cfg, opts.maxTokens, {
+    usedTokens: estimateRequestTokens(messages, tools),
+  });
+  if (cap != null) {
+    if (isReasoningModel(cfg.model)) body.max_completion_tokens = cap;
+    else body.max_tokens = cap;
   }
   if (opts.responseFormat) body.response_format = opts.responseFormat;
   applyOpenAIReasoning(body, cfg);
@@ -82,9 +84,11 @@ export async function chatComplete(cfg, messages, opts = {}) {
   if (!response.ok) await raiseResponseError(response);
 
   const data = await response.json();
+  const choice = data.choices?.[0];
   return {
-    content: data.choices?.[0]?.message?.content?.trim() || '',
+    content: choice?.message?.content?.trim() || '',
     usage: data.usage || null,
+    finishReason: normalizeFinishReason(choice?.finish_reason),
   };
 }
 

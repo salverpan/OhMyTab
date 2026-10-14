@@ -396,7 +396,7 @@ export async function fetchFeedItemHandler(args, transport = defaultTransport) {
     });
     if (fullResp && fullResp.item) item = fullResp.item;
   }
-  const text = item.fullText || item.summary || '(no content)';
+  const text = item.fullText || item.originalSummary || item.summary || '(no content)';
   return '[' + (item.title || '(no title)') + ']\nlink=' + (item.link || '') + '\n' + text;
 }
 
@@ -421,7 +421,8 @@ export async function fetchFeedItemsHandler(args, transport = defaultTransport, 
         });
         if (fullResp && fullResp.item) item = fullResp.item;
       }
-      const rawText = item.fullText || item.summary || '';
+      // 写入工作区的是证据：优先原文，翻译后的 summary 只作最后兜底。
+      const rawText = item.fullText || item.originalSummary || item.summary || '';
       const rec = {
         id: item.id,
         title: item.title || '(no title)',

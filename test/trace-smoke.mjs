@@ -18,9 +18,14 @@ globalThis.chrome = {
 
 const T = await import('../src/lib/trace-log.js');
 T.__useMemoryBackend();
-const { buildTraceGraph, isGraphEmpty, focusNodeIds, ROOT_ID } = await import('../src/lib/trace-model.js');
+const { buildTraceGraph, isGraphEmpty, focusNodeIds, ROOT_ID, buildProcessTimeline, isProcessEmpty } = await import('../src/lib/trace-model.js');
 const { layoutGraph } = await import('../src/lib/trace-layout.js');
 const { traceDetailHtml } = await import('../src/sidepanel/trace-graph.js');
+const { buildArgumentGraph, isArgumentEmpty, layoutArgumentGraph } = await import('../src/lib/argument-model.js');
+const { processTimelineHtml } = await import('../src/sidepanel/trace-process.js');
+const { chatFlowHtml } = await import('../src/sidepanel/chat-flow-view.js');
+const { briefingHtml } = await import('../src/sidepanel/briefing-view.js');
+const { buildBriefing } = await import('../src/lib/briefing-model.js');
 
 let passed = 0;
 function ok(cond, label) {
@@ -63,6 +68,36 @@ ok(reportNodes.length === 4 && reportNodes.every((n) => n.parentId === 'sa1'), '
 ok(reportNodes.find((n) => n.title === '库存下降').status === 'citation-fail'
   && reportNodes.find((n) => n.title === '库存下降').text === '引文不存在', '断言带核验 verdict 与理由');
 ok(T.subagentReportNodes({ report: null }).length === 0, '无报告不产生节点');
+const withFindings = T.subagentReportNodes({
+  projectId: 'p1', parentId: 'sa1', threadId: 'chat', ts: 2000,
+  report: {
+    summary: 's',
+    findings: [{ question: '价格？', answer: '在涨', supporting: ['c1'], contradicting: ['c2'], confidence: 'high' }],
+    claims: [{ id: 'c1', claim: '油价上涨', evidence: [] }],
+    unresolved: [], actions: [],
+  },
+});
+ok(withFindings.some((n) => n.kind === 'finding' && n.meta.support[0] === 'sa1:c1'), 'finding 挂支撑 claim 节点 id');
+
+const outlineNodes = T.reportTraceNodes({
+  projectId: 'p1', parentId: 'turn1', threadId: 'chat', reportId: 'rp1', title: '格局变化',
+  question: '低成本化会怎样？', entryId: 'doc-9',
+  outline: {
+    title: '格局变化', bluf: '价格战将蔓延',
+    key_judgments: [{ judgment: '价格战很可能蔓延', confidence: 'medium', likelihood: '很可能', basis: ['E1'], counter: ['E2'], reasoning: '单价与产能' }],
+    uncertainties: [{ issue: '停产传闻', basis: ['E2'] }],
+    gaps: ['缺官方数据'],
+  },
+  evidence: [
+    { id: 'E1', claim: '单价降至 400', verdict: 'entailment-pass', modality: 'claimed', attribution: 'A 厂', sources: [{ doc_id: 'd1', quote: '400' }] },
+    { id: 'E2', claim: '已停产', verdict: 'overclaim', modality: 'speculative', sources: [{ doc_id: 'd2', quote: '暂停' }] },
+    { id: 'E3', claim: '无关', verdict: 'entailment-pass', sources: [] },
+  ],
+});
+ok(outlineNodes[0].kind === 'report' && outlineNodes[0].refs.entryId === 'doc-9', '研报节点带产出 id');
+ok(outlineNodes.some((n) => n.kind === 'kj' && n.meta.support[0] === 'rp1:E1'), '核心判断挂证据节点');
+ok(!outlineNodes.some((n) => n.title === '无关'), '未引用的证据不进图');
+ok(T.normalizeTraceNode({ kind: 'finding' }).kind === 'finding', 'finding 是合法 kind');
 
 // —— buildTraceGraph：层级 / 笔记归属 / 修正边 ——
 const t0 = 1_700_000_000_000;
@@ -160,6 +195,96 @@ for (let i = 0; i < lay.nodes.length; i++) {
 }
 ok(overlap === 0, '节点互不重叠');
 ok(g.edges.filter((e) => e.type === 'tree').every((e) => pos.get(e.source).x < pos.get(e.target).x), '父节点总在子节点左侧（从左到右）');
+
+// —— 论证图 / 过程时间线 ——
+const argNodes = [
+  tn({ id: 'turnR', kind: 'turn', subtype: 'user', title: '帮我写研报', ts: t0 + 10 }),
+  ...outlineNodes.map((n) => ({ ...n, ts: t0 + 20 })),
+];
+const arg = buildArgumentGraph({ nodes: argNodes });
+ok(!isArgumentEmpty(arg) && arg.nodes.some((n) => n.kind === 'question') && arg.nodes.some((n) => n.kind === 'judgment'), '论证图：问题 + 判断');
+ok(arg.edges.some((e) => e.type === 'support') && arg.edges.some((e) => e.type === 'counter'), '论证图有支撑边和反对边');
+const argLay = layoutArgumentGraph(arg);
+ok(argLay.nodes.length === arg.nodes.length && argLay.width > 0, '论证图每个节点都有坐标');
+const qX = argLay.nodes.find((n) => n.id === arg.nodes.find((x) => x.kind === 'question').id).x;
+const eX = argLay.nodes.find((n) => arg.nodes.find((x) => x.id === n.id && x.kind === 'evidence')).x;
+ok(qX < eX, '论证图问题在证据左侧');
+
+const manyClaims = Array.from({ length: 12 }, (_, i) => ({ id: `c${i}`, claim: `事实${i}`, evidence: [] }));
+const flood = T.subagentReportNodes({
+  projectId: 'p1', parentId: 'saFlood', threadId: 'chat', ts: t0,
+  report: {
+    summary: 's',
+    findings: [{ question: '趋势？', answer: '向下', supporting: manyClaims.map((c) => c.id), contradicting: [], confidence: 'low' }],
+    claims: manyClaims, unresolved: [], actions: [],
+  },
+});
+const floodArg = buildArgumentGraph({
+  nodes: [
+    tn({ id: 'turnF', kind: 'turn', subtype: 'user', title: '调研趋势', ts: t0 }),
+    tn({ id: 'saFlood', parentId: 'turnF', kind: 'subagent', subtype: 'explore', title: '查趋势', ts: t0 + 1, status: 'completed' }),
+    ...flood,
+  ],
+});
+ok(floodArg.nodes.some((n) => n.kind === 'bundle') && floodArg.nodes.filter((n) => n.kind === 'evidence').length <= 4, '证据过多时聚合成 bundle');
+const expanded = buildArgumentGraph({
+  nodes: floodArg.nodes.length ? [
+    tn({ id: 'turnF', kind: 'turn', subtype: 'user', title: '调研趋势', ts: t0 }),
+    tn({ id: 'saFlood', parentId: 'turnF', kind: 'subagent', subtype: 'explore', title: '查趋势', ts: t0 + 1, status: 'completed' }),
+    ...flood,
+  ] : [],
+  expanded: { [flood.find((n) => n.kind === 'finding').id]: true },
+});
+ok(!expanded.nodes.some((n) => n.kind === 'bundle') && expanded.nodes.filter((n) => n.kind === 'evidence').length === 12, '展开后露出全部证据');
+
+const proc = buildProcessTimeline({
+  nodes: [
+    tn({ id: 'idle1', kind: 'turn', subtype: 'user', title: '怎么全是标签格式？', ts: t0 }),
+    tn({ id: 'idle1r', parentId: 'idle1', kind: 'agent', title: '那是核验标签', ts: t0 + 10 }),
+    tn({ id: 'work1', kind: 'turn', subtype: 'user', title: '稀土替代深度调研', ts: t0 + 100 }),
+    tn({ id: 'saW', parentId: 'work1', kind: 'subagent', subtype: 'explore', title: '查论文', ts: t0 + 110, endedAt: t0 + 210, status: 'completed' }),
+    ...T.subagentReportNodes({
+      projectId: 'p1', parentId: 'saW', threadId: 'chat', ts: t0 + 200,
+      report: {
+        summary: 's',
+        findings: [{ question: '替代进展？', answer: '中试阶段', supporting: ['c1'], contradicting: [], confidence: 'medium' }],
+        claims: [{ id: 'c1', claim: '中试已启动', evidence: [] }],
+        unresolved: [], actions: [],
+      },
+      verification: { claims: [{ id: 'c1', verdict: 'entailment-pass' }] },
+    }),
+  ],
+  notes: [], tasks: [],
+});
+ok(!isProcessEmpty(proc), '过程时间线非空');
+const idle = proc.threads[0].turns.find((t) => t.id === 'idle1');
+const work = proc.threads[0].turns.find((t) => t.id === 'work1');
+ok(idle.grade === 'idle' && work.grade === 'work', '闲聊回合降级，调研回合保留');
+ok(work.subagents[0].groups[0].question === '替代进展？' && work.subagents[0].counts.pass === 1, '断言按 finding 分组');
+const procHtml = processTimelineHtml(proc);
+ok(procHtml.includes('is-idle') && procHtml.includes('替代进展') && !procHtml.includes('主代理回复'), '过程 HTML：闲聊折叠、判断可见、回复用正文');
+const flowHtml = chatFlowHtml(proc);
+ok(flowHtml.includes('ChatFlow') && flowHtml.includes('稀土替代深度调研') && !flowHtml.includes('怎么全是标签格式'), 'ChatFlow 只画调研回合');
+ok(!flowHtml.includes('这条对话怎么走的') && flowHtml.includes('子代理'), 'ChatFlow 标题与派出线');
+const brief = buildBriefing({
+  nodes: [
+    tn({ id: 'turnR', kind: 'turn', subtype: 'user', title: '稀土替代调研', ts: t0 }),
+    ...T.reportTraceNodes({
+      projectId: 'p1', parentId: 'turnR', threadId: 'chat', reportId: 'rpX', title: '定点前夜',
+      question: '稀土替代到哪了',
+      outline: {
+        title: '定点前夜', bluf: '只会在 A0 上车',
+        key_judgments: [{ judgment: '铁氧体先上 A0', confidence: 'medium', likelihood: '很可能', basis: ['E1'], counter: [], reasoning: '定点指向入门车' }],
+      },
+      evidence: [
+        { id: 'E1', claim: '入门版采用铁氧体', verdict: 'entailment-pass', sources: [{ quote: '量产' }] },
+      ],
+    }),
+  ],
+});
+const briefHtml = briefingHtml(brief);
+ok(briefHtml.includes('j-trio') && briefHtml.includes('支撑') && briefHtml.includes('反对') && briefHtml.includes('未核'), '简报三列计数');
+ok(!briefHtml.includes('tb-bar') && !briefHtml.includes('条越绿'), '简报不再用证据条');
 
 // —— 详情卡：转义 + 新旧对比 + 笔记跳转 ——
 const noteById = new Map(notes.map((n) => [n.id, n]));

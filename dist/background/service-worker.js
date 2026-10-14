@@ -136,7 +136,7 @@ const TOOL_ZH = {
   create_document: '创建文档', plot_chart: '绘制图表', call_api: '调用 API', save_memory: '保存记忆',
   doc_edit: '编辑文档', doc_review: '审阅文档', manage_heartbeat: '管理定时任务', ingest: '入库',
   read_section: '读取章节', search_workspace: '搜索工作区', notebook: '笔记本', plan: '任务清单',
-  task: '派出子代理', submit_report: '提交报告', section_job: '章节作业',
+  task: '派出子代理', submit_report: '提交报告', section_job: '章节作业', write_document: '撰写文档', compose_report: '撰写文档',
   extract_subtitles: '提取字幕', fetch_video_transcript: '获取视频字幕', capture_network: '抓取网络请求',
   exec_js_main: '执行页面脚本', vision_find: '视觉查找', vision_read: '视觉阅读', vision_extract: '视觉 OCR',
 };
@@ -454,8 +454,26 @@ const AGENT_WRAP_HINT_ROUND = 95;
 /* 子代理轮数**不设上限**（2026-09-10 用户拍板）。旧口径是 24 轮 + 第 20 轮注入
  * 收尾提示；实测一次麦捷科技调研打满 24 轮仍在调工具，循环按预算退出时把
  * `lastText`（模型唯一说过的开场白）当报告交回，父代理收到的是 completed + 一句话。
- * 现在子代理做到自己交出最终报告为止，唯一终止是模型某轮不再调工具或父代理 abort。
- * 若担心模型陷在工具循环里不收敛，用停止按钮（signal）而不是恢复轮数硬顶。 */
+ *
+ * 2026-10-07 改为**资源预算 + 强制交回**：按累计 token 与耗时计，不按轮数。
+ * 到 SUBAGENT_BUDGET_WARN_RATIO 注入收尾提示；耗尽时只给模型 submit_report 一个工具，
+ * 逼它把已核实的写进 claims、没查完的写进 unresolved——旧问题是退出时丢弃了工作，
+ * 不是预算本身。0 = 不限。用户可在设置「子代理」里改。 */
+const SUBAGENT_BUDGET_TOKENS = 2_000_000;
+const SUBAGENT_BUDGET_TOKENS_MAX = 50_000_000;
+const SUBAGENT_BUDGET_MINUTES = 20;
+const SUBAGENT_BUDGET_MINUTES_MAX = 240;
+const SUBAGENT_BUDGET_WARN_RATIO = 0.85;
+/** 预算耗尽后的强制交回最多尝试几轮（模型仍不调 submit_report 则判 incomplete）。 */
+const SUBAGENT_FORCED_SUBMIT_ROUNDS = 2;
+
+function clampSubagentBudgetTokens(raw) {
+  return clampInt(raw, 0, SUBAGENT_BUDGET_TOKENS_MAX, SUBAGENT_BUDGET_TOKENS);
+}
+
+function clampSubagentBudgetMinutes(raw) {
+  return clampInt(raw, 0, SUBAGENT_BUDGET_MINUTES_MAX, SUBAGENT_BUDGET_MINUTES);
+}
 
 /** 同一轮并行子代理上限（默认）。用户可在设置「子代理」里改；覆盖不全时再补一波（只补缺口）。
  * 浏览器是共享资源：配合 SUBAGENT_MAX_TABS 最坏默认 3×6=18 个后台标签。 */
@@ -483,7 +501,9 @@ function clampSubagentMaxTabs(raw) {
   return clampInt(raw, SUBAGENT_MAX_TABS_MIN, SUBAGENT_MAX_TABS_MAX, SUBAGENT_MAX_TABS);
 }
 
-/** 同一轮 Sub 可并行的无状态章节作业；只读已落库正文，不占浏览器标签。 */
+/** 同一轮 Sub 可并行的无状态章节作业；只读已落库正文，不占浏览器标签。
+ * MAX_CHARS 是单次送入模型的分页尺寸，不是文件总长上限：更长的正文由
+ * section_job 返回的 content_next_offset 续拉。 */
 const SECTION_WORKER_MAX_PARALLEL = 4;
 const SECTION_WORKER_MAX_CHARS = 20000;
 const SECTION_WORKER_MAX_ROUNDS = 3;
@@ -499,10 +519,11 @@ const CHECK_TIMEOUT_MS = 30000;
  * 可能永不 settle；超时必须抛错并让 acquireBrowserLock 释放，禁止无限等。 */
 const CDP_TIMEOUT_MS = 20000;
 
-/** 通用 call_api：单次超时与请求体/响应上限。密钥不进这些数字。 */
+/** 通用 call_api：单次超时与请求体上限。响应**不在源头截断**——全量文本交给
+ * 执行器的溢出入库（EXEC_OUTPUT_CAP_CHARS，全文进工作区、模型拿预览 + doc_id）。
+ * 密钥不进这些数字。 */
 const CALL_API_TIMEOUT_MS = 30000;
 const CALL_API_MAX_BODY = 256 * 1024;
-const CALL_API_MAX_RESPONSE_CHARS = 30000;
 
 /* 子代理交回父代理的自然语言正文不再是真相通道。
  * 长度由 TaskReport 的 summary/claims/actions/unresolved schema 约束；长来源只回
@@ -524,7 +545,7 @@ const STORAGE_KEYS = {
 const CHANNELS_KEY = 'aiChannels';       // chrome.storage.local：渠道档案列表
 const ACTIVE_CHANNEL_KEY = 'activeChannelId';
 const CUSTOM_SUBAGENTS_KEY = 'customSubagents'; // 用户自定义子代理（name/description/prompt/tools）
-const SUBAGENT_LIMITS_KEY = 'subagentLimits'; // { maxParallel, maxTabs }
+const SUBAGENT_LIMITS_KEY = 'subagentLimits'; // { maxParallel, maxTabs, budgetTokens, budgetMinutes, checkChannelId }
 
 const DEFAULT_API_CONFIG = {
   apiKey: '',
@@ -778,19 +799,26 @@ async function getCustomSubagents() {
 }
 
 function normalizeSubagentLimits(raw) {
+  const pick = (k, d) => (raw && raw[k] != null && raw[k] !== '' ? raw[k] : d);
   return {
-    maxParallel: clampSubagentMaxParallel(raw && raw.maxParallel != null ? raw.maxParallel : SUBAGENT_MAX_PARALLEL),
-    maxTabs: clampSubagentMaxTabs(raw && raw.maxTabs != null ? raw.maxTabs : SUBAGENT_MAX_TABS),
+    maxParallel: clampSubagentMaxParallel(pick('maxParallel', SUBAGENT_MAX_PARALLEL)),
+    maxTabs: clampSubagentMaxTabs(pick('maxTabs', SUBAGENT_MAX_TABS)),
+    budgetTokens: clampSubagentBudgetTokens(pick('budgetTokens', SUBAGENT_BUDGET_TOKENS)),
+    budgetMinutes: clampSubagentBudgetMinutes(pick('budgetMinutes', SUBAGENT_BUDGET_MINUTES)),
+    checkChannelId: String((raw && raw.checkChannelId) || ''),
   };
 }
 
-/** 用户配置的子代理批次并行上限、单子代理同时打开标签上限。未配置时回落 limits.js 默认值。 */
+/**
+ * 用户配置的子代理限额：批次并行、同时打开标签、单个子代理的 token / 耗时预算、
+ * Check 审查模型所用渠道（空 = 跟随子代理自己的模型）。未配置时回落 limits.js 默认值。
+ */
 async function getSubagentLimits() {
   try {
     const { [SUBAGENT_LIMITS_KEY]: stored } = await chrome.storage.local.get(SUBAGENT_LIMITS_KEY);
     return normalizeSubagentLimits(stored);
   } catch (_) {
-    return { maxParallel: SUBAGENT_MAX_PARALLEL, maxTabs: SUBAGENT_MAX_TABS };
+    return normalizeSubagentLimits(null);
   }
 }
 
@@ -871,6 +899,13 @@ function safeJsonParse(text, fallback = {}) {
   } catch (_) {
     return fallback;
   }
+}
+
+/** 各协议的「输出被上限截断」收成 length，其余原样小写。 */
+function normalizeFinishReason(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'length' || s === 'max_tokens' || s.includes('max_token')) return 'length';
+  return s || 'stop';
 }
 
 const keys = /* #__PURE__ */ JSON.parse("{\"siliconflow-cn/baidu/ernie-4.5-300b-a47b\":[131000,131000,0],\"baidu/ernie-4.5-300b-a47b\":[131000,131000,0],\"ernie-4.5-300b-a47b\":[131000,131000,0],\"siliconflow-cn/stepfun-ai/step-3.5-flash\":[262000,262000,1],\"stepfun-ai/step-3.5-flash\":[262000,262000,1],\"step-3.5-flash\":[262000,262000,1],\"siliconflow-cn/deepseek-ai/deepseek-v4-flash\":[1000000,384000,1],\"deepseek-ai/deepseek-v4-flash\":[1000000,384000,1],\"deepseek-v4-flash\":[1000000,384000,1],\"siliconflow-cn/deepseek-ai/deepseek-v3.1-terminus\":[164000,164000,1],\"deepseek-ai/deepseek-v3.1-terminus\":[164000,164000,1],\"deepseek-v3.1-terminus\":[164000,164000,1],\"siliconflow-cn/deepseek-ai/deepseek-ocr\":[8192,8192,0],\"deepseek-ai/deepseek-ocr\":[8192,8192,0],\"deepseek-ocr\":[8192,8192,0],\"siliconflow-cn/deepseek-ai/deepseek-r1\":[164000,164000,1],\"deepseek-ai/deepseek-r1\":[163839,163839,1],\"deepseek-r1\":[163839,163839,1],\"siliconflow-cn/deepseek-ai/deepseek-v3.2\":[164000,164000,1],\"deepseek-ai/deepseek-v3.2\":[164000,164000,1],\"deepseek-v3.2\":[164000,164000,1],\"siliconflow-cn/deepseek-ai/deepseek-v4-pro\":[1049000,393000,1],\"deepseek-ai/deepseek-v4-pro\":[512000,384000,1],\"deepseek-v4-pro\":[512000,384000,1],\"siliconflow-cn/deepseek-ai/deepseek-v3\":[164000,164000,0],\"deepseek-ai/deepseek-v3\":[131072,131072,0],\"deepseek-v3\":[131072,131072,0],\"siliconflow-cn/inclusionai/ling-flash-2.0\":[131000,131000,0],\"inclusionai/ling-flash-2.0\":[131000,131000,0],\"ling-flash-2.0\":[131000,131000,0],\"siliconflow-cn/zai-org/glm-5.2\":[1049000,262000,1],\"zai-org/glm-5.2\":[512000,164000,1],\"glm-5.2\":[512000,164000,1],\"siliconflow-cn/zai-org/glm-4.5-air\":[131000,131000,0],\"zai-org/glm-4.5-air\":[131000,131000,0],\"glm-4.5-air\":[131072,98304,1],\"siliconflow-cn/qwen/qwen3.5-27b\":[262144,65536,1],\"qwen/qwen3.5-27b\":[262144,262144,0],\"qwen3.5-27b\":[262144,262144,0],\"siliconflow-cn/qwen/qwen3-8b\":[131000,131000,1],\"qwen/qwen3-8b\":[131000,131000,1],\"qwen3-8b\":[131000,131000,1],\"siliconflow-cn/qwen/qwen3-14b\":[131000,131000,1],\"qwen/qwen3-14b\":[131000,131000,1],\"qwen3-14b\":[131000,131000,1],\"siliconflow-cn/qwen/qwen3.5-4b\":[262144,65536,1],\"qwen/qwen3.5-4b\":[262144,65536,1],\"qwen3.5-4b\":[262144,65536,1],\"siliconflow-cn/qwen/qwen3.5-9b\":[262144,65536,1],\"qwen/qwen3.5-9b\":[262144,65536,1],\"qwen3.5-9b\":[262144,65536,1],\"siliconflow-cn/qwen/qwen3.5-122b-a10b\":[262144,65536,1],\"qwen/qwen3.5-122b-a10b\":[262144,262144,0],\"qwen3.5-122b-a10b\":[262144,262144,0],\"siliconflow-cn/qwen/qwen3.5-397b-a17b\":[262144,65536,1],\"qwen/qwen3.5-397b-a17b\":[262144,130000,1],\"qwen3.5-397b-a17b\":[262144,130000,1],\"siliconflow-cn/qwen/qwen3.5-35b-a3b\":[262144,65536,1],\"qwen/qwen3.5-35b-a3b\":[262144,262144,0],\"qwen3.5-35b-a3b\":[262144,262144,0],\"siliconflow-cn/qwen/qwen3-32b\":[131000,131000,1],\"qwen/qwen3-32b\":[131000,131000,1],\"qwen3-32b\":[131000,131000,1],\"siliconflow-cn/qwen/qwen3-235b-a22b-thinking-2507\":[262000,262000,1],\"qwen/qwen3-235b-a22b-thinking-2507\":[262000,262000,1],\"qwen3-235b-a22b-thinking-2507\":[262000,262000,1],\"siliconflow-cn/qwen/qwen3.6-35b-a3b\":[262144,65536,0],\"qwen/qwen3.6-35b-a3b\":[262144,262144,0],\"qwen3.6-35b-a3b\":[262144,262144,0],\"siliconflow-cn/qwen/qwen3-vl-30b-a3b-instruct\":[262000,262000,0],\"qwen/qwen3-vl-30b-a3b-instruct\":[262000,262000,0],\"qwen3-vl-30b-a3b-instruct\":[262000,262000,0],\"siliconflow-cn/qwen/qwen3-vl-235b-a22b-thinking\":[262000,262000,1],\"qwen/qwen3-vl-235b-a22b-thinking\":[262000,262000,1],\"qwen3-vl-235b-a22b-thinking\":[262000,262000,1],\"siliconflow-cn/qwen/qwen3-vl-8b-instruct\":[262000,262000,0],\"qwen/qwen3-vl-8b-instruct\":[262000,262000,0],\"qwen3-vl-8b-instruct\":[262000,262000,0],\"siliconflow-cn/qwen/qwen3-vl-32b-instruct\":[262000,262000,0],\"qwen/qwen3-vl-32b-instruct\":[262000,262000,0],\"qwen3-vl-32b-instruct\":[262000,262000,0],\"siliconflow-cn/qwen/qwen2.5-72b-instruct\":[33000,4000,0],\"qwen/qwen2.5-72b-instruct\":[33000,4000,0],\"qwen2.5-72b-instruct\":[33000,4000,0],\"siliconflow-cn/qwen/qwen2.5-7b-instruct\":[33000,4000,0],\"qwen/qwen2.5-7b-instruct\":[33000,4000,0],\"qwen2.5-7b-instruct\":[33000,4000,0],\"siliconflow-cn/qwen/qwen3-coder-480b-a35b-instruct\":[262000,262000,0],\"qwen/qwen3-coder-480b-a35b-instruct\":[262000,262000,0],\"qwen3-coder-480b-a35b-instruct\":[262000,262000,0],\"siliconflow-cn/qwen/qwen3-vl-235b-a22b-instruct\":[262000,262000,0],\"qwen/qwen3-vl-235b-a22b-instruct\":[262000,262000,0],\"qwen3-vl-235b-a22b-instruct\":[262000,262000,0],\"siliconflow-cn/qwen/qwen3-coder-30b-a3b-instruct\":[262000,262000,0],\"qwen/qwen3-coder-30b-a3b-instruct\":[262000,262000,0],\"qwen3-coder-30b-a3b-instruct\":[262000,262000,0],\"siliconflow-cn/qwen/qwen3-vl-32b-thinking\":[262000,262000,1],\"qwen/qwen3-vl-32b-thinking\":[262000,262000,1],\"qwen3-vl-32b-thinking\":[262000,262000,1],\"siliconflow-cn/qwen/qwen3-vl-30b-a3b-thinking\":[262000,262000,1],\"qwen/qwen3-vl-30b-a3b-thinking\":[262000,262000,1],\"qwen3-vl-30b-a3b-thinking\":[262000,262000,1],\"siliconflow-cn/qwen/qwen3-30b-a3b-instruct-2507\":[262000,262000,0],\"qwen/qwen3-30b-a3b-instruct-2507\":[262000,262000,0],\"qwen3-30b-a3b-instruct-2507\":[262000,262000,0],\"siliconflow-cn/bytedance-seed/seed-oss-36b-instruct\":[262000,262000,0],\"bytedance-seed/seed-oss-36b-instruct\":[262000,262000,0],\"seed-oss-36b-instruct\":[262000,262000,0],\"siliconflow-cn/pro/deepseek-ai/deepseek-v3\":[164000,164000,0],\"pro/deepseek-ai/deepseek-v3\":[164000,164000,0],\"siliconflow-cn/pro/deepseek-ai/deepseek-v3.1-terminus\":[164000,164000,1],\"pro/deepseek-ai/deepseek-v3.1-terminus\":[164000,164000,1],\"siliconflow-cn/pro/deepseek-ai/deepseek-r1\":[164000,164000,1],\"pro/deepseek-ai/deepseek-r1\":[164000,164000,1],\"siliconflow-cn/pro/deepseek-ai/deepseek-v3.2\":[164000,164000,1],\"pro/deepseek-ai/deepseek-v3.2\":[164000,164000,1],\"siliconflow-cn/pro/zai-org/glm-5.1\":[205000,205000,1],\"pro/zai-org/glm-5.1\":[205000,205000,1],\"glm-5.1\":[202752,131072,1],\"siliconflow-cn/pro/zai-org/glm-5\":[205000,205000,1],\"pro/zai-org/glm-5\":[205000,205000,1],\"glm-5\":[202752,131072,1],\"siliconflow-cn/pro/minimaxai/minimax-m2.5\":[192000,131000,0],\"pro/minimaxai/minimax-m2.5\":[192000,131000,0],\"minimax-m2.5\":[204800,131072,1],\"siliconflow-cn/pro/moonshotai/kimi-k2.5\":[262000,262000,1],\"pro/moonshotai/kimi-k2.5\":[262000,262000,1],\"kimi-k2.5\":[262144,262144,1],\"siliconflow-cn/pro/moonshotai/kimi-k2.6\":[262000,262000,1],\"pro/moonshotai/kimi-k2.6\":[262000,262000,1],\"kimi-k2.6\":[262144,131000,1],\"siliconflow-cn/tencent/hunyuan-a13b-instruct\":[131000,131000,1],\"tencent/hunyuan-a13b-instruct\":[131000,131000,1],\"hunyuan-a13b-instruct\":[131000,131000,1],\"siliconflow-cn/paddlepaddle/paddleocr-vl-1.5\":[16384,16384,0],\"paddlepaddle/paddleocr-vl-1.5\":[16384,16384,0],\"paddleocr-vl-1.5\":[16384,16384,0],\"groq/llama-3.1-8b-instant\":[131072,131072,0],\"llama-3.1-8b-instant\":[131072,131072,0],\"groq/allam-2-7b\":[4096,4096,0],\"allam-2-7b\":[4096,4096,0],\"groq/llama-3.3-70b-versatile\":[131072,32768,0],\"llama-3.3-70b-versatile\":[131072,32768,0],\"groq/qwen/qwen3.8-27b\":[131042,16384,1],\"qwen/qwen3.8-27b\":[1000000,131072,1],\"qwen3.8-27b\":[131042,16384,1],\"groq/qwen/qwen3.6-27b\":[131072,16384,1],\"qwen/qwen3.6-27b\":[262144,262144,0],\"qwen3.6-27b\":[262144,262144,0],\"groq/groq/compound\":[131072,8192,0],\"groq/compound\":[131072,8192,0],\"compound\":[131072,8192,0],\"groq/groq/compound-mini\":[131072,8192,0],\"groq/compound-mini\":[131072,8192,0],\"compound-mini\":[131072,8192,0],\"groq/meta-llama/llama-prompt-guard-2-86m\":[512,512,0],\"meta-llama/llama-prompt-guard-2-86m\":[512,512,0],\"llama-prompt-guard-2-86m\":[512,512,0],\"groq/meta-llama/llama-prompt-guard-2-22m\":[512,512,0],\"meta-llama/llama-prompt-guard-2-22m\":[512,512,0],\"llama-prompt-guard-2-22m\":[512,512,0],\"groq/openai/gpt-oss-20b\":[131072,65536,1],\"openai/gpt-oss-20b\":[131072,131072,1],\"gpt-oss-20b\":[131072,131072,1],\"groq/openai/gpt-oss-safeguard-20b\":[131072,65536,1],\"openai/gpt-oss-safeguard-20b\":[131072,65536,1],\"gpt-oss-safeguard-20b\":[131072,65536,1],\"groq/openai/gpt-oss-120b\":[131072,65536,1],\"openai/gpt-oss-120b\":[131072,131072,1],\"gpt-oss-120b\":[131072,131072,1],\"groq/canopylabs/orpheus-v1-english\":[4000,50000,0],\"canopylabs/orpheus-v1-english\":[4000,50000,0],\"orpheus-v1-english\":[4000,50000,0],\"groq/canopylabs/orpheus-arabic-saudi\":[4000,50000,0],\"canopylabs/orpheus-arabic-saudi\":[4000,50000,0],\"orpheus-arabic-saudi\":[4000,50000,0],\"alibaba-cn/qwen3.7-max\":[1000000,65536,1],\"qwen3.7-max\":[1000000,500000,0],\"alibaba-cn/qwen2-5-72b-instruct\":[131072,8192,0],\"qwen2-5-72b-instruct\":[131072,8192,0],\"alibaba-cn/deepseek-r1-distill-qwen-7b\":[32768,16384,1],\"deepseek-r1-distill-qwen-7b\":[32768,16384,1],\"alibaba-cn/qwen3-next-80b-a3b-thinking\":[131072,32768,1],\"qwen3-next-80b-a3b-thinking\":[131072,32768,1],\"alibaba-cn/deepseek-v3\":[65536,8192,0],\"alibaba-cn/qwen2-5-omni-7b\":[32768,2048,0],\"qwen2-5-omni-7b\":[32768,2048,0],\"alibaba-cn/qwen-mt-turbo\":[16384,8192,0],\"qwen-mt-turbo\":[16384,8192,0],\"alibaba-cn/deepseek-v3-1\":[131072,65536,0],\"deepseek-v3-1\":[131072,131072,1],\"alibaba-cn/qwen-deep-research\":[1000000,32768,0],\"qwen-deep-research\":[1000000,32768,0],\"alibaba-cn/qwen-vl-max\":[131072,8192,0],\"qwen-vl-max\":[131072,8192,0],\"alibaba-cn/qwen3-next-80b-a3b-instruct\":[131072,32768,0],\"qwen3-next-80b-a3b-instruct\":[131072,32768,0],\"alibaba-cn/qwen3-coder-flash\":[1000000,65536,0],\"qwen3-coder-flash\":[1000000,65536,0],\"alibaba-cn/qwen3-14b\":[131072,8192,1],\"alibaba-cn/qwen-max\":[131072,8192,0],\"qwen-max\":[32768,8192,0],\"alibaba-cn/qwen3.6-plus\":[1000000,65536,1],\"qwen3.6-plus\":[1000000,500000,1],\"alibaba-cn/moonshot-kimi-k2-instruct\":[131072,8192,0],\"moonshot-kimi-k2-instruct\":[131072,8192,0],\"alibaba-cn/qwen-vl-plus\":[131072,8192,0],\"qwen-vl-plus\":[131072,8192,0],\"alibaba-cn/qwen-omni-turbo-realtime\":[32768,2048,0],\"qwen-omni-turbo-realtime\":[32768,2048,0],\"alibaba-cn/kimi-k2.6\":[262144,16384,1],\"alibaba-cn/qwen-flash\":[1000000,32768,1],\"qwen-flash\":[1000000,32768,1],\"alibaba-cn/glm-5.2\":[1000000,128000,1],\"alibaba-cn/qwen-turbo\":[1000000,16384,1],\"qwen-turbo\":[1000000,16384,1],\"alibaba-cn/qwen3-vl-30b-a3b\":[131072,32768,1],\"qwen3-vl-30b-a3b\":[131072,32768,1],\"alibaba-cn/qwen-vl-ocr\":[34096,4096,0],\"qwen-vl-ocr\":[34096,4096,0],\"alibaba-cn/tongyi-intent-detect-v3\":[8192,1024,0],\"tongyi-intent-detect-v3\":[8192,1024,0],\"alibaba-cn/deepseek-v4-flash\":[1000000,384000,1],\"alibaba-cn/kimi-k2-thinking\":[262144,16384,1],\"kimi-k2-thinking\":[262144,262144,1],\"alibaba-cn/qwen3-32b\":[131072,16384,1],\"alibaba-cn/qwq-plus\":[131072,8192,1],\"qwq-plus\":[131072,8192,1],\"alibaba-cn/qwen3.5-flash\":[1000000,65536,1],\"qwen3.5-flash\":[1000000,65536,1],\"alibaba-cn/qwen3-vl-plus\":[262144,32768,1],\"qwen3-vl-plus\":[262144,32768,1],\"alibaba-cn/deepseek-v3-2-exp\":[131072,65536,0],\"deepseek-v3-2-exp\":[131072,65536,0],\"alibaba-cn/qwen2-5-7b-instruct\":[131072,8192,0],\"qwen2-5-7b-instruct\":[131072,8192,0],\"alibaba-cn/qwen3-coder-30b-a3b-instruct\":[262144,65536,0],\"alibaba-cn/qwen2-5-math-7b-instruct\":[4096,3072,0],\"qwen2-5-math-7b-instruct\":[4096,3072,0],\"alibaba-cn/qwen3.5-397b-a17b\":[262144,65536,1],\"alibaba-cn/qwq-32b\":[131072,8192,1],\"qwq-32b\":[131072,8192,1],\"alibaba-cn/deepseek-r1\":[131072,16384,1],\"alibaba-cn/qwen3-asr-flash\":[53248,4096,0],\"qwen3-asr-flash\":[53248,4096,0],\"alibaba-cn/qwen3-omni-flash\":[65536,16384,1],\"qwen3-omni-flash\":[65536,16384,1],\"alibaba-cn/deepseek-r1-distill-qwen-1-5b\":[32768,16384,1],\"deepseek-r1-distill-qwen-1-5b\":[32768,16384,1],\"alibaba-cn/qwen3.7-flash\":[1000000,65536,1],\"qwen3.7-flash\":[1000000,65536,1],\"alibaba-cn/qwen2-5-vl-72b-instruct\":[131072,8192,0],\"qwen2-5-vl-72b-instruct\":[131072,8192,0],\"alibaba-cn/deepseek-r1-0528\":[131072,16384,1],\"deepseek-r1-0528\":[163840,32768,1],\"alibaba-cn/deepseek-r1-distill-qwen-32b\":[32768,16384,1],\"deepseek-r1-distill-qwen-32b\":[32768,16384,1],\"alibaba-cn/qwen3-max\":[262144,65536,0],\"qwen3-max\":[262144,65536,0],\"alibaba-cn/qwen2-5-coder-32b-instruct\":[131072,8192,0],\"qwen2-5-coder-32b-instruct\":[131072,8192,0],\"alibaba-cn/deepseek-r1-distill-llama-70b\":[32768,16384,1],\"deepseek-r1-distill-llama-70b\":[32768,16384,1],\"alibaba-cn/qwen2-5-math-72b-instruct\":[4096,3072,0],\"qwen2-5-math-72b-instruct\":[4096,3072,0],\"alibaba-cn/qwen-plus\":[1000000,32768,1],\"qwen-plus\":[1000000,32768,1],\"alibaba-cn/minimax-m2.5\":[204800,131072,1],\"alibaba-cn/qwen3-omni-flash-realtime\":[65536,16384,0],\"qwen3-omni-flash-realtime\":[65536,16384,0],\"alibaba-cn/qwen2-5-vl-7b-instruct\":[131072,8192,0],\"qwen2-5-vl-7b-instruct\":[131072,8192,0],\"alibaba-cn/qwen3.6-flash\":[1000000,65536,1],\"qwen3.6-flash\":[1000000,65536,1],\"alibaba-cn/qwen3.8-flash\":[1000000,131072,1],\"qwen3.8-flash\":[1000000,131072,1],\"alibaba-cn/qwen2-5-14b-instruct\":[131072,8192,0],\"qwen2-5-14b-instruct\":[131072,8192,0],\"alibaba-cn/qwen-math-turbo\":[4096,3072,0],\"qwen-math-turbo\":[4096,3072,0],\"alibaba-cn/qwen-plus-character\":[32768,4096,0],\"qwen-plus-character\":[32768,4096,0],\"alibaba-cn/qwen3.6-max-preview\":[245800,65536,1],\"qwen3.6-max-preview\":[262144,65536,1],\"alibaba-cn/glm-5\":[202752,16384,1],\"alibaba-cn/qwen3.8-max\":[1000000,131072,1],\"qwen3.8-max\":[1000000,131072,1],\"alibaba-cn/kimi-k2.5\":[262144,32768,1],\"alibaba-cn/qwen3-8b\":[131072,8192,1],\"alibaba-cn/glm-5.1\":[202752,128000,1],\"alibaba-cn/qwen3-235b-a22b\":[131072,16384,1],\"qwen3-235b-a22b\":[131072,16384,1],\"alibaba-cn/qwen3.7-plus\":[1000000,64000,1],\"qwen3.7-plus\":[1000000,65536,1],\"alibaba-cn/qwen-omni-turbo\":[32768,2048,0],\"qwen-omni-turbo\":[32768,2048,0],\"alibaba-cn/deepseek-v4-pro\":[1000000,384000,1],\"alibaba-cn/qwen3-coder-480b-a35b-instruct\":[262144,65536,0],\"alibaba-cn/qwen2-5-32b-instruct\":[131072,8192,0],\"qwen2-5-32b-instruct\":[131072,8192,0],\"alibaba-cn/qwen2-5-coder-7b-instruct\":[131072,8192,0],\"qwen2-5-coder-7b-instruct\":[131072,8192,0],\"alibaba-cn/qwen-long\":[10000000,8192,0],\"qwen-long\":[10000000,8192,0],\"alibaba-cn/deepseek-r1-distill-llama-8b\":[32768,16384,1],\"deepseek-r1-distill-llama-8b\":[32768,16384,1],\"alibaba-cn/deepseek-r1-distill-qwen-14b\":[32768,16384,1],\"deepseek-r1-distill-qwen-14b\":[32768,16384,1],\"alibaba-cn/qwen3-vl-235b-a22b\":[131072,32768,1],\"qwen3-vl-235b-a22b\":[131072,32768,1],\"alibaba-cn/qwen3.5-plus\":[1000000,65536,1],\"qwen3.5-plus\":[262144,65536,1],\"alibaba-cn/qwen-math-plus\":[4096,3072,0],\"qwen-math-plus\":[4096,3072,0],\"alibaba-cn/qwen-doc-turbo\":[131072,8192,0],\"qwen-doc-turbo\":[131072,8192,0],\"alibaba-cn/qwen-mt-plus\":[16384,8192,0],\"qwen-mt-plus\":[16384,8192,0],\"alibaba-cn/qvq-max\":[131072,8192,1],\"qvq-max\":[131072,8192,1],\"alibaba-cn/minimax/minimax-m2.7\":[204800,131072,1],\"minimax/minimax-m2.7\":[204800,131072,1],\"minimax-m2.7\":[202752,131072,1],\"alibaba-cn/siliconflow/deepseek-r1-0528\":[163840,32768,1],\"siliconflow/deepseek-r1-0528\":[163840,32768,1],\"alibaba-cn/siliconflow/deepseek-v3.2\":[163840,65536,1],\"siliconflow/deepseek-v3.2\":[163840,65536,1],\"alibaba-cn/siliconflow/deepseek-v3.1-terminus\":[163840,65536,1],\"siliconflow/deepseek-v3.1-terminus\":[163840,65536,1],\"alibaba-cn/siliconflow/deepseek-v3-0324\":[163840,163840,0],\"siliconflow/deepseek-v3-0324\":[163840,163840,0],\"deepseek-v3-0324\":[163840,163840,0],\"alibaba-cn/kimi/kimi-k2.5\":[262144,262144,1],\"kimi/kimi-k2.5\":[262144,262144,1],\"alibaba-cn/qwen3-coder-plus\":[1048576,65536,0],\"qwen3-coder-plus\":[1048576,65536,0],\"minimax/minimax-m2\":[204800,131072,1],\"minimax-m2\":[204800,131072,1],\"minimax/minimax-m2.1\":[204800,131072,1],\"minimax-m2.1\":[204800,131072,1],\"minimax/minimax-m2.5\":[204800,128000,1],\"minimax/minimax-m2.5-highspeed\":[204800,131072,1],\"minimax-m2.5-highspeed\":[204800,131072,1],\"minimax/minimax-m3\":[1048576,512000,1],\"minimax-m3\":[524288,250000,1],\"minimax/minimax-m2.7-highspeed\":[204800,131072,1],\"minimax-m2.7-highspeed\":[204800,131072,1],\"alibaba/qwen3.7-max\":[1000000,65536,1],\"alibaba/qwen2-5-72b-instruct\":[131072,8192,0],\"alibaba/deepseek-v4-flash-0731\":[1000000,384000,1],\"deepseek-v4-flash-0731\":[1000000,384000,1],\"alibaba/qwen3-coder-plus\":[1048576,65536,0],\"alibaba/qwen3-next-80b-a3b-thinking\":[131072,32768,1],\"alibaba/qwen2-5-omni-7b\":[32768,2048,0],\"alibaba/qwen-mt-turbo\":[16384,8192,0],\"alibaba/qwen-vl-max\":[131072,8192,0],\"alibaba/qwen3-next-80b-a3b-instruct\":[131072,32768,0],\"alibaba/qwen3-coder-flash\":[1000000,65536,0],\"alibaba/qwen3-14b\":[131072,8192,1],\"alibaba/qwen-max\":[32768,8192,0],\"alibaba/qwen3.6-plus\":[1000000,65536,1],\"alibaba/qwen-vl-plus\":[131072,8192,0],\"alibaba/qwen-omni-turbo-realtime\":[32768,2048,0],\"alibaba/qwen3.5-27b\":[262144,65536,1],\"alibaba/qwen3.5-35b-a3b\":[262144,65536,1],\"alibaba/qwen-flash\":[1000000,32768,1],\"alibaba/glm-5.2\":[1000000,131072,1],\"alibaba/qwen-turbo\":[1000000,16384,1],\"alibaba/qwen3-livetranslate-flash-realtime\":[53248,4096,0],\"qwen3-livetranslate-flash-realtime\":[53248,4096,0],\"alibaba/qwen3-vl-30b-a3b\":[131072,32768,1],\"alibaba/qwen-vl-ocr\":[34096,4096,0],\"alibaba/qwen3-32b\":[131072,16384,1],\"alibaba/qwq-plus\":[131072,8192,1],\"alibaba/qwen3-vl-plus\":[262144,32768,1],\"alibaba/qwen2-5-7b-instruct\":[131072,8192,0],\"alibaba/qwen3-coder-30b-a3b-instruct\":[262144,65536,0],\"alibaba/qwen3.5-397b-a17b\":[262144,65536,1],\"alibaba/qwen3.6-27b\":[262144,65536,1],\"alibaba/qwen3-asr-flash\":[53248,4096,0],\"alibaba/qwen3-omni-flash\":[65536,16384,1],\"alibaba/qwen2-5-vl-72b-instruct\":[131072,8192,0],\"alibaba/qwen3.6-35b-a3b\":[262144,65536,1],\"alibaba/qwen3-max\":[262144,65536,0],\"alibaba/qwen-plus\":[1000000,32768,1],\"alibaba/qwen3.5-122b-a10b\":[262144,65536,1],\"alibaba/qwen3-omni-flash-realtime\":[65536,16384,0],\"alibaba/qwen2-5-vl-7b-instruct\":[131072,8192,0],\"alibaba/qwen3.6-flash\":[1000000,65536,1],\"alibaba/qwen3.8-flash\":[1000000,131072,1],\"alibaba/qwen2-5-14b-instruct\":[131072,8192,0],\"alibaba/qwen3.6-max-preview\":[262144,65536,1],\"alibaba/qwen-plus-character-ja\":[8192,512,0],\"qwen-plus-character-ja\":[8192,512,0],\"alibaba/qwen3.8-max\":[1000000,131072,1],\"alibaba/qwen3-8b\":[131072,8192,1],\"alibaba/qwen3-235b-a22b\":[131072,16384,1],\"alibaba/qwen3.7-plus\":[1000000,65536,1],\"alibaba/qwen-omni-turbo\":[32768,2048,0],\"alibaba/qwen3-coder-480b-a35b-instruct\":[262144,65536,0],\"alibaba/qwen2-5-32b-instruct\":[131072,8192,0],\"alibaba/qwen3-vl-235b-a22b\":[131072,32768,1],\"alibaba/qwen3.5-plus\":[1000000,65536,1],\"alibaba/qwen-mt-plus\":[16384,8192,0],\"alibaba/qvq-max\":[131072,8192,1],\"anthropic/claude-sonnet-4-6\":[1000000,128000,1],\"claude-sonnet-4-6\":[1000000,64000,1],\"anthropic/claude-opus-5\":[1000000,128000,1],\"claude-opus-5\":[1000000,128000,1],\"anthropic/claude-opus-4-5\":[200000,64000,1],\"claude-opus-4-5\":[200000,64000,1],\"anthropic/claude-fable-5-1\":[1000000,128000,1],\"claude-fable-5-1\":[1000000,128000,1],\"anthropic/claude-opus-4-6\":[1000000,128000,1],\"claude-opus-4-6\":[1000000,128000,1],\"anthropic/claude-sonnet-4-5-20250929\":[1000000,64000,1],\"claude-sonnet-4-5-20250929\":[1000000,64000,1],\"anthropic/claude-opus-4-7\":[1000000,128000,1],\"claude-opus-4-7\":[1000000,128000,1],\"anthropic/claude-haiku-4-5-20251001\":[200000,64000,1],\"claude-haiku-4-5-20251001\":[200000,64000,1],\"anthropic/claude-fable-5\":[1000000,128000,1],\"claude-fable-5\":[1000000,128000,1],\"anthropic/claude-haiku-4-5\":[200000,64000,1],\"claude-haiku-4-5\":[200000,64000,1],\"anthropic/claude-sonnet-4-5\":[1000000,64000,1],\"claude-sonnet-4-5\":[1000000,64000,1],\"anthropic/claude-opus-4-8\":[1000000,128000,1],\"claude-opus-4-8\":[1000000,128000,1],\"anthropic/claude-sonnet-5\":[1000000,128000,1],\"claude-sonnet-5\":[1000000,128000,1],\"anthropic/claude-opus-4-5-20251101\":[200000,64000,1],\"claude-opus-4-5-20251101\":[200000,64000,1],\"google/gemma-4-26b-a4b-it\":[262144,262144,0],\"gemma-4-26b-a4b-it\":[262144,262144,0],\"google/gemini-3.1-pro-preview-customtools\":[1048576,65536,1],\"gemini-3.1-pro-preview-customtools\":[1048576,65536,1],\"google/gemini-3.1-flash-lite-image\":[65536,58982,1],\"gemini-3.1-flash-lite-image\":[65536,65536,1],\"google/lyria-3-clip-preview\":[1048576,65536,0],\"lyria-3-clip-preview\":[1048576,65536,0],\"google/gemini-2.5-flash-image\":[32768,8192,0],\"gemini-2.5-flash-image\":[32768,32768,1],\"google/deep-research-max-preview-04-2026\":[131072,65536,1],\"deep-research-max-preview-04-2026\":[131072,65536,1],\"google/gemini-3-pro-image\":[131072,32768,1],\"gemini-3-pro-image\":[131072,32768,1],\"google/gemini-3.1-pro-preview\":[1048576,65536,1],\"gemini-3.1-pro-preview\":[1048576,65536,1],\"google/deep-research-preview-04-2026\":[131072,65536,1],\"deep-research-preview-04-2026\":[131072,65536,1],\"google/gemini-2.5-flash-lite\":[1048576,65535,1],\"gemini-2.5-flash-lite\":[1048576,65536,1],\"google/gemini-2.5-computer-use-preview-10-2025\":[131072,65536,1],\"gemini-2.5-computer-use-preview-10-2025\":[131072,65536,1],\"google/gemini-3.6-flash\":[1048576,65536,1],\"gemini-3.6-flash\":[1048576,65536,1],\"google/gemini-3.1-flash-lite\":[1048576,65536,1],\"gemini-3.1-flash-lite\":[1048576,65536,1],\"google/gemini-3.1-flash-live-preview\":[131072,65536,1],\"gemini-3.1-flash-live-preview\":[131072,65536,1],\"google/gemini-2.5-pro-preview-tts\":[8192,16384,0],\"gemini-2.5-pro-preview-tts\":[8192,16384,0],\"google/gemini-3.5-flash\":[1048576,65536,1],\"gemini-3.5-flash\":[1048576,65536,1],\"google/veo-3.1-generate-preview\":[480,8192,0],\"veo-3.1-generate-preview\":[480,8192,0],\"google/gemini-3.1-flash-lite-preview\":[1048576,65536,1],\"gemini-3.1-flash-lite-preview\":[1048576,65536,1],\"google/veo-3.1-fast-generate-preview\":[480,8192,0],\"veo-3.1-fast-generate-preview\":[480,8192,0],\"google/gemini-2.5-flash-preview-tts\":[8192,16384,0],\"gemini-2.5-flash-preview-tts\":[8192,16384,0],\"google/gemini-embedding-001\":[2048,1,0],\"gemini-embedding-001\":[2048,1,0],\"google/gemini-3.1-flash-image\":[131072,32768,1],\"gemini-3.1-flash-image\":[65536,65536,1],\"google/gemini-3.5-flash-lite\":[1048576,65536,1],\"gemini-3.5-flash-lite\":[1048576,65536,1],\"google/gemini-3-pro-image-preview\":[65536,32768,1],\"gemini-3-pro-image-preview\":[131072,32768,1],\"google/gemini-3.1-flash-tts-preview\":[8192,16384,1],\"gemini-3.1-flash-tts-preview\":[8192,16384,1],\"google/veo-3.1-lite-generate-preview\":[480,8192,0],\"veo-3.1-lite-generate-preview\":[480,8192,0],\"google/gemini-flash-lite-latest\":[1048576,65536,1],\"gemini-flash-lite-latest\":[1048576,65536,1],\"google/gemma-4-31b-it\":[262144,131072,1],\"gemma-4-31b-it\":[262144,131072,1],\"google/gemini-embedding-2\":[8192,1,0],\"gemini-embedding-2\":[8192,1,0],\"google/gemini-3-flash-preview\":[1048576,65536,1],\"gemini-3-flash-preview\":[1048576,65536,1],\"google/gemini-3.8-flash\":[1048576,65536,1],\"gemini-3.8-flash\":[1048576,65536,1],\"google/gemini-3.5-live-translate-preview\":[16384,32768,0],\"gemini-3.5-live-translate-preview\":[16384,32768,0],\"google/lyria-3-pro-preview\":[1048576,65536,0],\"lyria-3-pro-preview\":[1048576,65536,0],\"google/gemini-3.7-flash\":[1048576,65536,1],\"gemini-3.7-flash\":[1048576,65536,1],\"google/gemini-2.5-pro\":[1048576,65536,1],\"gemini-2.5-pro\":[1048576,65536,1],\"google/gemini-flash-latest\":[1048576,65536,1],\"gemini-flash-latest\":[1048576,65536,1],\"google/gemini-3.1-flash-image-preview\":[65536,58982,1],\"gemini-3.1-flash-image-preview\":[65536,65536,1],\"google/gemini-omni-flash-preview\":[131072,65536,1],\"gemini-omni-flash-preview\":[131072,65536,1],\"google/gemini-2.5-flash\":[1048576,65535,1],\"gemini-2.5-flash\":[1048576,65536,1],\"meta/muse-spark-1.3\":[1048576,943718,1],\"muse-spark-1.3\":[1048576,131072,1],\"meta/muse-spark-1.2\":[1048576,943718,1],\"muse-spark-1.2\":[1048576,131072,1],\"meta/muse-spark-1.2-contributor\":[1048576,943718,1],\"muse-spark-1.2-contributor\":[1048576,131072,1],\"meta/muse-spark-1.3-contributor\":[1048576,943718,1],\"muse-spark-1.3-contributor\":[1048576,131072,1],\"meta/muse-spark-1.1\":[1048576,943718,1],\"muse-spark-1.1\":[1048576,131072,1],\"zhipuai/glm-5.2\":[1000000,131072,1],\"zhipuai/glm-5.3-flash\":[1000000,131072,1],\"glm-5.3-flash\":[1048575,400000,1],\"zhipuai/glm-5\":[204800,131072,1],\"zhipuai/glm-5.1\":[200000,131072,1],\"zhipuai/glm-5.3\":[1000000,131072,1],\"glm-5.3\":[1048576,262144,1],\"zhipuai/glm-5v-turbo\":[200000,131072,1],\"glm-5v-turbo\":[200000,131072,1],\"zhipuai/glm-4.7-flash\":[200000,131072,1],\"glm-4.7-flash\":[200000,131072,1],\"zhipuai/glm-4.7-flashx\":[200000,131072,1],\"glm-4.7-flashx\":[200000,131072,1],\"zhipuai/glm-4.5v\":[64000,16384,1],\"glm-4.5v\":[64000,16384,1],\"zhipuai/glm-4.5\":[131072,98304,1],\"glm-4.5\":[131072,98304,1],\"zhipuai/glm-4.5-flash\":[131072,98304,1],\"glm-4.5-flash\":[131072,98304,1],\"zhipuai/glm-4.6v\":[128000,32768,1],\"glm-4.6v\":[128000,32768,1],\"zhipuai/glm-4.6\":[204800,131072,1],\"glm-4.6\":[204800,131072,1],\"zhipuai/glm-4.5-air\":[131072,98304,1],\"zhipuai/glm-4.7\":[204800,131072,1],\"glm-4.7\":[204800,131072,1],\"fireworks-ai/accounts/fireworks/routers/kimi-k3-fast\":[1048576,131072,1],\"accounts/fireworks/routers/kimi-k3-fast\":[1048576,131072,1],\"kimi-k3-fast\":[1048576,131072,1],\"fireworks-ai/accounts/fireworks/routers/glm-5p2-fast\":[1048575,131072,1],\"accounts/fireworks/routers/glm-5p2-fast\":[1048575,131072,1],\"glm-5p2-fast\":[1048575,131072,1],\"fireworks-ai/accounts/fireworks/models/qwen3p7-plus\":[262144,65536,1],\"accounts/fireworks/models/qwen3p7-plus\":[262144,65536,1],\"qwen3p7-plus\":[262144,65536,1],\"fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-vision-exp\":[1000000,384000,1],\"accounts/fireworks/models/deepseek-v4-flash-vision-exp\":[1000000,384000,1],\"deepseek-v4-flash-vision-exp\":[1000000,384000,1],\"fireworks-ai/accounts/fireworks/models/deepseek-v4-pro-0813\":[1000000,384000,1],\"accounts/fireworks/models/deepseek-v4-pro-0813\":[1000000,384000,1],\"deepseek-v4-pro-0813\":[1048576,384000,1],\"fireworks-ai/accounts/fireworks/models/deepseek-v4-flash-0731\":[1000000,384000,1],\"accounts/fireworks/models/deepseek-v4-flash-0731\":[1000000,384000,1],\"fireworks-ai/accounts/fireworks/models/minimax-m3\":[512000,512000,1],\"accounts/fireworks/models/minimax-m3\":[512000,512000,1],\"fireworks-ai/accounts/fireworks/models/kimi-k2p6\":[262000,262000,1],\"accounts/fireworks/models/kimi-k2p6\":[262000,262000,1],\"kimi-k2p6\":[262000,262000,1],\"fireworks-ai/accounts/fireworks/models/nemotron-3-ultra-nvfp4\":[262144,128000,1],\"accounts/fireworks/models/nemotron-3-ultra-nvfp4\":[262144,128000,1],\"nemotron-3-ultra-nvfp4\":[262144,128000,1],\"fireworks-ai/accounts/fireworks/models/kimi-k3\":[1048576,131072,1],\"accounts/fireworks/models/kimi-k3\":[1048576,131072,1],\"kimi-k3\":[1048576,131072,1],\"fireworks-ai/accounts/fireworks/models/glm-5p3\":[1000000,131072,1],\"accounts/fireworks/models/glm-5p3\":[1000000,131072,1],\"glm-5p3\":[1000000,131072,1],\"fireworks-ai/accounts/fireworks/models/kimi-k2p7-code\":[262000,262000,1],\"accounts/fireworks/models/kimi-k2p7-code\":[262000,262000,1],\"kimi-k2p7-code\":[262000,262000,1],\"fireworks-ai/accounts/fireworks/models/glm-5p3-flash\":[1000000,131072,1],\"accounts/fireworks/models/glm-5p3-flash\":[1000000,131072,1],\"glm-5p3-flash\":[1000000,131072,1],\"fireworks-ai/accounts/fireworks/models/qwen3p8-2p4t-a95b\":[262144,131072,1],\"accounts/fireworks/models/qwen3p8-2p4t-a95b\":[262144,131072,1],\"qwen3p8-2p4t-a95b\":[262144,131072,1],\"fireworks-ai/accounts/fireworks/models/muse-glimmer-30b\":[131072,131072,1],\"accounts/fireworks/models/muse-glimmer-30b\":[131072,131072,1],\"muse-glimmer-30b\":[131072,131072,1],\"fireworks-ai/accounts/fireworks/models/inkling\":[1048576,1048576,1],\"accounts/fireworks/models/inkling\":[1048576,1048576,1],\"inkling\":[524288,131072,1],\"fireworks-ai/accounts/fireworks/models/gpt-oss-120b\":[131072,32768,1],\"accounts/fireworks/models/gpt-oss-120b\":[131072,32768,1],\"fireworks-ai/accounts/fireworks/models/glm-5p2\":[1048575,131072,1],\"accounts/fireworks/models/glm-5p2\":[1048575,131072,1],\"glm-5p2\":[1048575,131072,1],\"fireworks-ai/accounts/fireworks/models/qwen3p8-max\":[262144,131072,1],\"accounts/fireworks/models/qwen3p8-max\":[262144,131072,1],\"qwen3p8-max\":[262144,131072,1],\"fireworks-ai/accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b\":[262144,262144,1],\"accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b\":[262144,262144,1],\"nemotron-lightning-3p5-30b-a3b\":[262144,262144,1],\"amazon-bedrock/moonshotai.kimi-k2.5\":[262143,16000,1],\"moonshotai.kimi-k2.5\":[262143,16000,1],\"amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"global.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"amazon-bedrock/us.anthropic.claude-opus-5\":[1000000,128000,1],\"us.anthropic.claude-opus-5\":[1000000,128000,1],\"amazon-bedrock/us.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"us.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"amazon-bedrock/us.xai.grok-4.6\":[500000,500000,1],\"us.xai.grok-4.6\":[500000,500000,1],\"amazon-bedrock/qwen.qwen3-coder-next\":[131072,65536,1],\"qwen.qwen3-coder-next\":[131072,65536,1],\"amazon-bedrock/global.openai.gpt-5.6-luna\":[1050000,128000,1],\"global.openai.gpt-5.6-luna\":[1050000,128000,1],\"amazon-bedrock/global.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"global.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"amazon-bedrock/openai.gpt-5.5\":[272000,128000,1],\"openai.gpt-5.5\":[272000,128000,1],\"amazon-bedrock/qwen.qwen3-coder-30b-a3b-v1:0\":[262144,131072,0],\"qwen.qwen3-coder-30b-a3b-v1:0\":[262144,131072,0],\"amazon-bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"global.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"amazon-bedrock/qwen.qwen3-235b-a22b-2507-v1:0\":[262144,131072,0],\"qwen.qwen3-235b-a22b-2507-v1:0\":[262144,131072,0],\"amazon-bedrock/mistral.ministral-3-3b-instruct\":[256000,8192,0],\"mistral.ministral-3-3b-instruct\":[256000,8192,0],\"amazon-bedrock/global.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"global.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"amazon-bedrock/openai.gpt-5.4\":[272000,128000,1],\"openai.gpt-5.4\":[272000,128000,1],\"amazon-bedrock/mistral.pixtral-large-2502-v1:0\":[128000,8192,0],\"mistral.pixtral-large-2502-v1:0\":[128000,8192,0],\"amazon-bedrock/mistral.mistral-large-3-675b-instruct\":[256000,8192,0],\"mistral.mistral-large-3-675b-instruct\":[256000,8192,0],\"amazon-bedrock/anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"amazon-bedrock/jp.anthropic.claude-opus-4-7\":[1000000,128000,1],\"jp.anthropic.claude-opus-4-7\":[1000000,128000,1],\"amazon-bedrock/eu.anthropic.claude-sonnet-5\":[1000000,128000,1],\"eu.anthropic.claude-sonnet-5\":[1000000,128000,1],\"amazon-bedrock/nvidia.nemotron-nano-9b-v2\":[128000,4096,0],\"nvidia.nemotron-nano-9b-v2\":[128000,4096,0],\"amazon-bedrock/au.anthropic.claude-sonnet-4-6\":[1000000,128000,1],\"au.anthropic.claude-sonnet-4-6\":[1000000,128000,1],\"amazon-bedrock/anthropic.claude-opus-4-7\":[1000000,128000,1],\"anthropic.claude-opus-4-7\":[1000000,128000,1],\"amazon-bedrock/mistral.ministral-3-8b-instruct\":[128000,4096,0],\"mistral.ministral-3-8b-instruct\":[128000,4096,0],\"amazon-bedrock/au.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"au.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"amazon-bedrock/anthropic.claude-opus-5\":[1000000,128000,1],\"anthropic.claude-opus-5\":[1000000,128000,1],\"amazon-bedrock/eu.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"eu.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"amazon-bedrock/anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"amazon-bedrock/mistral.voxtral-mini-3b-2507\":[128000,4096,0],\"mistral.voxtral-mini-3b-2507\":[128000,4096,0],\"amazon-bedrock/nvidia.nemotron-nano-12b-v2\":[128000,4096,0],\"nvidia.nemotron-nano-12b-v2\":[128000,4096,0],\"amazon-bedrock/nvidia.nemotron-nano-3-30b\":[128000,4096,1],\"nvidia.nemotron-nano-3-30b\":[128000,4096,1],\"amazon-bedrock/eu.anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"eu.anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"amazon-bedrock/minimax.minimax-m2.1\":[204800,131072,1],\"minimax.minimax-m2.1\":[204800,131072,1],\"amazon-bedrock/meta.llama3-3-70b-instruct-v1:0\":[128000,4096,0],\"meta.llama3-3-70b-instruct-v1:0\":[128000,4096,0],\"amazon-bedrock/deepseek.v3-v1:0\":[163840,81920,1],\"deepseek.v3-v1:0\":[163840,81920,1],\"amazon-bedrock/eu.anthropic.claude-opus-5\":[1000000,128000,1],\"eu.anthropic.claude-opus-5\":[1000000,128000,1],\"amazon-bedrock/anthropic.claude-sonnet-5\":[1000000,128000,1],\"anthropic.claude-sonnet-5\":[1000000,128000,1],\"amazon-bedrock/us.meta.llama4-maverick-17b-instruct-v1:0\":[1000000,16384,0],\"us.meta.llama4-maverick-17b-instruct-v1:0\":[1000000,16384,0],\"amazon-bedrock/meta.llama3-1-8b-instruct-v1:0\":[128000,4096,0],\"meta.llama3-1-8b-instruct-v1:0\":[128000,4096,0],\"amazon-bedrock/minimax.minimax-m2\":[204608,128000,1],\"minimax.minimax-m2\":[204608,128000,1],\"amazon-bedrock/global.anthropic.claude-opus-5\":[1000000,128000,1],\"global.anthropic.claude-opus-5\":[1000000,128000,1],\"amazon-bedrock/qwen.qwen3-32b-v1:0\":[16384,16384,1],\"qwen.qwen3-32b-v1:0\":[16384,16384,1],\"amazon-bedrock/writer.palmyra-x4-v1:0\":[122880,8192,1],\"writer.palmyra-x4-v1:0\":[122880,8192,1],\"amazon-bedrock/google.gemma-3-12b-it\":[131072,8192,0],\"google.gemma-3-12b-it\":[131072,8192,0],\"amazon-bedrock/au.anthropic.claude-opus-4-8\":[1000000,128000,1],\"au.anthropic.claude-opus-4-8\":[1000000,128000,1],\"amazon-bedrock/jp.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"jp.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"amazon-bedrock/eu.anthropic.claude-opus-4-8\":[1000000,128000,1],\"eu.anthropic.claude-opus-4-8\":[1000000,128000,1],\"amazon-bedrock/jp.anthropic.claude-opus-5\":[1000000,128000,1],\"jp.anthropic.claude-opus-5\":[1000000,128000,1],\"amazon-bedrock/mistral.ministral-3-14b-instruct\":[128000,4096,0],\"mistral.ministral-3-14b-instruct\":[128000,4096,0],\"amazon-bedrock/openai.gpt-oss-safeguard-20b\":[128000,16384,0],\"openai.gpt-oss-safeguard-20b\":[128000,16384,0],\"amazon-bedrock/openai.gpt-5.6-luna\":[1050000,128000,1],\"openai.gpt-5.6-luna\":[1050000,128000,1],\"amazon-bedrock/anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"amazon-bedrock/openai.gpt-oss-20b-1:0\":[128000,16384,1],\"openai.gpt-oss-20b-1:0\":[128000,16384,1],\"amazon-bedrock/qwen.qwen3-vl-235b-a22b\":[262000,262000,0],\"qwen.qwen3-vl-235b-a22b\":[262000,262000,0],\"amazon-bedrock/amazon.nova-2-lite-v1:0\":[128000,4096,1],\"amazon.nova-2-lite-v1:0\":[128000,4096,1],\"amazon-bedrock/global.xai.grok-4.6\":[500000,500000,1],\"global.xai.grok-4.6\":[500000,500000,1],\"amazon-bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"global.anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"amazon-bedrock/amazon.nova-lite-v1:0\":[300000,8192,0],\"amazon.nova-lite-v1:0\":[300000,8192,0],\"amazon-bedrock/anthropic.claude-opus-4-8\":[1000000,128000,1],\"anthropic.claude-opus-4-8\":[1000000,128000,1],\"amazon-bedrock/amazon.nova-pro-v1:0\":[300000,8192,0],\"amazon.nova-pro-v1:0\":[300000,8192,0],\"amazon-bedrock/us.anthropic.claude-opus-4-7\":[1000000,128000,1],\"us.anthropic.claude-opus-4-7\":[1000000,128000,1],\"amazon-bedrock/au.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"au.anthropic.claude-opus-4-6-v1\":[1000000,128000,1],\"amazon-bedrock/writer.palmyra-x5-v1:0\":[1040000,8192,1],\"writer.palmyra-x5-v1:0\":[1040000,8192,1],\"amazon-bedrock/global.openai.gpt-5.6-sol\":[1050000,128000,1],\"global.openai.gpt-5.6-sol\":[1050000,128000,1],\"amazon-bedrock/openai.gpt-5.6-sol\":[1050000,128000,1],\"openai.gpt-5.6-sol\":[1050000,128000,1],\"amazon-bedrock/global.anthropic.claude-opus-4-8\":[1000000,128000,1],\"global.anthropic.claude-opus-4-8\":[1000000,128000,1],\"amazon-bedrock/minimax.minimax-m2.5\":[196608,98304,1],\"minimax.minimax-m2.5\":[196608,98304,1],\"amazon-bedrock/openai.gpt-oss-120b-1:0\":[128000,16384,1],\"openai.gpt-oss-120b-1:0\":[128000,16384,1],\"amazon-bedrock/eu.anthropic.claude-opus-4-7\":[1000000,128000,1],\"eu.anthropic.claude-opus-4-7\":[1000000,128000,1],\"amazon-bedrock/us.meta.llama4-scout-17b-instruct-v1:0\":[3500000,16384,0],\"us.meta.llama4-scout-17b-instruct-v1:0\":[3500000,16384,0],\"amazon-bedrock/moonshot.kimi-k2-thinking\":[262143,16000,1],\"moonshot.kimi-k2-thinking\":[262143,16000,1],\"amazon-bedrock/anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"amazon-bedrock/deepseek.r1-v1:0\":[128000,32768,1],\"deepseek.r1-v1:0\":[128000,32768,1],\"amazon-bedrock/mistral.magistral-small-2509\":[128000,40000,1],\"mistral.magistral-small-2509\":[128000,40000,1],\"amazon-bedrock/us.anthropic.claude-fable-5\":[1000000,128000,1],\"us.anthropic.claude-fable-5\":[1000000,128000,1],\"amazon-bedrock/eu.anthropic.claude-fable-5\":[1000000,128000,1],\"eu.anthropic.claude-fable-5\":[1000000,128000,1],\"amazon-bedrock/us.anthropic.claude-fable-5-1\":[1000000,128000,1],\"us.anthropic.claude-fable-5-1\":[1000000,128000,1],\"amazon-bedrock/meta.llama4-scout-17b-instruct-v1:0\":[3500000,16384,0],\"meta.llama4-scout-17b-instruct-v1:0\":[3500000,16384,0],\"amazon-bedrock/google.gemma-3-27b-it\":[202752,8192,0],\"google.gemma-3-27b-it\":[202752,8192,0],\"amazon-bedrock/amazon.nova-micro-v1:0\":[128000,8192,0],\"amazon.nova-micro-v1:0\":[128000,8192,0],\"amazon-bedrock/anthropic.claude-fable-5\":[1000000,128000,1],\"anthropic.claude-fable-5\":[1000000,128000,1],\"amazon-bedrock/xai.grok-4.6\":[500000,500000,1],\"xai.grok-4.6\":[500000,500000,1],\"amazon-bedrock/global.anthropic.claude-fable-5\":[1000000,128000,1],\"global.anthropic.claude-fable-5\":[1000000,128000,1],\"amazon-bedrock/au.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"au.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"amazon-bedrock/eu.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"eu.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"amazon-bedrock/jp.anthropic.claude-opus-4-8\":[1000000,128000,1],\"jp.anthropic.claude-opus-4-8\":[1000000,128000,1],\"amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"eu.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"amazon-bedrock/qwen.qwen3-next-80b-a3b\":[262000,262000,0],\"qwen.qwen3-next-80b-a3b\":[262000,262000,0],\"amazon-bedrock/us.anthropic.claude-sonnet-5\":[1000000,128000,1],\"us.anthropic.claude-sonnet-5\":[1000000,128000,1],\"amazon-bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"amazon-bedrock/global.anthropic.claude-opus-4-7\":[1000000,128000,1],\"global.anthropic.claude-opus-4-7\":[1000000,128000,1],\"amazon-bedrock/qwen.qwen3-coder-480b-a35b-v1:0\":[131072,65536,0],\"qwen.qwen3-coder-480b-a35b-v1:0\":[131072,65536,0],\"amazon-bedrock/openai.gpt-5.6-terra\":[1050000,128000,1],\"openai.gpt-5.6-terra\":[1050000,128000,1],\"amazon-bedrock/nvidia.nemotron-super-3-120b\":[262144,131072,1],\"nvidia.nemotron-super-3-120b\":[262144,131072,1],\"amazon-bedrock/zai.glm-4.7-flash\":[200000,131072,1],\"zai.glm-4.7-flash\":[200000,131072,1],\"amazon-bedrock/google.gemma-3-4b-it\":[128000,4096,0],\"google.gemma-3-4b-it\":[128000,4096,0],\"amazon-bedrock/global.openai.gpt-5.6-terra\":[1050000,128000,1],\"global.openai.gpt-5.6-terra\":[1050000,128000,1],\"amazon-bedrock/zai.glm-5\":[202752,101376,1],\"zai.glm-5\":[202752,101376,1],\"amazon-bedrock/openai.gpt-oss-safeguard-120b\":[128000,16384,0],\"openai.gpt-oss-safeguard-120b\":[128000,16384,0],\"amazon-bedrock/mistral.devstral-2-123b\":[256000,8192,0],\"mistral.devstral-2-123b\":[256000,8192,0],\"amazon-bedrock/us.anthropic.claude-opus-4-1-20250805-v1:0\":[200000,32000,1],\"us.anthropic.claude-opus-4-1-20250805-v1:0\":[200000,32000,1],\"amazon-bedrock/us.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"us.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"amazon-bedrock/mistral.voxtral-small-24b-2507\":[32000,8192,0],\"mistral.voxtral-small-24b-2507\":[32000,8192,0],\"amazon-bedrock/openai.gpt-oss-20b\":[128000,16384,1],\"openai.gpt-oss-20b\":[128000,16384,1],\"amazon-bedrock/meta.llama4-maverick-17b-instruct-v1:0\":[1000000,16384,0],\"meta.llama4-maverick-17b-instruct-v1:0\":[1000000,16384,0],\"amazon-bedrock/zai.glm-4.7\":[204800,131072,1],\"zai.glm-4.7\":[204800,131072,1],\"amazon-bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"us.anthropic.claude-opus-4-5-20251101-v1:0\":[200000,64000,1],\"amazon-bedrock/jp.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"jp.anthropic.claude-sonnet-4-6\":[1000000,64000,1],\"amazon-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"us.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"amazon-bedrock/us.deepseek.r1-v1:0\":[128000,32768,1],\"us.deepseek.r1-v1:0\":[128000,32768,1],\"amazon-bedrock/us.anthropic.claude-opus-4-8\":[1000000,128000,1],\"us.anthropic.claude-opus-4-8\":[1000000,128000,1],\"amazon-bedrock/au.anthropic.claude-opus-5\":[1000000,128000,1],\"au.anthropic.claude-opus-5\":[1000000,128000,1],\"amazon-bedrock/anthropic.claude-opus-4-1-20250805-v1:0\":[200000,32000,1],\"anthropic.claude-opus-4-1-20250805-v1:0\":[200000,32000,1],\"amazon-bedrock/jp.anthropic.claude-sonnet-5\":[1000000,128000,1],\"jp.anthropic.claude-sonnet-5\":[1000000,128000,1],\"amazon-bedrock/au.anthropic.claude-sonnet-5\":[1000000,128000,1],\"au.anthropic.claude-sonnet-5\":[1000000,128000,1],\"amazon-bedrock/xai.grok-4.3\":[1000000,131072,1],\"xai.grok-4.3\":[1000000,131072,1],\"amazon-bedrock/openai.gpt-oss-120b\":[128000,16384,1],\"openai.gpt-oss-120b\":[128000,16384,1],\"amazon-bedrock/meta.llama3-1-70b-instruct-v1:0\":[128000,4096,0],\"meta.llama3-1-70b-instruct-v1:0\":[128000,4096,0],\"amazon-bedrock/global.anthropic.claude-fable-5-1\":[1000000,128000,1],\"global.anthropic.claude-fable-5-1\":[1000000,128000,1],\"amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"us.anthropic.claude-haiku-4-5-20251001-v1:0\":[200000,64000,1],\"amazon-bedrock/anthropic.claude-fable-5-1\":[1000000,128000,1],\"anthropic.claude-fable-5-1\":[1000000,128000,1],\"amazon-bedrock/global.anthropic.claude-sonnet-5\":[1000000,128000,1],\"global.anthropic.claude-sonnet-5\":[1000000,128000,1],\"amazon-bedrock/jp.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"jp.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"amazon-bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"eu.anthropic.claude-sonnet-4-5-20250929-v1:0\":[200000,64000,1],\"amazon-bedrock/deepseek.v3.2\":[163840,81920,1],\"deepseek.v3.2\":[163840,81920,1],\"deepseek/deepseek-v4-flash-vision-exp\":[1048576,384000,1],\"deepseek/deepseek-v4-flash\":[1048576,384000,1],\"deepseek/deepseek-v4-pro\":[1048576,384000,1],\"opencode/claude-sonnet-4-6\":[1000000,64000,1],\"opencode/nemotron-3-ultra-free\":[1000000,128000,1],\"nemotron-3-ultra-free\":[1000000,128000,1],\"opencode/gemini-3.1-pro\":[1048576,65536,1],\"gemini-3.1-pro\":[1048576,65536,1],\"opencode/gpt-5-nano\":[400000,128000,1],\"gpt-5-nano\":[400000,128000,1],\"opencode/glm-4.7\":[204800,131072,1],\"opencode/hy3-preview-free\":[256000,64000,1],\"hy3-preview-free\":[256000,64000,1],\"opencode/deepseek-v4-flash-vision-exp\":[1000000,384000,1],\"opencode/grok-code\":[256000,256000,1],\"grok-code\":[256000,256000,1],\"opencode/muse-spark-1.3\":[1048576,131072,1],\"opencode/muse-spark-1.3-contributor-free\":[1048576,131072,1],\"muse-spark-1.3-contributor-free\":[1048576,131072,1],\"opencode/gpt-5-codex\":[400000,128000,1],\"gpt-5-codex\":[400000,128000,1],\"opencode/muse-spark-1.2\":[1048576,131072,1],\"opencode/glm-4.6\":[204800,131072,1],\"opencode/north-mini-code-free\":[256000,64000,1],\"north-mini-code-free\":[256000,64000,1],\"opencode/minimax-m2.1\":[204800,131072,1],\"opencode/minimax-m2.1-free\":[204800,131072,1],\"minimax-m2.1-free\":[204800,131072,1],\"opencode/gpt-5.1-codex-mini\":[400000,128000,1],\"gpt-5.1-codex-mini\":[400000,128000,1],\"opencode/qwen3.6-plus\":[262144,65536,1],\"opencode/gpt-5.1-codex\":[400000,128000,1],\"gpt-5.1-codex\":[400000,128000,1],\"opencode/gpt-5.6-sol\":[1050000,128000,1],\"gpt-5.6-sol\":[1050000,128000,1],\"opencode/claude-opus-5\":[1000000,128000,1],\"opencode/minimax-m2.7\":[204800,131072,1],\"opencode/kimi-k2.6\":[262144,65536,1],\"opencode/gpt-5.2-codex\":[400000,128000,1],\"gpt-5.2-codex\":[400000,128000,1],\"opencode/longcat-2.0-free\":[1000000,131072,1],\"longcat-2.0-free\":[1000000,131072,1],\"opencode/glm-5.2\":[1000000,131072,1],\"opencode/gpt-6-astra\":[1050000,128000,1],\"gpt-6-astra\":[1050000,128000,1],\"opencode/claude-opus-4-5\":[200000,64000,1],\"opencode/deepseek-v4-flash-free\":[200000,128000,1],\"deepseek-v4-flash-free\":[200000,128000,1],\"opencode/minimax-m2.5\":[204800,131072,1],\"opencode/minimax-m3\":[512000,128000,1],\"opencode/laguna-s-2.1-free\":[256000,32000,1],\"laguna-s-2.1-free\":[256000,32000,1],\"opencode/deepseek-v4-flash\":[1000000,384000,1],\"opencode/kimi-k2.7-code\":[262144,262144,1],\"kimi-k2.7-code\":[262144,131072,1],\"opencode/kimi-k2-thinking\":[262144,262144,1],\"opencode/gpt-5.3-codex-spark\":[128000,128000,1],\"gpt-5.3-codex-spark\":[128000,32000,1],\"opencode/grok-4.5\":[500000,500000,1],\"grok-4.5\":[500000,500000,1],\"opencode/gemini-3.6-flash\":[1048576,65536,1],\"opencode/minimax-m3-free\":[200000,32000,1],\"minimax-m3-free\":[200000,32000,1],\"opencode/gpt-5.4\":[1050000,128000,1],\"gpt-5.4\":[1050000,128000,1],\"opencode/grok-build-0.1\":[256000,256000,1],\"grok-build-0.1\":[256000,256000,1],\"opencode/qwen3-coder\":[262144,65536,0],\"qwen3-coder\":[262144,65536,0],\"opencode/claude-fable-5-1\":[1000000,128000,1],\"opencode/gpt-5.1\":[400000,128000,1],\"gpt-5.1\":[400000,128000,1],\"opencode/gpt-5.1-codex-max\":[400000,128000,1],\"gpt-5.1-codex-max\":[400000,128000,1],\"opencode/claude-opus-4-6\":[1000000,128000,1],\"opencode/gemini-3.5-flash\":[1048576,65536,1],\"opencode/muse-spark-1.2-contributor-free\":[1048576,131072,1],\"muse-spark-1.2-contributor-free\":[1048576,131072,1],\"opencode/x-preview-f-free\":[1000000,131072,1],\"x-preview-f-free\":[1000000,131072,1],\"opencode/gpt-5.6-luna\":[1050000,128000,1],\"gpt-5.6-luna\":[1050000,128000,1],\"opencode/claude-opus-4-7\":[1000000,128000,1],\"opencode/kimi-k3\":[1048576,131072,1],\"opencode/ling-2.6-flash-free\":[262100,32800,0],\"ling-2.6-flash-free\":[262100,32800,0],\"opencode/gemini-3-pro\":[1048576,65536,1],\"gemini-3-pro\":[1048576,65536,1],\"opencode/nemotron-3.5-lightning-free\":[262144,262144,1],\"nemotron-3.5-lightning-free\":[262144,262144,1],\"opencode/hy3-free\":[190000,64000,1],\"hy3-free\":[190000,64000,1],\"opencode/gpt-5.3-codex\":[400000,128000,1],\"gpt-5.3-codex\":[400000,128000,1],\"opencode/kimi-k2.5-free\":[262144,262144,1],\"kimi-k2.5-free\":[262144,262144,1],\"opencode/glm-5.3-flash\":[1000000,131072,1],\"opencode/ring-2.6-1t-free\":[262000,66000,1],\"ring-2.6-1t-free\":[262000,66000,1],\"opencode/claude-fable-5\":[1000000,128000,1],\"opencode/gemini-3.5-flash-lite\":[1048576,65536,1],\"opencode/mimo-v2.5-free\":[200000,32000,1],\"mimo-v2.5-free\":[200000,32000,1],\"opencode/claude-3-5-haiku\":[200000,8192,0],\"claude-3-5-haiku\":[200000,8192,0],\"opencode/nemotron-3-super-free\":[204800,128000,1],\"nemotron-3-super-free\":[204800,128000,1],\"opencode/gpt-5.4-nano\":[400000,128000,1],\"gpt-5.4-nano\":[400000,128000,1],\"opencode/gpt-5.5-pro\":[1050000,128000,1],\"gpt-5.5-pro\":[1050000,128000,1],\"opencode/big-pickle\":[200000,32000,1],\"big-pickle\":[200000,32000,1],\"opencode/gpt-5.4-mini\":[400000,128000,1],\"gpt-5.4-mini\":[400000,128000,1],\"opencode/ling-3.0-flash-fin-free\":[262144,32768,1],\"ling-3.0-flash-fin-free\":[262144,32768,1],\"opencode/kimi-k2\":[262144,262144,0],\"kimi-k2\":[262144,262144,0],\"opencode/grok-4.6\":[500000,500000,1],\"grok-4.6\":[500000,500000,1],\"opencode/claude-haiku-4-5\":[200000,64000,1],\"opencode/claude-sonnet-4-5\":[1000000,64000,1],\"opencode/glm-5\":[204800,131072,1],\"opencode/claude-opus-4-1\":[200000,32000,1],\"claude-opus-4-1\":[200000,32000,1],\"opencode/kimi-k2.5\":[262144,65536,1],\"opencode/glm-5.1\":[204800,131072,1],\"opencode/ling-3.0-flash-free\":[262144,32768,1],\"ling-3.0-flash-free\":[262144,32768,1],\"opencode/trinity-large-preview-free\":[131072,131072,0],\"trinity-large-preview-free\":[131072,131072,0],\"opencode/gemini-3.8-flash\":[1048576,65536,1],\"opencode/claude-opus-4-8\":[1000000,128000,1],\"opencode/deepseek-v4-pro\":[1000000,384000,1],\"opencode/gpt-5.4-pro\":[1050000,128000,1],\"gpt-5.4-pro\":[1050000,128000,1],\"opencode/gemini-3.7-flash\":[1048576,65536,1],\"opencode/glm-4.7-free\":[204800,131072,1],\"glm-4.7-free\":[204800,131072,1],\"opencode/glm-5-free\":[204800,131072,1],\"glm-5-free\":[204800,131072,1],\"opencode/gpt-5.6-terra\":[1050000,128000,1],\"gpt-5.6-terra\":[1050000,128000,1],\"opencode/glm-5.3\":[1000000,131072,1],\"opencode/mimo-v2-flash-free\":[262144,65536,1],\"mimo-v2-flash-free\":[262144,65536,1],\"opencode/gpt-5.2\":[400000,128000,1],\"gpt-5.2\":[400000,128000,1],\"opencode/gemini-3-flash\":[1048576,65536,1],\"gemini-3-flash\":[1048576,65536,1],\"opencode/gpt-5\":[400000,128000,1],\"gpt-5\":[400000,128000,1],\"opencode/claude-sonnet-4\":[1000000,64000,1],\"claude-sonnet-4\":[1000000,64000,1],\"opencode/claude-sonnet-5\":[1000000,128000,1],\"opencode/minimax-m2.5-free\":[204800,131072,1],\"minimax-m2.5-free\":[204800,131072,1],\"opencode/mimo-v2-omni-free\":[262144,64000,1],\"mimo-v2-omni-free\":[262144,64000,1],\"opencode/mimo-v2-pro-free\":[1048576,64000,1],\"mimo-v2-pro-free\":[1048576,64000,1],\"opencode/qwen3.6-plus-free\":[262144,65536,1],\"qwen3.6-plus-free\":[262144,65536,1],\"opencode/qwen3.5-plus\":[262144,65536,1],\"opencode/gpt-5.5\":[1050000,128000,1],\"gpt-5.5\":[1050000,128000,1],\"opencode/ling-3.0-tiny-free\":[262144,32768,1],\"ling-3.0-tiny-free\":[262144,32768,1],\"openrouter/qwen/qwen3.7-max\":[1000000,131072,1],\"qwen/qwen3.7-max\":[1000000,500000,0],\"openrouter/qwen/qwen3-coder-plus\":[1000000,65536,0],\"qwen/qwen3-coder-plus\":[1000000,65536,0],\"openrouter/qwen/qwen3-next-80b-a3b-thinking\":[262144,235929,1],\"qwen/qwen3-next-80b-a3b-thinking\":[262144,235929,1],\"openrouter/qwen/qwen3-235b-a22b-thinking-2507\":[131072,117964,1],\"openrouter/qwen/qwen3.5-9b\":[262144,235929,1],\"openrouter/qwen/qwen3-next-80b-a3b-instruct\":[262144,235929,0],\"qwen/qwen3-next-80b-a3b-instruct\":[262144,235929,0],\"openrouter/qwen/qwen3-coder-flash\":[1000000,65536,0],\"qwen/qwen3-coder-flash\":[1000000,65536,0],\"openrouter/qwen/qwen3-14b\":[131072,16384,1],\"openrouter/qwen/qwen3.6-plus\":[1000000,65536,1],\"qwen/qwen3.6-plus\":[1000000,500000,1],\"openrouter/qwen/qwen3.5-27b\":[262144,65536,1],\"openrouter/qwen/qwen3.8-27b\":[1000000,131072,1],\"openrouter/qwen/qwen3.5-35b-a3b\":[262144,16384,1],\"openrouter/qwen/qwen3.5-plus-20260420\":[1000000,65536,1],\"qwen/qwen3.5-plus-20260420\":[1000000,65536,1],\"qwen3.5-plus-20260420\":[1000000,65536,1],\"openrouter/qwen/qwen3-32b\":[131072,16384,1],\"openrouter/qwen/qwen3.5-plus-02-15\":[1000000,65536,1],\"qwen/qwen3.5-plus-02-15\":[1000000,65536,1],\"qwen3.5-plus-02-15\":[1000000,65536,1],\"openrouter/qwen/qwen-plus-2025-07-28\":[1000000,32768,0],\"qwen/qwen-plus-2025-07-28\":[1000000,32768,0],\"qwen-plus-2025-07-28\":[1000000,32768,0],\"openrouter/qwen/qwen3-coder\":[262144,65536,0],\"qwen/qwen3-coder\":[262144,65536,0],\"openrouter/qwen/qwen2.5-vl-72b-instruct\":[128000,115200,0],\"qwen/qwen2.5-vl-72b-instruct\":[128000,115200,0],\"qwen2.5-vl-72b-instruct\":[128000,115200,0],\"openrouter/qwen/qwen3-coder-next\":[262144,235929,0],\"qwen/qwen3-coder-next\":[262144,235929,0],\"qwen3-coder-next\":[262144,235929,0],\"openrouter/qwen/qwen3-coder-30b-a3b-instruct\":[262144,235929,0],\"openrouter/qwen/qwen3-235b-a22b-2507\":[262144,16384,0],\"qwen/qwen3-235b-a22b-2507\":[262144,16384,0],\"qwen3-235b-a22b-2507\":[262144,16384,0],\"openrouter/qwen/qwen3.5-flash-02-23\":[1000000,65536,1],\"qwen/qwen3.5-flash-02-23\":[1000000,65536,1],\"qwen3.5-flash-02-23\":[1000000,65536,1],\"openrouter/qwen/qwen3.5-397b-a17b\":[262144,65536,1],\"openrouter/qwen/qwen3-vl-8b-thinking\":[131072,32768,1],\"qwen/qwen3-vl-8b-thinking\":[131072,32768,1],\"qwen3-vl-8b-thinking\":[131072,32768,1],\"openrouter/qwen/qwen3.6-27b\":[262144,65536,1],\"openrouter/qwen/qwen3.7-flash\":[1000000,65536,1],\"qwen/qwen3.7-flash\":[1000000,65536,1],\"openrouter/qwen/qwen3-30b-a3b-thinking-2507\":[81920,32768,1],\"qwen/qwen3-30b-a3b-thinking-2507\":[81920,32768,1],\"qwen3-30b-a3b-thinking-2507\":[81920,32768,1],\"openrouter/qwen/qwen3.6-35b-a3b\":[262144,235929,1],\"openrouter/qwen/qwen3-max-thinking\":[262144,65536,1],\"qwen/qwen3-max-thinking\":[262144,65536,1],\"qwen3-max-thinking\":[262144,65536,1],\"openrouter/qwen/qwen3.8-max-0902\":[1000000,131072,1],\"qwen/qwen3.8-max-0902\":[1000000,131072,1],\"qwen3.8-max-0902\":[1000000,131072,1],\"openrouter/qwen/qwen3-max\":[262144,65536,0],\"qwen/qwen3-max\":[262144,65536,0],\"openrouter/qwen/qwen3-vl-8b-instruct\":[262144,32768,0],\"openrouter/qwen/qwen3.8-2.4t-a95b\":[1048576,262144,1],\"qwen/qwen3.8-2.4t-a95b\":[1048576,262144,1],\"qwen3.8-2.4t-a95b\":[1048576,262144,1],\"openrouter/qwen/qwen3-vl-30b-a3b-instruct\":[262144,16384,0],\"openrouter/qwen/qwen-plus\":[1000000,32768,0],\"qwen/qwen-plus\":[1000000,32768,0],\"openrouter/qwen/qwen3.5-122b-a10b\":[262144,81920,1],\"openrouter/qwen/qwen-2.5-coder-32b-instruct\":[32768,29491,0],\"qwen/qwen-2.5-coder-32b-instruct\":[32768,29491,0],\"qwen-2.5-coder-32b-instruct\":[32768,29491,0],\"openrouter/qwen/qwen3-30b-a3b-instruct-2507\":[262144,32000,0],\"openrouter/qwen/qwen3.6-flash\":[1000000,65536,1],\"qwen/qwen3.6-flash\":[1000000,65536,1],\"openrouter/qwen/qwen3-30b-a3b\":[131072,16384,1],\"qwen/qwen3-30b-a3b\":[131072,16384,1],\"qwen3-30b-a3b\":[131072,16384,1],\"openrouter/qwen/qwen-2.5-7b-instruct\":[32768,29491,0],\"qwen/qwen-2.5-7b-instruct\":[32768,29491,0],\"qwen-2.5-7b-instruct\":[32768,29491,0],\"openrouter/qwen/qwen3.8-flash\":[1000000,131072,1],\"qwen/qwen3.8-flash\":[1000000,131072,1],\"openrouter/qwen/qwen3-vl-30b-a3b-thinking\":[262144,32768,1],\"openrouter/qwen/qwen3.6-max-preview\":[262144,65536,1],\"qwen/qwen3.6-max-preview\":[262144,65536,1],\"openrouter/qwen/qwen-2.5-72b-instruct\":[32768,16384,0],\"qwen/qwen-2.5-72b-instruct\":[32768,16384,0],\"qwen-2.5-72b-instruct\":[32768,16384,0],\"openrouter/qwen/qwen3-8b\":[131072,8192,1],\"openrouter/qwen/qwen3-235b-a22b\":[131072,8192,1],\"qwen/qwen3-235b-a22b\":[131072,8192,1],\"openrouter/qwen/qwen3-vl-235b-a22b-thinking\":[131072,32768,1],\"openrouter/qwen/qwen3-vl-235b-a22b-instruct\":[262144,32768,0],\"openrouter/qwen/qwen3.7-plus\":[1000000,131072,1],\"qwen/qwen3.7-plus\":[1000000,131072,1],\"openrouter/qwen/qwen3-vl-32b-instruct\":[131072,32768,0],\"openrouter/baidu/ernie-4.5-vl-424b-a47b\":[123000,16000,1],\"baidu/ernie-4.5-vl-424b-a47b\":[123000,16000,1],\"ernie-4.5-vl-424b-a47b\":[123000,16000,1],\"openrouter/aion-labs/aion-2.0\":[131072,32768,1],\"aion-labs/aion-2.0\":[131072,32768,1],\"aion-2.0\":[131072,32768,1],\"openrouter/aion-labs/aion-rp-llama-3.1-8b\":[32768,29491,0],\"aion-labs/aion-rp-llama-3.1-8b\":[32768,29491,0],\"aion-rp-llama-3.1-8b\":[32768,29491,0],\"openrouter/aion-labs/aion-3.0\":[131072,32768,1],\"aion-labs/aion-3.0\":[131072,32768,1],\"aion-3.0\":[131072,32768,1],\"openrouter/aion-labs/aion-3.0-mini\":[131072,32768,1],\"aion-labs/aion-3.0-mini\":[131072,32768,1],\"aion-3.0-mini\":[131072,32768,1],\"openrouter/~anthropic/claude-fable-latest\":[1000000,128000,1],\"~anthropic/claude-fable-latest\":[1000000,128000,1],\"claude-fable-latest\":[1000000,128000,1],\"openrouter/~anthropic/claude-opus-latest\":[1000000,128000,1],\"~anthropic/claude-opus-latest\":[1000000,128000,1],\"claude-opus-latest\":[1000000,128000,1],\"openrouter/~anthropic/claude-haiku-latest\":[200000,64000,1],\"~anthropic/claude-haiku-latest\":[200000,64000,1],\"claude-haiku-latest\":[200000,64000,1],\"openrouter/~anthropic/claude-sonnet-latest\":[1000000,128000,1],\"~anthropic/claude-sonnet-latest\":[1000000,128000,1],\"claude-sonnet-latest\":[1000000,128000,1],\"openrouter/morph/morph-v3-large\":[262144,131072,0],\"morph/morph-v3-large\":[262144,131072,0],\"morph-v3-large\":[262144,131072,0],\"openrouter/morph/morph-v3-fast\":[81920,38000,0],\"morph/morph-v3-fast\":[81920,38000,0],\"morph-v3-fast\":[81920,38000,0],\"openrouter/undi95/remm-slerp-l2-13b\":[6144,5529,0],\"undi95/remm-slerp-l2-13b\":[6144,5529,0],\"remm-slerp-l2-13b\":[6144,5529,0],\"openrouter/~deepseek/deepseek-v4-flash-latest\":[1310720,393216,1],\"~deepseek/deepseek-v4-flash-latest\":[1310720,393216,1],\"deepseek-v4-flash-latest\":[1310720,393216,1],\"openrouter/dots-studio/dots-3-note-preview:free\":[512000,460800,1],\"dots-studio/dots-3-note-preview:free\":[512000,460800,1],\"dots-3-note-preview:free\":[512000,460800,1],\"openrouter/~x-ai/grok-latest\":[500000,450000,1],\"~x-ai/grok-latest\":[500000,450000,1],\"grok-latest\":[500000,450000,1],\"openrouter/meituan/longcat-2.0\":[1048756,262144,1],\"meituan/longcat-2.0\":[1048756,262144,1],\"longcat-2.0\":[1048756,262144,1],\"openrouter/poolside/laguna-xs-2.1\":[262144,32768,1],\"poolside/laguna-xs-2.1\":[262144,32768,1],\"laguna-xs-2.1\":[262144,32768,1],\"openrouter/poolside/laguna-xs-2.1:free\":[262144,32768,1],\"poolside/laguna-xs-2.1:free\":[262144,32768,1],\"laguna-xs-2.1:free\":[262144,32768,1],\"openrouter/poolside/laguna-s-2.1:free\":[262144,32768,1],\"poolside/laguna-s-2.1:free\":[262144,32768,1],\"laguna-s-2.1:free\":[262144,32768,1],\"openrouter/poolside/laguna-s-2.1\":[1048576,131072,1],\"poolside/laguna-s-2.1\":[1048576,131072,1],\"laguna-s-2.1\":[1048576,131072,1],\"openrouter/kwaipilot/kat-coder-pro-v2\":[262144,144000,0],\"kwaipilot/kat-coder-pro-v2\":[262144,144000,0],\"kat-coder-pro-v2\":[262144,144000,0],\"openrouter/kwaipilot/kat-coder-pro-v2.5\":[262144,235929,0],\"kwaipilot/kat-coder-pro-v2.5\":[262144,235929,0],\"kat-coder-pro-v2.5\":[262144,235929,0],\"openrouter/stepfun/step-3.7-flash\":[262144,230400,1],\"stepfun/step-3.7-flash\":[262144,230400,1],\"step-3.7-flash\":[262144,230400,1],\"openrouter/stepfun/step-3.5-flash\":[262144,65536,1],\"stepfun/step-3.5-flash\":[262144,65536,1],\"openrouter/mistralai/ministral-14b-2512\":[262144,209715,0],\"mistralai/ministral-14b-2512\":[262144,209715,0],\"ministral-14b-2512\":[262144,209715,0],\"openrouter/mistralai/mistral-large\":[128000,102400,0],\"mistralai/mistral-large\":[128000,102400,0],\"mistral-large\":[128000,102400,0],\"openrouter/mistralai/codestral-2508\":[256000,204800,0],\"mistralai/codestral-2508\":[256000,204800,0],\"codestral-2508\":[256000,204800,0],\"openrouter/mistralai/mistral-medium-3-5\":[262144,209715,1],\"mistralai/mistral-medium-3-5\":[262144,209715,1],\"mistral-medium-3-5\":[262144,209715,1],\"openrouter/mistralai/devstral-2512\":[262144,209715,0],\"mistralai/devstral-2512\":[262144,209715,0],\"devstral-2512\":[262144,262144,0],\"openrouter/mistralai/mistral-large-2407\":[131072,104857,0],\"mistralai/mistral-large-2407\":[131072,104857,0],\"mistral-large-2407\":[131072,104857,0],\"openrouter/mistralai/mistral-small-3.2-24b-instruct\":[131072,16384,0],\"mistralai/mistral-small-3.2-24b-instruct\":[131072,16384,0],\"mistral-small-3.2-24b-instruct\":[131072,16384,0],\"openrouter/mistralai/mixtral-8x22b-instruct\":[65536,52428,0],\"mistralai/mixtral-8x22b-instruct\":[65536,52428,0],\"mixtral-8x22b-instruct\":[65536,52428,0],\"openrouter/mistralai/mistral-saba\":[32768,26214,0],\"mistralai/mistral-saba\":[32768,26214,0],\"mistral-saba\":[32768,26214,0],\"openrouter/mistralai/mistral-large-2512\":[262144,209715,0],\"mistralai/mistral-large-2512\":[262144,209715,0],\"mistral-large-2512\":[262144,262144,0],\"openrouter/mistralai/ministral-3b-2512\":[131072,104857,0],\"mistralai/ministral-3b-2512\":[131072,104857,0],\"ministral-3b-2512\":[131072,104857,0],\"openrouter/mistralai/mistral-nemo\":[131072,16384,0],\"mistralai/mistral-nemo\":[131072,16384,0],\"mistral-nemo\":[128000,128000,0],\"openrouter/mistralai/mistral-medium-3\":[131072,104857,0],\"mistralai/mistral-medium-3\":[131072,104857,0],\"mistral-medium-3\":[131072,104857,0],\"openrouter/mistralai/mistral-small-24b-instruct-2501\":[32768,16384,0],\"mistralai/mistral-small-24b-instruct-2501\":[32768,16384,0],\"mistral-small-24b-instruct-2501\":[32768,16384,0],\"openrouter/mistralai/mistral-small-3.1-24b-instruct\":[128000,102400,0],\"mistralai/mistral-small-3.1-24b-instruct\":[128000,102400,0],\"mistral-small-3.1-24b-instruct\":[128000,102400,0],\"openrouter/mistralai/mistral-small-2603\":[262144,209715,1],\"mistralai/mistral-small-2603\":[262144,209715,1],\"mistral-small-2603\":[256000,256000,1],\"openrouter/mistralai/ministral-8b-2512\":[262144,209715,0],\"mistralai/ministral-8b-2512\":[262144,209715,0],\"ministral-8b-2512\":[262144,209715,0],\"openrouter/mistralai/voxtral-small-24b-2507\":[32768,26214,0],\"mistralai/voxtral-small-24b-2507\":[32768,26214,0],\"voxtral-small-24b-2507\":[32768,26214,0],\"openrouter/mistralai/mistral-medium-3.1\":[131072,104857,0],\"mistralai/mistral-medium-3.1\":[131072,104857,0],\"mistral-medium-3.1\":[131072,104857,0],\"openrouter/xiaomi/mimo-v2.5\":[1050000,131072,1],\"xiaomi/mimo-v2.5\":[1050000,131072,1],\"mimo-v2.5\":[1050000,131072,1],\"openrouter/xiaomi/mimo-v2.5-pro\":[1050000,131072,1],\"xiaomi/mimo-v2.5-pro\":[1050000,131072,1],\"mimo-v2.5-pro\":[1050000,131072,1],\"openrouter/minimax/minimax-m2.1\":[204800,131072,1],\"openrouter/minimax/minimax-m2\":[204800,131072,1],\"openrouter/minimax/minimax-m2.7\":[204800,131072,1],\"openrouter/minimax/minimax-m2.5\":[204800,128000,1],\"openrouter/minimax/minimax-m3\":[1048576,512000,1],\"openrouter/minimax/minimax-m2-her\":[65536,2048,0],\"minimax/minimax-m2-her\":[65536,2048,0],\"minimax-m2-her\":[65536,2048,0],\"openrouter/minimax/minimax-m1\":[1000000,40000,1],\"minimax/minimax-m1\":[1000000,40000,1],\"minimax-m1\":[1000000,40000,1],\"openrouter/minimax/minimax-01\":[1000192,900172,0],\"minimax/minimax-01\":[1000192,900172,0],\"minimax-01\":[1000192,900172,0],\"openrouter/minimax/minimax-m3:free\":[1048576,943718,1],\"minimax/minimax-m3:free\":[1048576,943718,1],\"minimax-m3:free\":[1048576,943718,1],\"openrouter/minimax/minimax-m2.7:free\":[196608,176947,1],\"minimax/minimax-m2.7:free\":[196608,176947,1],\"minimax-m2.7:free\":[196608,176947,1],\"openrouter/nvidia/nemotron-3.5-lightning:free\":[1000000,65536,1],\"nvidia/nemotron-3.5-lightning:free\":[1000000,65536,1],\"nemotron-3.5-lightning:free\":[1000000,65536,1],\"openrouter/nvidia/nemotron-3.5-content-safety\":[131072,117964,1],\"nvidia/nemotron-3.5-content-safety\":[131072,117964,1],\"nemotron-3.5-content-safety\":[131072,117964,1],\"openrouter/nvidia/nemotron-3.5-lightning\":[262144,131072,1],\"nvidia/nemotron-3.5-lightning\":[262144,131072,1],\"nemotron-3.5-lightning\":[262144,131072,1],\"openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free\":[256000,65536,1],\"nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free\":[256000,65536,1],\"nemotron-3-nano-omni-30b-a3b-reasoning:free\":[256000,65536,1],\"openrouter/nvidia/nemotron-3-super-120b-a12b\":[1000000,16384,1],\"nvidia/nemotron-3-super-120b-a12b\":[1000000,16384,1],\"nemotron-3-super-120b-a12b\":[1000000,16384,1],\"openrouter/nvidia/nemotron-3-ultra-550b-a55b:free\":[1000000,65536,1],\"nvidia/nemotron-3-ultra-550b-a55b:free\":[1000000,65536,1],\"nemotron-3-ultra-550b-a55b:free\":[1000000,65536,1],\"openrouter/nvidia/nemotron-3-super-120b-a12b:free\":[262144,235929,1],\"nvidia/nemotron-3-super-120b-a12b:free\":[262144,235929,1],\"nemotron-3-super-120b-a12b:free\":[262144,235929,1],\"openrouter/nvidia/nemotron-3.5-content-safety:free\":[128000,8192,1],\"nvidia/nemotron-3.5-content-safety:free\":[128000,8192,1],\"nemotron-3.5-content-safety:free\":[128000,8192,1],\"openrouter/nvidia/nemotron-3-ultra-550b-a55b\":[262144,32768,1],\"nvidia/nemotron-3-ultra-550b-a55b\":[512300,512300,1],\"nemotron-3-ultra-550b-a55b\":[512300,512300,1],\"openrouter/nvidia/nemotron-3-nano-30b-a3b\":[262144,235929,1],\"nvidia/nemotron-3-nano-30b-a3b\":[262144,235929,1],\"nemotron-3-nano-30b-a3b\":[262144,235929,1],\"openrouter/anthropic/claude-opus-4.8\":[1000000,128000,1],\"anthropic/claude-opus-4.8\":[1000000,128000,1],\"claude-opus-4.8\":[1000000,128000,1],\"openrouter/anthropic/claude-opus-4.7\":[1000000,128000,1],\"anthropic/claude-opus-4.7\":[1000000,128000,1],\"claude-opus-4.7\":[1000000,128000,1],\"openrouter/anthropic/claude-opus-5\":[1000000,128000,1],\"openrouter/anthropic/claude-opus-4.1\":[200000,32000,1],\"anthropic/claude-opus-4.1\":[200000,32000,1],\"claude-opus-4.1\":[200000,32000,1],\"openrouter/anthropic/claude-sonnet-4.6\":[1000000,128000,1],\"anthropic/claude-sonnet-4.6\":[1000000,128000,1],\"claude-sonnet-4.6\":[1000000,128000,1],\"openrouter/anthropic/claude-3-haiku\":[200000,4096,0],\"anthropic/claude-3-haiku\":[200000,4096,0],\"claude-3-haiku\":[200000,4096,0],\"openrouter/anthropic/claude-haiku-4.5\":[200000,64000,1],\"anthropic/claude-haiku-4.5\":[200000,64000,1],\"claude-haiku-4.5\":[200000,64000,1],\"openrouter/anthropic/claude-opus-4.6\":[1000000,128000,1],\"anthropic/claude-opus-4.6\":[1000000,128000,1],\"claude-opus-4.6\":[1000000,128000,1],\"openrouter/anthropic/claude-fable-5\":[1000000,128000,1],\"openrouter/anthropic/claude-opus-4\":[200000,32000,1],\"anthropic/claude-opus-4\":[200000,32000,1],\"claude-opus-4\":[200000,32000,1],\"openrouter/anthropic/claude-sonnet-4.5\":[1000000,64000,1],\"anthropic/claude-sonnet-4.5\":[1000000,64000,1],\"claude-sonnet-4.5\":[1000000,64000,1],\"openrouter/anthropic/claude-opus-4.5\":[200000,64000,1],\"anthropic/claude-opus-4.5\":[200000,64000,1],\"claude-opus-4.5\":[200000,64000,1],\"openrouter/anthropic/claude-sonnet-4\":[1000000,64000,1],\"anthropic/claude-sonnet-4\":[1000000,64000,1],\"openrouter/anthropic/claude-sonnet-5\":[1000000,128000,1],\"openrouter/anthropic/claude-fable-5.1\":[1000000,128000,1],\"anthropic/claude-fable-5.1\":[1000000,128000,1],\"claude-fable-5.1\":[1000000,128000,1],\"openrouter/google/gemma-4-26b-a4b-it\":[262144,16384,1],\"openrouter/google/gemini-3.1-pro-preview-customtools\":[1048576,65536,1],\"openrouter/google/gemini-3.1-flash-lite-image\":[65536,58982,1],\"openrouter/google/gemma-3-4b-it\":[131072,16384,0],\"google/gemma-3-4b-it\":[131072,16384,0],\"gemma-3-4b-it\":[131072,16384,0],\"openrouter/google/lyria-3-clip-preview\":[1048576,65536,0],\"openrouter/google/gemini-2.5-flash-image\":[32768,8192,0],\"openrouter/google/gemini-3-pro-image\":[131072,32768,1],\"openrouter/google/gemini-3.1-pro-preview\":[1048576,65536,1],\"openrouter/google/gemini-2.5-flash-lite\":[1048576,65535,1],\"openrouter/google/gemini-3.6-flash\":[1048576,65536,1],\"openrouter/google/gemini-3.1-flash-lite\":[1048576,65536,1],\"openrouter/google/gemini-3.5-flash\":[1048576,65536,1],\"openrouter/google/gemini-3.1-flash-lite-preview\":[1048576,65536,1],\"openrouter/google/gemma-3-27b-it\":[131072,117964,0],\"google/gemma-3-27b-it\":[131072,117964,0],\"gemma-3-27b-it\":[131072,117964,0],\"openrouter/google/gemini-3.1-flash-image\":[131072,32768,1],\"openrouter/google/gemini-3.5-flash-lite\":[1048576,65536,1],\"openrouter/google/gemini-2.5-pro-preview\":[1048576,65536,1],\"google/gemini-2.5-pro-preview\":[1048576,65536,1],\"gemini-2.5-pro-preview\":[1048576,65536,1],\"openrouter/google/gemini-3-pro-image-preview\":[65536,32768,1],\"openrouter/google/gemma-4-31b-it:free\":[262144,32768,1],\"google/gemma-4-31b-it:free\":[262144,32768,1],\"gemma-4-31b-it:free\":[262144,32768,1],\"openrouter/google/gemma-4-31b-it\":[262144,16384,1],\"openrouter/google/gemini-3-flash-preview\":[1048576,65536,1],\"openrouter/google/gemini-3.8-flash\":[1048576,65536,1],\"openrouter/google/lyria-3-pro-preview\":[1048576,65536,0],\"openrouter/google/gemini-3.7-flash\":[1048576,65536,1],\"openrouter/google/gemini-2.5-pro\":[1048576,65536,1],\"openrouter/google/gemini-3.1-flash-image-preview\":[65536,58982,1],\"openrouter/google/gemini-2.5-flash\":[1048576,65535,1],\"openrouter/google/gemini-2.5-pro-preview-05-06\":[1048576,65535,1],\"google/gemini-2.5-pro-preview-05-06\":[1048576,65535,1],\"gemini-2.5-pro-preview-05-06\":[1048576,65535,1],\"openrouter/google/gemma-3-12b-it\":[131072,16384,0],\"google/gemma-3-12b-it\":[131072,16384,0],\"gemma-3-12b-it\":[131072,16384,0],\"openrouter/google/gemma-4-26b-a4b-it:free\":[262144,32768,1],\"google/gemma-4-26b-a4b-it:free\":[262144,32768,1],\"gemma-4-26b-a4b-it:free\":[262144,32768,1],\"openrouter/google/gemma-2-27b-it\":[8192,2048,0],\"google/gemma-2-27b-it\":[8192,2048,0],\"gemma-2-27b-it\":[8192,2048,0],\"openrouter/relace/relace-apply-3\":[256000,128000,0],\"relace/relace-apply-3\":[256000,128000,0],\"relace-apply-3\":[256000,128000,0],\"openrouter/relace/relace-search\":[256000,128000,0],\"relace/relace-search\":[256000,128000,0],\"relace-search\":[256000,128000,0],\"openrouter/nex-agi/nex-n2-mini\":[262144,235929,1],\"nex-agi/nex-n2-mini\":[262144,235929,1],\"nex-n2-mini\":[262144,235929,1],\"openrouter/nex-agi/nex-n2-pro\":[262144,235929,1],\"nex-agi/nex-n2-pro\":[262144,235929,1],\"nex-n2-pro\":[262144,235929,1],\"openrouter/thinkingmachines/inkling-small\":[1048576,262144,1],\"thinkingmachines/inkling-small\":[1048576,262144,1],\"inkling-small\":[1048576,262144,1],\"openrouter/thinkingmachines/inkling-small:free\":[1048576,262144,1],\"thinkingmachines/inkling-small:free\":[1048576,262144,1],\"inkling-small:free\":[1048576,262144,1],\"openrouter/thinkingmachines/inkling:free\":[1048576,262144,1],\"thinkingmachines/inkling:free\":[1048576,262144,1],\"inkling:free\":[1048576,262144,1],\"openrouter/thinkingmachines/inkling\":[1048576,471859,1],\"thinkingmachines/inkling\":[524288,131072,1],\"openrouter/gryphe/mythomax-l2-13b\":[8192,3686,0],\"gryphe/mythomax-l2-13b\":[8192,3686,0],\"mythomax-l2-13b\":[8192,3686,0],\"openrouter/meta/muse-spark-1.3\":[1048576,943718,1],\"openrouter/meta/muse-spark-1.2\":[1048576,943718,1],\"openrouter/meta/muse-spark-1.2-contributor\":[1048576,943718,1],\"openrouter/meta/muse-spark-1.3-contributor\":[1048576,943718,1],\"openrouter/meta/muse-spark-1.1\":[1048576,943718,1],\"openrouter/meta/muse-glimmer-30b\":[131072,117964,1],\"meta/muse-glimmer-30b\":[131072,117964,1],\"openrouter/perceptron/perceptron-mk1\":[32768,8192,1],\"perceptron/perceptron-mk1\":[32768,8192,1],\"perceptron-mk1\":[32768,8192,1],\"openrouter/thedrummer/skyfall-36b-v2\":[32768,29491,0],\"thedrummer/skyfall-36b-v2\":[32768,29491,0],\"skyfall-36b-v2\":[32768,29491,0],\"openrouter/thedrummer/unslopnemo-12b\":[1024000,819200,0],\"thedrummer/unslopnemo-12b\":[1024000,819200,0],\"unslopnemo-12b\":[1024000,819200,0],\"openrouter/thedrummer/cydonia-24b-v4.1\":[131072,117964,0],\"thedrummer/cydonia-24b-v4.1\":[131072,117964,0],\"cydonia-24b-v4.1\":[131072,117964,0],\"openrouter/bytedance/ui-tars-1.5-7b\":[128000,2048,0],\"bytedance/ui-tars-1.5-7b\":[128000,2048,0],\"ui-tars-1.5-7b\":[128000,2048,0],\"openrouter/bytedance-seed/seed-1.6-flash\":[262144,32768,1],\"bytedance-seed/seed-1.6-flash\":[262144,32768,1],\"seed-1.6-flash\":[262144,32768,1],\"openrouter/bytedance-seed/seed-2-1-turbo\":[262144,235929,1],\"bytedance-seed/seed-2-1-turbo\":[262144,235929,1],\"seed-2-1-turbo\":[262144,235929,1],\"openrouter/bytedance-seed/seed-2.0-code\":[262144,131072,1],\"bytedance-seed/seed-2.0-code\":[262144,131072,1],\"seed-2.0-code\":[262144,131072,1],\"openrouter/bytedance-seed/seed-1.6\":[262144,32768,1],\"bytedance-seed/seed-1.6\":[262144,32768,1],\"seed-1.6\":[262144,32768,1],\"openrouter/bytedance-seed/seed-2.0-mini\":[262144,131072,1],\"bytedance-seed/seed-2.0-mini\":[262144,131072,1],\"seed-2.0-mini\":[262144,131072,1],\"openrouter/bytedance-seed/seed-2.0-lite\":[262144,131072,1],\"bytedance-seed/seed-2.0-lite\":[262144,131072,1],\"seed-2.0-lite\":[262144,131072,1],\"openrouter/inception/mercury-2.5-preview\":[260000,65536,1],\"inception/mercury-2.5-preview\":[260000,65536,1],\"mercury-2.5-preview\":[260000,65536,1],\"openrouter/inception/mercury-2\":[128000,50000,1],\"inception/mercury-2\":[128000,50000,1],\"mercury-2\":[128000,50000,1],\"openrouter/writer/palmyra-x5\":[1040000,8192,0],\"writer/palmyra-x5\":[1040000,8192,0],\"palmyra-x5\":[1040000,8192,0],\"openrouter/~google/gemini-pro-latest\":[1048576,65536,1],\"~google/gemini-pro-latest\":[1048576,65536,1],\"gemini-pro-latest\":[1048576,65536,1],\"openrouter/~google/gemini-flash-latest\":[1048576,65536,1],\"~google/gemini-flash-latest\":[1048576,65536,1],\"openrouter/microsoft/phi-4\":[16384,14745,0],\"microsoft/phi-4\":[16384,14745,0],\"phi-4\":[16384,14745,0],\"openrouter/microsoft/wizardlm-2-8x22b\":[65535,8000,0],\"microsoft/wizardlm-2-8x22b\":[65535,8000,0],\"wizardlm-2-8x22b\":[65535,8000,0],\"openrouter/sakana/fugu-ultra\":[1000000,128000,1],\"sakana/fugu-ultra\":[1000000,128000,1],\"fugu-ultra\":[1000000,128000,1],\"openrouter/sakana/sakana-namazu\":[262144,65536,1],\"sakana/sakana-namazu\":[262144,65536,1],\"sakana-namazu\":[262144,65536,1],\"openrouter/~moonshotai/kimi-latest\":[1048576,943718,1],\"~moonshotai/kimi-latest\":[1048576,943718,1],\"kimi-latest\":[1048576,943718,1],\"openrouter/ibm-granite/granite-4.2-8b\":[131072,117964,1],\"ibm-granite/granite-4.2-8b\":[131072,117964,1],\"granite-4.2-8b\":[131072,117964,1],\"openrouter/ibm-granite/granite-4.0-h-micro\":[131000,117900,0],\"ibm-granite/granite-4.0-h-micro\":[131000,117900,0],\"granite-4.0-h-micro\":[131000,117900,0],\"openrouter/deepseek/deepseek-chat-v3.1\":[163840,144900,1],\"deepseek/deepseek-chat-v3.1\":[163840,144900,1],\"deepseek-chat-v3.1\":[163840,144900,1],\"openrouter/deepseek/deepseek-v4-flash-vision-exp\":[1048576,384000,1],\"openrouter/deepseek/deepseek-v4-pro-0813\":[1048576,384000,1],\"deepseek/deepseek-v4-pro-0813\":[1048576,384000,1],\"openrouter/deepseek/deepseek-v4-flash-0731\":[1310720,131072,1],\"deepseek/deepseek-v4-flash-0731\":[1310720,131072,1],\"openrouter/deepseek/deepseek-v4-flash\":[1048576,384000,1],\"openrouter/deepseek/deepseek-r1\":[64000,16000,1],\"deepseek/deepseek-r1\":[64000,16000,1],\"openrouter/deepseek/deepseek-chat\":[163840,16384,0],\"deepseek/deepseek-chat\":[163840,16384,0],\"deepseek-chat\":[163840,16384,0],\"openrouter/deepseek/deepseek-r1-0528\":[163840,32768,1],\"deepseek/deepseek-r1-0528\":[163840,32768,1],\"openrouter/deepseek/deepseek-v3.2\":[163840,65536,1],\"deepseek/deepseek-v3.2\":[163840,65536,1],\"openrouter/deepseek/deepseek-r1-distill-llama-70b\":[8192,7372,1],\"deepseek/deepseek-r1-distill-llama-70b\":[8192,7372,1],\"openrouter/deepseek/deepseek-v3.2-exp\":[163840,65536,1],\"deepseek/deepseek-v3.2-exp\":[163840,65536,1],\"deepseek-v3.2-exp\":[164000,164000,1],\"openrouter/deepseek/deepseek-v3.1-terminus\":[163840,32768,1],\"deepseek/deepseek-v3.1-terminus\":[163840,32768,1],\"openrouter/deepseek/deepseek-v4-pro\":[1048576,384000,1],\"openrouter/deepseek/deepseek-chat-v3-0324\":[163840,147456,0],\"deepseek/deepseek-chat-v3-0324\":[163840,147456,0],\"deepseek-chat-v3-0324\":[163840,147456,0],\"openrouter/~openai/gpt-latest\":[1050000,128000,1],\"~openai/gpt-latest\":[1050000,128000,1],\"gpt-latest\":[1050000,128000,1],\"openrouter/~openai/gpt-mini-latest\":[400000,128000,1],\"~openai/gpt-mini-latest\":[400000,128000,1],\"gpt-mini-latest\":[400000,128000,1],\"openrouter/amazon/nova-2-lite-v1\":[1000000,65535,1],\"amazon/nova-2-lite-v1\":[1000000,65535,1],\"nova-2-lite-v1\":[1000000,65535,1],\"openrouter/amazon/nova-micro-v1\":[128000,5120,0],\"amazon/nova-micro-v1\":[128000,5120,0],\"nova-micro-v1\":[128000,5120,0],\"openrouter/amazon/nova-pro-v1\":[300000,5120,0],\"amazon/nova-pro-v1\":[300000,5120,0],\"nova-pro-v1\":[300000,5120,0],\"openrouter/amazon/nova-premier-v1\":[1000000,32000,0],\"amazon/nova-premier-v1\":[1000000,32000,0],\"nova-premier-v1\":[1000000,32000,0],\"openrouter/amazon/nova-lite-v1\":[300000,5120,0],\"amazon/nova-lite-v1\":[300000,5120,0],\"nova-lite-v1\":[300000,5120,0],\"openrouter/inclusionai/ling-3.0-flash\":[262144,32768,1],\"inclusionai/ling-3.0-flash\":[262144,32768,1],\"ling-3.0-flash\":[262144,32768,1],\"openrouter/inclusionai/ling-3.0-flash-fin\":[262144,235929,1],\"inclusionai/ling-3.0-flash-fin\":[262144,235929,1],\"ling-3.0-flash-fin\":[262144,235929,1],\"openrouter/inclusionai/ling-3.0-flash-fin:free\":[262144,32768,1],\"inclusionai/ling-3.0-flash-fin:free\":[262144,32768,1],\"ling-3.0-flash-fin:free\":[262144,32768,1],\"openrouter/inclusionai/ling-3.0-flash-sante:free\":[262144,32768,1],\"inclusionai/ling-3.0-flash-sante:free\":[262144,32768,1],\"ling-3.0-flash-sante:free\":[262144,32768,1],\"openrouter/anthracite-org/magnum-v4-72b\":[32768,4096,0],\"anthracite-org/magnum-v4-72b\":[32768,4096,0],\"magnum-v4-72b\":[32768,4096,0],\"openrouter/mancer/weaver\":[8000,6000,0],\"mancer/weaver\":[8000,6000,0],\"weaver\":[8000,6000,0],\"openrouter/openrouter/free\":[200000,8000,1],\"openrouter/free\":[200000,8000,1],\"free\":[200000,8000,1],\"openrouter/openrouter/pareto-code\":[2000000,200000,0],\"openrouter/pareto-code\":[2000000,200000,0],\"pareto-code\":[2000000,200000,0],\"openrouter/openrouter/bodybuilder\":[128000,128000,0],\"openrouter/bodybuilder\":[128000,128000,0],\"bodybuilder\":[128000,128000,0],\"openrouter/openrouter/fusion\":[1000000,128000,0],\"openrouter/fusion\":[1000000,128000,0],\"fusion\":[1000000,128000,0],\"openrouter/openrouter/auto\":[2000000,2000000,1],\"openrouter/auto\":[2000000,2000000,1],\"auto\":[2000000,2000000,1],\"openrouter/sao10k/l3.3-euryale-70b\":[131072,16384,0],\"sao10k/l3.3-euryale-70b\":[131072,16384,0],\"l3.3-euryale-70b\":[131072,16384,0],\"openrouter/sao10k/l3-lunaris-8b\":[8192,7372,0],\"sao10k/l3-lunaris-8b\":[8192,7372,0],\"l3-lunaris-8b\":[8192,7372,0],\"openrouter/sao10k/l3.1-euryale-70b\":[131072,16384,0],\"sao10k/l3.1-euryale-70b\":[131072,16384,0],\"l3.1-euryale-70b\":[131072,16384,0],\"openrouter/x-ai/grok-4.20-multi-agent\":[2000000,1800000,1],\"x-ai/grok-4.20-multi-agent\":[2000000,1800000,1],\"grok-4.20-multi-agent\":[2000000,1800000,1],\"openrouter/x-ai/grok-4.3\":[1000000,900000,1],\"x-ai/grok-4.3\":[1000000,900000,1],\"grok-4.3\":[1000000,30000,1],\"openrouter/x-ai/grok-4.20\":[2000000,1800000,1],\"x-ai/grok-4.20\":[2000000,1800000,1],\"grok-4.20\":[2000000,1800000,1],\"openrouter/x-ai/grok-4.5\":[500000,450000,1],\"x-ai/grok-4.5\":[500000,450000,1],\"openrouter/x-ai/grok-build-0.1\":[256000,230400,1],\"x-ai/grok-build-0.1\":[256000,230400,1],\"openrouter/x-ai/grok-4.6\":[500000,450000,1],\"x-ai/grok-4.6\":[500000,450000,1],\"openrouter/meta-llama/llama-3.1-8b-instruct\":[131072,117964,0],\"meta-llama/llama-3.1-8b-instruct\":[131072,117964,0],\"llama-3.1-8b-instruct\":[131072,117964,0],\"openrouter/meta-llama/llama-guard-4-12b\":[163840,16384,0],\"meta-llama/llama-guard-4-12b\":[163840,16384,0],\"llama-guard-4-12b\":[163840,16384,0],\"openrouter/meta-llama/llama-3.2-3b-instruct\":[131072,117964,0],\"meta-llama/llama-3.2-3b-instruct\":[131072,117964,0],\"llama-3.2-3b-instruct\":[131072,117964,0],\"openrouter/meta-llama/llama-3.2-1b-instruct\":[60000,54000,0],\"meta-llama/llama-3.2-1b-instruct\":[60000,54000,0],\"llama-3.2-1b-instruct\":[60000,54000,0],\"openrouter/meta-llama/llama-4-maverick\":[1048576,115200,0],\"meta-llama/llama-4-maverick\":[1048576,115200,0],\"llama-4-maverick\":[1048576,115200,0],\"openrouter/meta-llama/llama-4-scout\":[1310720,16384,0],\"meta-llama/llama-4-scout\":[1310720,16384,0],\"llama-4-scout\":[1310720,16384,0],\"openrouter/meta-llama/llama-3.1-70b-instruct\":[131072,16384,0],\"meta-llama/llama-3.1-70b-instruct\":[131072,16384,0],\"llama-3.1-70b-instruct\":[131072,16384,0],\"openrouter/meta-llama/llama-3.3-70b-instruct\":[131072,16384,0],\"meta-llama/llama-3.3-70b-instruct\":[131072,16384,0],\"llama-3.3-70b-instruct\":[131072,16384,0],\"openrouter/nousresearch/hermes-3-llama-3.1-70b\":[131072,16384,0],\"nousresearch/hermes-3-llama-3.1-70b\":[131072,16384,0],\"hermes-3-llama-3.1-70b\":[131072,16384,0],\"openrouter/nousresearch/hermes-3-llama-3.1-405b\":[131072,16384,0],\"nousresearch/hermes-3-llama-3.1-405b\":[131072,16384,0],\"hermes-3-llama-3.1-405b\":[131072,16384,0],\"openrouter/nousresearch/hermes-4-405b\":[131072,117964,1],\"nousresearch/hermes-4-405b\":[131072,117964,1],\"hermes-4-405b\":[131072,117964,1],\"openrouter/nousresearch/hermes-4-70b\":[131072,117964,1],\"nousresearch/hermes-4-70b\":[131072,117964,1],\"hermes-4-70b\":[131072,117964,1],\"openrouter/openai/o4-mini-high\":[200000,100000,1],\"openai/o4-mini-high\":[200000,100000,1],\"o4-mini-high\":[200000,100000,1],\"openrouter/openai/gpt-5-nano\":[400000,128000,1],\"openai/gpt-5-nano\":[400000,128000,1],\"openrouter/openai/gpt-4.1-nano\":[1047576,32768,0],\"openai/gpt-4.1-nano\":[1047576,32768,0],\"gpt-4.1-nano\":[1047576,32768,0],\"openrouter/openai/gpt-4o-2024-05-13\":[128000,4096,0],\"openai/gpt-4o-2024-05-13\":[128000,4096,0],\"gpt-4o-2024-05-13\":[128000,4096,0],\"openrouter/openai/gpt-5-pro\":[400000,128000,1],\"openai/gpt-5-pro\":[400000,272000,1],\"gpt-5-pro\":[400000,272000,1],\"openrouter/openai/gpt-4o-mini-2024-07-18\":[128000,16384,0],\"openai/gpt-4o-mini-2024-07-18\":[128000,16384,0],\"gpt-4o-mini-2024-07-18\":[128000,16384,0],\"openrouter/openai/o3-mini-high\":[200000,100000,1],\"openai/o3-mini-high\":[200000,100000,1],\"o3-mini-high\":[200000,100000,1],\"openrouter/openai/gpt-5.1-codex-mini\":[400000,128000,1],\"openai/gpt-5.1-codex-mini\":[400000,128000,1],\"openrouter/openai/gpt-6-astra-pro\":[1050000,128000,1],\"openai/gpt-6-astra-pro\":[1050000,128000,1],\"gpt-6-astra-pro\":[1050000,128000,1],\"openrouter/openai/gpt-audio-mini\":[128000,16384,0],\"openai/gpt-audio-mini\":[128000,16384,0],\"gpt-audio-mini\":[128000,16384,0],\"openrouter/openai/gpt-5.1-codex\":[400000,128000,1],\"openai/gpt-5.1-codex\":[400000,128000,1],\"openrouter/openai/gpt-5.6-sol\":[1050000,128000,1],\"openai/gpt-5.6-sol\":[1050000,128000,1],\"openrouter/openai/gpt-4-turbo-preview\":[128000,4096,0],\"openai/gpt-4-turbo-preview\":[128000,4096,0],\"gpt-4-turbo-preview\":[128000,4096,0],\"openrouter/openai/gpt-4o-2024-08-06\":[128000,16384,0],\"openai/gpt-4o-2024-08-06\":[128000,16384,0],\"gpt-4o-2024-08-06\":[128000,16384,0],\"openrouter/openai/gpt-5.2-codex\":[400000,128000,1],\"openai/gpt-5.2-codex\":[400000,128000,1],\"openrouter/openai/gpt-6-astra\":[1050000,128000,1],\"openai/gpt-6-astra\":[1050000,128000,1],\"openrouter/openai/gpt-5.2-chat\":[128000,32000,0],\"openai/gpt-5.2-chat\":[128000,32000,0],\"gpt-5.2-chat\":[128000,32000,0],\"openrouter/openai/gpt-5.6-luna-pro\":[1050000,128000,1],\"openai/gpt-5.6-luna-pro\":[1050000,128000,1],\"gpt-5.6-luna-pro\":[1050000,128000,1],\"openrouter/openai/gpt-5.2-pro\":[400000,128000,1],\"openai/gpt-5.2-pro\":[400000,128000,1],\"gpt-5.2-pro\":[400000,128000,1],\"openrouter/openai/gpt-4.1-mini\":[1047576,32768,0],\"openai/gpt-4.1-mini\":[1047576,32768,0],\"gpt-4.1-mini\":[1047576,32768,0],\"openrouter/openai/gpt-5.4\":[1050000,128000,1],\"openai/gpt-5.4\":[1050000,128000,1],\"openrouter/openai/gpt-oss-20b\":[131072,117964,1],\"openrouter/openai/gpt-4-turbo\":[128000,4096,0],\"openai/gpt-4-turbo\":[128000,4096,0],\"gpt-4-turbo\":[128000,4096,0],\"openrouter/openai/gpt-5-image\":[400000,128000,1],\"openai/gpt-5-image\":[400000,128000,1],\"gpt-5-image\":[400000,128000,1],\"openrouter/openai/gpt-5.6-sol-pro\":[1050000,128000,1],\"openai/gpt-5.6-sol-pro\":[1050000,128000,1],\"gpt-5.6-sol-pro\":[1050000,128000,1],\"openrouter/openai/gpt-oss-safeguard-20b\":[131072,65536,1],\"openrouter/openai/gpt-5.1\":[400000,128000,1],\"openai/gpt-5.1\":[400000,128000,1],\"openrouter/openai/gpt-5.1-codex-max\":[400000,128000,1],\"openai/gpt-5.1-codex-max\":[400000,128000,1],\"openrouter/openai/gpt-5.4-image-2\":[272000,128000,1],\"openai/gpt-5.4-image-2\":[272000,128000,1],\"gpt-5.4-image-2\":[272000,128000,1],\"openrouter/openai/gpt-3.5-turbo-0613\":[4095,3685,0],\"openai/gpt-3.5-turbo-0613\":[4095,3685,0],\"gpt-3.5-turbo-0613\":[4095,3685,0],\"openrouter/openai/gpt-audio\":[128000,16384,0],\"openai/gpt-audio\":[128000,16384,0],\"gpt-audio\":[128000,16384,0],\"openrouter/openai/o1\":[200000,100000,1],\"openai/o1\":[200000,100000,1],\"o1\":[200000,100000,1],\"openrouter/openai/gpt-4o\":[128000,16384,0],\"openai/gpt-4o\":[128000,16384,0],\"gpt-4o\":[128000,16384,0],\"openrouter/openai/gpt-5.6-luna\":[1050000,128000,1],\"openai/gpt-5.6-luna\":[1050000,128000,1],\"openrouter/openai/gpt-5.3-codex\":[400000,128000,1],\"openai/gpt-5.3-codex\":[400000,128000,1],\"openrouter/openai/gpt-4o-mini\":[128000,16384,0],\"openai/gpt-4o-mini\":[128000,16384,0],\"gpt-4o-mini\":[128000,16384,0],\"openrouter/openai/o1-pro\":[200000,100000,1],\"openai/o1-pro\":[200000,100000,1],\"o1-pro\":[200000,100000,1],\"openrouter/openai/gpt-4.1\":[1047576,32768,0],\"openai/gpt-4.1\":[1047576,32768,0],\"gpt-4.1\":[1047576,32768,0],\"openrouter/openai/gpt-5.4-nano\":[400000,128000,1],\"openai/gpt-5.4-nano\":[400000,128000,1],\"openrouter/openai/gpt-5.6-terra-pro\":[1050000,128000,1],\"openai/gpt-5.6-terra-pro\":[1050000,128000,1],\"gpt-5.6-terra-pro\":[1050000,128000,1],\"openrouter/openai/gpt-5.5-pro\":[1050000,128000,1],\"openai/gpt-5.5-pro\":[1050000,128000,1],\"openrouter/openai/gpt-chat-latest\":[400000,128000,0],\"openai/gpt-chat-latest\":[400000,128000,0],\"gpt-chat-latest\":[400000,128000,0],\"openrouter/openai/gpt-5.4-mini\":[400000,128000,1],\"openai/gpt-5.4-mini\":[400000,128000,1],\"openrouter/openai/gpt-3.5-turbo-16k\":[16385,4096,0],\"openai/gpt-3.5-turbo-16k\":[16385,4096,0],\"gpt-3.5-turbo-16k\":[16385,4096,0],\"openrouter/openai/gpt-5-image-mini\":[400000,128000,1],\"openai/gpt-5-image-mini\":[400000,128000,1],\"gpt-5-image-mini\":[400000,128000,1],\"openrouter/openai/gpt-3.5-turbo\":[16385,4096,0],\"openai/gpt-3.5-turbo\":[16385,4096,0],\"gpt-3.5-turbo\":[16385,4096,0],\"openrouter/openai/gpt-5-mini\":[400000,128000,1],\"openai/gpt-5-mini\":[400000,128000,1],\"gpt-5-mini\":[400000,128000,1],\"openrouter/openai/gpt-oss-120b\":[131072,117964,1],\"openrouter/openai/gpt-5.4-pro\":[1050000,128000,1],\"openai/gpt-5.4-pro\":[1050000,128000,1],\"openrouter/openai/gpt-3.5-turbo-instruct\":[4095,3685,0],\"openai/gpt-3.5-turbo-instruct\":[4095,3685,0],\"gpt-3.5-turbo-instruct\":[4095,3685,0],\"openrouter/openai/gpt-5.6-terra\":[1050000,128000,1],\"openai/gpt-5.6-terra\":[1050000,128000,1],\"openrouter/openai/gpt-4\":[8191,4096,0],\"openai/gpt-4\":[8192,8192,0],\"gpt-4\":[8192,8192,0],\"openrouter/openai/gpt-5.2\":[400000,128000,1],\"openai/gpt-5.2\":[400000,128000,1],\"openrouter/openai/gpt-5\":[400000,128000,1],\"openai/gpt-5\":[400000,128000,1],\"openrouter/openai/o4-mini\":[200000,100000,1],\"openai/o4-mini\":[200000,100000,1],\"o4-mini\":[200000,100000,1],\"openrouter/openai/o3-mini\":[200000,100000,1],\"openai/o3-mini\":[200000,100000,1],\"o3-mini\":[200000,100000,1],\"openrouter/openai/o3\":[200000,100000,1],\"openai/o3\":[200000,100000,1],\"o3\":[200000,100000,1],\"openrouter/openai/o3-pro\":[200000,100000,1],\"openai/o3-pro\":[200000,100000,1],\"o3-pro\":[200000,100000,1],\"openrouter/openai/gpt-5.5\":[1050000,128000,1],\"openai/gpt-5.5\":[1050000,128000,1],\"openrouter/openai/gpt-4o-2024-11-20\":[128000,16384,0],\"openai/gpt-4o-2024-11-20\":[128000,16384,0],\"gpt-4o-2024-11-20\":[128000,16384,0],\"openrouter/~z-ai/glm-flash-latest\":[1310720,131072,1],\"~z-ai/glm-flash-latest\":[1310720,131072,1],\"glm-flash-latest\":[1310720,131072,1],\"openrouter/~z-ai/glm-latest\":[1310720,235929,1],\"~z-ai/glm-latest\":[1310720,235929,1],\"glm-latest\":[1310720,235929,1],\"openrouter/moonshotai/kimi-k2-0905\":[262144,100352,0],\"moonshotai/kimi-k2-0905\":[262144,100352,0],\"kimi-k2-0905\":[262144,100352,0],\"openrouter/moonshotai/kimi-k2.6\":[262144,235929,1],\"moonshotai/kimi-k2.6\":[262144,131000,1],\"openrouter/moonshotai/kimi-k2.7-code\":[262144,235929,1],\"moonshotai/kimi-k2.7-code\":[262144,131072,1],\"openrouter/moonshotai/kimi-k2-thinking\":[262144,100352,1],\"moonshotai/kimi-k2-thinking\":[262144,100352,1],\"openrouter/moonshotai/kimi-k3\":[1048576,943718,1],\"moonshotai/kimi-k3\":[1048576,131072,1],\"openrouter/moonshotai/kimi-k2\":[131072,100352,0],\"moonshotai/kimi-k2\":[131072,100352,0],\"openrouter/moonshotai/kimi-k2.5\":[262144,235929,1],\"moonshotai/kimi-k2.5\":[262144,262144,1],\"openrouter/cohere/north-mini-code:free\":[256000,64000,1],\"cohere/north-mini-code:free\":[256000,64000,1],\"north-mini-code:free\":[256000,64000,1],\"openrouter/cohere/command-r-plus-08-2024\":[128000,4000,0],\"cohere/command-r-plus-08-2024\":[128000,4000,0],\"command-r-plus-08-2024\":[128000,4000,0],\"openrouter/cohere/command-a\":[256000,8192,0],\"cohere/command-a\":[256000,8192,0],\"command-a\":[256000,8192,0],\"openrouter/cohere/command-r7b-12-2024\":[128000,4000,0],\"cohere/command-r7b-12-2024\":[128000,4000,0],\"command-r7b-12-2024\":[128000,4000,0],\"openrouter/cohere/command-r-08-2024\":[128000,4000,0],\"cohere/command-r-08-2024\":[128000,4000,0],\"command-r-08-2024\":[128000,4000,0],\"openrouter/upstage/solar-pro-3\":[131072,117964,1],\"upstage/solar-pro-3\":[131072,117964,1],\"solar-pro-3\":[131072,117964,1],\"openrouter/upstage/solar-pro4\":[524288,131072,1],\"upstage/solar-pro4\":[524288,131072,1],\"solar-pro4\":[524288,131072,1],\"openrouter/arcee-ai/trinity-large-thinking\":[262144,80000,1],\"arcee-ai/trinity-large-thinking\":[262144,80000,1],\"trinity-large-thinking\":[262144,80000,1],\"openrouter/tencent/hy3\":[262144,128000,1],\"tencent/hy3\":[262144,128000,1],\"hy3\":[262144,128000,1],\"openrouter/tencent/hy4-preview\":[1048576,64000,1],\"tencent/hy4-preview\":[1048576,64000,1],\"hy4-preview\":[1048576,64000,1],\"openrouter/tencent/hy-mt2-30b-a3b\":[8192,4096,0],\"tencent/hy-mt2-30b-a3b\":[8192,4096,0],\"hy-mt2-30b-a3b\":[8192,4096,0],\"openrouter/tencent/hy-mt2-7b\":[8192,4096,0],\"tencent/hy-mt2-7b\":[8192,4096,0],\"hy-mt2-7b\":[8192,4096,0],\"openrouter/tencent/hy-mt2-1.8b\":[8192,4096,0],\"tencent/hy-mt2-1.8b\":[8192,4096,0],\"hy-mt2-1.8b\":[8192,4096,0],\"openrouter/tencent/hy3-preview\":[262144,235929,1],\"tencent/hy3-preview\":[262144,262144,1],\"hy3-preview\":[262144,262144,1],\"openrouter/tencent/hunyuan-a13b-instruct\":[131072,117964,1],\"openrouter/liquid/lfm-2.5-2.6b:free\":[65536,8192,1],\"liquid/lfm-2.5-2.6b:free\":[65536,8192,1],\"lfm-2.5-2.6b:free\":[65536,8192,1],\"openrouter/z-ai/glm-4.7\":[204800,131072,1],\"z-ai/glm-4.7\":[204800,131072,1],\"openrouter/z-ai/glm-4.5-air\":[131072,98304,1],\"z-ai/glm-4.5-air\":[131072,98304,1],\"openrouter/z-ai/glm-4.6\":[204800,16384,1],\"z-ai/glm-4.6\":[204800,16384,1],\"openrouter/z-ai/glm-4.6v\":[131072,32768,1],\"z-ai/glm-4.6v\":[131072,32768,1],\"openrouter/z-ai/glm-5.2\":[1048576,131072,1],\"z-ai/glm-5.2\":[1048576,131072,1],\"openrouter/z-ai/glm-5.3-flash\":[1310720,131072,1],\"z-ai/glm-5.3-flash\":[1310720,131072,1],\"openrouter/z-ai/glm-4.5\":[131072,98304,1],\"z-ai/glm-4.5\":[131072,98304,1],\"openrouter/z-ai/glm-4.5v\":[65536,16384,1],\"z-ai/glm-4.5v\":[65536,16384,1],\"openrouter/z-ai/glm-5\":[204800,128000,1],\"z-ai/glm-5\":[204800,128000,1],\"openrouter/z-ai/glm-5.1\":[204800,128000,1],\"z-ai/glm-5.1\":[204800,128000,1],\"openrouter/z-ai/glm-5-turbo\":[202752,131072,1],\"z-ai/glm-5-turbo\":[202752,131072,1],\"glm-5-turbo\":[200000,131072,1],\"openrouter/z-ai/glm-5.3\":[1310720,943718,1],\"z-ai/glm-5.3\":[1310720,943718,1],\"openrouter/z-ai/glm-5v-turbo\":[202752,131072,1],\"z-ai/glm-5v-turbo\":[202752,131072,1],\"openrouter/z-ai/glm-4.7-flash\":[202752,16384,1],\"z-ai/glm-4.7-flash\":[202752,16384,1],\"openrouter/cognitivecomputations/dolphin-mistral-24b-venice-edition\":[128000,8192,0],\"cognitivecomputations/dolphin-mistral-24b-venice-edition\":[128000,8192,0],\"dolphin-mistral-24b-venice-edition\":[128000,8192,0],\"openrouter/perplexity/sonar-pro-search\":[200000,8000,1],\"perplexity/sonar-pro-search\":[200000,8000,1],\"sonar-pro-search\":[200000,8000,1],\"openrouter/perplexity/sonar\":[127072,114364,0],\"perplexity/sonar\":[128000,4096,0],\"sonar\":[128000,4096,0],\"openrouter/perplexity/sonar-reasoning-pro\":[128000,115200,1],\"perplexity/sonar-reasoning-pro\":[128000,4096,1],\"sonar-reasoning-pro\":[128000,4096,1],\"openrouter/perplexity/sonar-pro\":[200000,8000,0],\"perplexity/sonar-pro\":[200000,8192,0],\"sonar-pro\":[200000,8192,0],\"openrouter/perplexity/sonar-deep-research\":[128000,115200,1],\"perplexity/sonar-deep-research\":[128000,32768,1],\"sonar-deep-research\":[128000,32768,1],\"openrouter/rekaai/reka-edge\":[16384,14745,0],\"rekaai/reka-edge\":[16384,14745,0],\"reka-edge\":[16384,14745,0],\"openrouter/rekaai/reka-flash-3\":[65536,58982,1],\"rekaai/reka-flash-3\":[65536,58982,1],\"reka-flash-3\":[65536,58982,1],\"openai/gpt-5.3-codex-spark\":[128000,32000,1],\"openai/text-embedding-ada-002\":[8192,1536,0],\"text-embedding-ada-002\":[8192,1536,0],\"openai/gpt-5.6\":[1050000,128000,1],\"gpt-5.6\":[1050000,128000,1],\"openai/text-embedding-3-small\":[8191,1536,0],\"text-embedding-3-small\":[8191,1536,0],\"openai/text-embedding-3-large\":[8191,3072,0],\"text-embedding-3-large\":[8191,3072,0],\"openai/gpt-5.2-chat-latest\":[128000,16384,1],\"gpt-5.2-chat-latest\":[128000,16384,1],\"openai/gpt-realtime-2.1\":[128000,32000,1],\"gpt-realtime-2.1\":[128000,32000,1],\"openai/gpt-5.3-chat-latest\":[128000,16384,0],\"gpt-5.3-chat-latest\":[128000,16384,0],\"siliconflow/baidu/ernie-4.5-300b-a47b\":[131000,131000,0],\"siliconflow/stepfun-ai/step-3.5-flash\":[262000,262000,1],\"siliconflow/deepseek-ai/deepseek-v3\":[164000,164000,0],\"siliconflow/deepseek-ai/deepseek-v4-flash\":[1000000,384000,1],\"siliconflow/deepseek-ai/deepseek-v3.1\":[164000,164000,1],\"deepseek-ai/deepseek-v3.1\":[164000,164000,1],\"deepseek-v3.1\":[164000,164000,1],\"siliconflow/deepseek-ai/deepseek-v3.1-terminus\":[164000,164000,1],\"siliconflow/deepseek-ai/deepseek-v3.2-exp\":[164000,164000,1],\"deepseek-ai/deepseek-v3.2-exp\":[164000,164000,1],\"siliconflow/deepseek-ai/deepseek-r1\":[164000,164000,1],\"siliconflow/deepseek-ai/deepseek-v3.2\":[164000,164000,1],\"siliconflow/deepseek-ai/deepseek-v4-pro\":[1000000,384000,1],\"siliconflow/inclusionai/ling-flash-2.0\":[131000,131000,0],\"siliconflow/google/gemma-4-31b-it\":[262144,262144,0],\"siliconflow/google/gemma-4-26b-a4b-it\":[262144,262144,0],\"siliconflow/zai-org/glm-5.1\":[205000,205000,1],\"zai-org/glm-5.1\":[202752,131072,1],\"siliconflow/zai-org/glm-5v-turbo\":[200000,131072,1],\"zai-org/glm-5v-turbo\":[200000,131072,1],\"siliconflow/zai-org/glm-4.5-air\":[131000,131000,0],\"siliconflow/zai-org/glm-5.2\":[1049000,262000,1],\"siliconflow/zai-org/glm-5\":[205000,205000,1],\"zai-org/glm-5\":[202752,131072,1],\"siliconflow/qwen/qwen3-30b-a3b-instruct-2507\":[262000,262000,0],\"siliconflow/qwen/qwen3-vl-30b-a3b-thinking\":[262000,262000,1],\"siliconflow/qwen/qwen3.5-27b\":[262144,262144,0],\"siliconflow/qwen/qwen3-8b\":[131000,131000,1],\"siliconflow/qwen/qwen3-vl-32b-thinking\":[262000,262000,1],\"siliconflow/qwen/qwen3-14b\":[131000,131000,1],\"siliconflow/qwen/qwen3-coder-30b-a3b-instruct\":[262000,262000,0],\"siliconflow/qwen/qwen3.5-9b\":[262144,262144,0],\"siliconflow/qwen/qwen3.5-122b-a10b\":[262144,262144,0],\"siliconflow/qwen/qwen3-vl-235b-a22b-instruct\":[262000,262000,0],\"siliconflow/qwen/qwen3-coder-480b-a35b-instruct\":[262000,262000,0],\"siliconflow/qwen/qwen2.5-7b-instruct\":[33000,4000,0],\"siliconflow/qwen/qwen2.5-72b-instruct\":[33000,4000,0],\"siliconflow/qwen/qwen3.5-397b-a17b\":[262144,262144,0],\"siliconflow/qwen/qwen3.5-35b-a3b\":[262144,262144,0],\"siliconflow/qwen/qwen3-vl-32b-instruct\":[262000,262000,0],\"siliconflow/qwen/qwen3-32b\":[131000,131000,1],\"siliconflow/qwen/qwen3-235b-a22b-thinking-2507\":[262000,262000,1],\"siliconflow/qwen/qwen3.6-27b\":[262144,262144,0],\"siliconflow/qwen/qwen3-vl-8b-instruct\":[262000,262000,0],\"siliconflow/qwen/qwen3.6-35b-a3b\":[262144,262144,0],\"siliconflow/qwen/qwen3-vl-235b-a22b-thinking\":[262000,262000,1],\"siliconflow/qwen/qwen3-vl-30b-a3b-instruct\":[262000,262000,0],\"siliconflow/bytedance-seed/seed-oss-36b-instruct\":[262000,262000,0],\"siliconflow/minimaxai/minimax-m2.5\":[197000,131000,0],\"minimaxai/minimax-m2.5\":[204800,131072,1],\"siliconflow/openai/gpt-oss-20b\":[131000,8000,0],\"siliconflow/openai/gpt-oss-120b\":[131000,8000,1],\"siliconflow/moonshotai/kimi-k2.5\":[262000,262000,1],\"siliconflow/moonshotai/kimi-k2.6\":[262000,262000,1],\"siliconflow/tencent/hunyuan-a13b-instruct\":[131000,131000,1],\"siliconflow/tencent/hy3-preview\":[262144,262144,1],\"moonshotai/kimi-k2.7-code-highspeed\":[262144,262144,1],\"kimi-k2.7-code-highspeed\":[262144,262144,1],\"cohere/command-r7b-arabic-02-2025\":[128000,4000,0],\"command-r7b-arabic-02-2025\":[128000,4000,0],\"cohere/command-a-plus-05-2026\":[128000,64000,1],\"command-a-plus-05-2026\":[128000,64000,1],\"cohere/command-a-reasoning-08-2025\":[256000,32000,1],\"command-a-reasoning-08-2025\":[256000,32000,1],\"cohere/command-a-vision-07-2025\":[128000,8000,0],\"command-a-vision-07-2025\":[128000,8000,0],\"cohere/north-mini-code-1-0\":[256000,64000,1],\"north-mini-code-1-0\":[256000,64000,1],\"cohere/command-a-translate-08-2025\":[8000,8000,0],\"command-a-translate-08-2025\":[8000,8000,0],\"cohere/command-a-03-2025\":[256000,8000,0],\"command-a-03-2025\":[256000,8000,0],\"cohere/c4ai-aya-expanse-32b\":[128000,4000,0],\"c4ai-aya-expanse-32b\":[128000,4000,0],\"cohere/c4ai-aya-expanse-8b\":[8000,4000,0],\"c4ai-aya-expanse-8b\":[8000,4000,0],\"cohere/c4ai-aya-vision-8b\":[16000,4000,0],\"c4ai-aya-vision-8b\":[16000,4000,0],\"cohere/c4ai-aya-vision-32b\":[16000,4000,0],\"c4ai-aya-vision-32b\":[16000,4000,0],\"xai/grok-4.3\":[1000000,30000,1],\"xai/grok-4.20-0309-reasoning\":[1000000,30000,1],\"grok-4.20-0309-reasoning\":[1000000,30000,1],\"xai/grok-4.20-multi-agent-0309\":[1000000,30000,1],\"grok-4.20-multi-agent-0309\":[1000000,30000,1],\"xai/grok-imagine-image\":[16000,0,0],\"grok-imagine-image\":[16000,0,0],\"xai/grok-imagine-video\":[1024,0,0],\"grok-imagine-video\":[1024,0,0],\"xai/grok-4.5\":[500000,500000,1],\"xai/grok-build-0.1\":[256000,256000,1],\"xai/grok-imagine-video-1.5\":[1024,0,0],\"grok-imagine-video-1.5\":[1024,0,0],\"xai/grok-imagine-image-2.0\":[64000,0,0],\"grok-imagine-image-2.0\":[64000,0,0],\"xai/grok-4.6\":[500000,500000,1],\"xai/grok-imagine-image-quality\":[16000,0,0],\"grok-imagine-image-quality\":[16000,0,0],\"xai/grok-4.20-0309-non-reasoning\":[1000000,30000,0],\"grok-4.20-0309-non-reasoning\":[1000000,30000,0],\"zai/glm-4.7\":[204800,131072,1],\"zai/glm-4.5-air\":[131072,98304,1],\"zai/glm-4.6\":[204800,131072,1],\"zai/glm-4.6v\":[128000,32768,1],\"zai/glm-5.2\":[1000000,131072,1],\"zai/glm-4.5-flash\":[131072,98304,1],\"zai/glm-5.3-flash\":[1000000,131072,1],\"zai/glm-4.5\":[131072,98304,1],\"zai/glm-4.5v\":[64000,16384,1],\"zai/glm-4.7-flashx\":[200000,131072,1],\"zai/glm-5\":[204800,131072,1],\"zai/glm-5.1\":[200000,131072,1],\"zai/glm-5-turbo\":[200000,131072,1],\"zai/glm-5.3\":[1000000,131072,1],\"zai/glm-5v-turbo\":[200000,131072,1],\"zai/glm-4.7-flash\":[200000,131072,1],\"mistral/pixtral-12b\":[128000,128000,0],\"pixtral-12b\":[128000,128000,0],\"mistral/devstral-small-2507\":[128000,128000,0],\"devstral-small-2507\":[128000,128000,0],\"mistral/mistral-small-2506\":[128000,16384,0],\"mistral-small-2506\":[128000,16384,0],\"mistral/magistral-small\":[128000,128000,1],\"magistral-small\":[128000,128000,1],\"mistral/devstral-2512\":[262144,262144,0],\"mistral/mistral-embed\":[8000,3072,0],\"mistral-embed\":[8000,3072,0],\"mistral/devstral-small-2505\":[128000,128000,0],\"devstral-small-2505\":[128000,128000,0],\"mistral/labs-devstral-small-2512\":[256000,256000,0],\"labs-devstral-small-2512\":[256000,256000,0],\"mistral/magistral-medium-latest\":[128000,16384,1],\"magistral-medium-latest\":[128000,16384,1],\"mistral/open-mixtral-8x22b\":[64000,64000,0],\"open-mixtral-8x22b\":[64000,64000,0],\"mistral/open-mixtral-8x7b\":[32000,32000,0],\"open-mixtral-8x7b\":[32000,32000,0],\"mistral/open-mistral-7b\":[8000,8000,0],\"open-mistral-7b\":[8000,8000,0],\"mistral/mistral-medium-latest\":[262144,262144,1],\"mistral-medium-latest\":[262144,262144,1],\"mistral/devstral-medium-2507\":[128000,128000,0],\"devstral-medium-2507\":[128000,128000,0],\"mistral/mistral-medium-2604\":[262144,262144,1],\"mistral-medium-2604\":[262144,262144,1],\"mistral/mistral-large-2512\":[262144,262144,0],\"mistral/devstral-medium-latest\":[262144,262144,0],\"devstral-medium-latest\":[262144,262144,0],\"mistral/voxtral-small-latest\":[32000,32000,0],\"voxtral-small-latest\":[32000,32000,0],\"mistral/ministral-8b-latest\":[128000,128000,0],\"ministral-8b-latest\":[128000,128000,0],\"mistral/mistral-nemo\":[128000,128000,0],\"mistral/mistral-small-latest\":[256000,256000,1],\"mistral-small-latest\":[256000,256000,1],\"mistral/open-mistral-nemo\":[128000,128000,0],\"open-mistral-nemo\":[128000,128000,0],\"mistral/mistral-large-latest\":[262144,262144,0],\"mistral-large-latest\":[262144,262144,0],\"mistral/mistral-large-2411\":[131072,16384,0],\"mistral-large-2411\":[131072,16384,0],\"mistral/devstral-latest\":[262144,262144,0],\"devstral-latest\":[262144,262144,0],\"mistral/zai-glm-5-2\":[1000000,131072,1],\"zai-glm-5-2\":[1000000,131072,1],\"mistral/mistral-small-2603\":[256000,256000,1],\"mistral/mistral-medium-2505\":[131072,131072,0],\"mistral-medium-2505\":[131072,131072,0],\"mistral/codestral-latest\":[256000,4096,0],\"codestral-latest\":[256000,4096,0],\"mistral/ministral-3b-latest\":[128000,128000,0],\"ministral-3b-latest\":[128000,128000,0],\"mistral/mistral-medium-2508\":[262144,262144,0],\"mistral-medium-2508\":[262144,262144,0],\"mistral/pixtral-large-latest\":[128000,128000,0],\"pixtral-large-latest\":[128000,128000,0],\"togetherai/essentialai/rnj-1-instruct\":[32768,32768,0],\"essentialai/rnj-1-instruct\":[32768,32768,0],\"rnj-1-instruct\":[32768,32768,0],\"togetherai/deepseek-ai/deepseek-v3-1\":[131072,131072,1],\"deepseek-ai/deepseek-v3-1\":[131072,131072,1],\"togetherai/deepseek-ai/deepseek-v3\":[131072,131072,0],\"togetherai/deepseek-ai/deepseek-v4-flash-0731\":[1000000,384000,1],\"deepseek-ai/deepseek-v4-flash-0731\":[1000000,384000,1],\"togetherai/deepseek-ai/deepseek-v4-pro-0813\":[1048576,384000,1],\"deepseek-ai/deepseek-v4-pro-0813\":[1048576,384000,1],\"togetherai/deepseek-ai/deepseek-r1\":[163839,163839,1],\"togetherai/deepseek-ai/deepseek-v4-pro\":[512000,384000,1],\"togetherai/pearl-ai/gemma-4-31b-it\":[32000,32000,1],\"pearl-ai/gemma-4-31b-it\":[32000,32000,1],\"togetherai/nvidia/nemotron-3-ultra-550b-a55b\":[512300,512300,1],\"togetherai/google/gemma-4-31b-it\":[262144,131072,1],\"togetherai/google/gemma-3n-e4b-it\":[32768,32768,0],\"google/gemma-3n-e4b-it\":[32768,32768,0],\"gemma-3n-e4b-it\":[32768,32768,0],\"togetherai/zai-org/glm-5.1\":[202752,131072,1],\"togetherai/zai-org/glm-5.3\":[1048576,262144,1],\"zai-org/glm-5.3\":[1048576,262144,1],\"togetherai/zai-org/glm-5.2\":[512000,164000,1],\"togetherai/zai-org/glm-5\":[202752,131072,1],\"togetherai/zai-org/glm-5.3-flash\":[1048575,400000,1],\"zai-org/glm-5.3-flash\":[1048575,400000,1],\"togetherai/liquidai/lfm2-24b-a2b\":[32768,32768,0],\"liquidai/lfm2-24b-a2b\":[32768,32768,0],\"lfm2-24b-a2b\":[32768,32768,0],\"togetherai/thinkingmachines/inkling\":[524288,131072,1],\"togetherai/qwen/qwen3.7-max\":[1000000,500000,0],\"togetherai/qwen/qwen3-235b-a22b-instruct-2507-tput\":[262144,262144,0],\"qwen/qwen3-235b-a22b-instruct-2507-tput\":[262144,262144,0],\"qwen3-235b-a22b-instruct-2507-tput\":[262144,262144,0],\"togetherai/qwen/qwen3.6-plus\":[1000000,500000,1],\"togetherai/qwen/qwen3.5-9b\":[262144,65536,1],\"togetherai/qwen/qwen3.5-397b-a17b\":[262144,130000,1],\"togetherai/qwen/qwen3-coder-480b-a35b-instruct-fp8\":[262144,262144,0],\"qwen/qwen3-coder-480b-a35b-instruct-fp8\":[262144,262144,0],\"qwen3-coder-480b-a35b-instruct-fp8\":[262144,262144,0],\"togetherai/qwen/qwen2.5-7b-instruct-turbo\":[32768,32768,0],\"qwen/qwen2.5-7b-instruct-turbo\":[32768,32768,0],\"qwen2.5-7b-instruct-turbo\":[32768,32768,0],\"togetherai/qwen/qwen3-coder-next-fp8\":[262144,262144,0],\"qwen/qwen3-coder-next-fp8\":[262144,262144,0],\"qwen3-coder-next-fp8\":[262144,262144,0],\"togetherai/deepcogito/cogito-v2-1-671b\":[163840,163840,1],\"deepcogito/cogito-v2-1-671b\":[163840,163840,1],\"cogito-v2-1-671b\":[163840,163840,1],\"togetherai/minimaxai/minimax-m2.5\":[204800,131072,1],\"togetherai/minimaxai/minimax-m3\":[524288,250000,1],\"minimaxai/minimax-m3\":[524288,250000,1],\"togetherai/minimaxai/minimax-m2.7\":[202752,131072,1],\"minimaxai/minimax-m2.7\":[202752,131072,1],\"togetherai/meta-llama/llama-3.3-70b-instruct-turbo\":[131072,131072,0],\"meta-llama/llama-3.3-70b-instruct-turbo\":[131072,131072,0],\"llama-3.3-70b-instruct-turbo\":[131072,131072,0],\"togetherai/meta-llama/meta-llama-3-8b-instruct-lite\":[8192,8192,0],\"meta-llama/meta-llama-3-8b-instruct-lite\":[8192,8192,0],\"meta-llama-3-8b-instruct-lite\":[8192,8192,0],\"togetherai/openai/gpt-oss-20b\":[131072,131072,1],\"togetherai/openai/gpt-oss-120b\":[131072,131072,1],\"togetherai/moonshotai/kimi-k2.5\":[262144,262144,1],\"togetherai/moonshotai/kimi-k2.7-code\":[262144,131072,1],\"togetherai/moonshotai/kimi-k2.6\":[262144,131000,1],\"togetherai/moonshotai/kimi-k3\":[1048576,131072,1]}");
@@ -1024,6 +1059,40 @@ function inferModelCaps(modelId, cfg) {
     return decorateEffort(recToCaps(hit.rec, liveMeta.source || 'catalog'), modelId, hint);
   }
   return decorateEffort(familyFallback(modelId), modelId, hint);
+}
+
+/** 单次请求最多向厂商要这么多输出。目录把输出标成整窗（26 万、100 万）时不再照单全要。 */
+const OUTPUT_TOKEN_REQUEST_CAP = 256_000;
+/** 未收录模型的输出上限。不省略字段，避免 DeepSeek 非思考模式自己落到 8K。 */
+const OUTPUT_TOKEN_UNKNOWN_FALLBACK = 32_000;
+/** 从窗口里留出的余量，盖住估算误差和协议开销。 */
+const OUTPUT_CONTEXT_SLACK = 1024;
+const OUTPUT_TOKEN_FLOOR = 256;
+
+function requestContextWindow(cfg, caps) {
+  const working = Number(cfg?.contextTokens);
+  const workingOk = Number.isFinite(working) && working >= 16_000 && working <= 2_000_000
+    ? Math.floor(working) : null;
+  const physical = caps.source === 'fallback' ? null : Number(caps.contextWindow);
+  const physicalOk = Number.isFinite(physical) && physical >= 16_000 ? Math.floor(physical) : null;
+  if (workingOk && physicalOk) return Math.min(workingOk, physicalOk);
+  return workingOk || physicalOk || 128_000;
+}
+
+/** 对话输出上限。调用方给了正数（识图、摘要、连通测试）则原样使用。
+ * 否则取 min(模型满额或 3.2 万, 25.6 万, 窗口减去已占用)。 */
+function resolveChatMaxTokens(cfg, explicit, { usedTokens = 0 } = {}) {
+  const given = explicit != null && explicit !== '' ? Number(explicit) : Number(cfg?.maxTokens);
+  if (Number.isFinite(given) && given > 0) return Math.floor(given);
+  const caps = inferModelCaps(cfg?.model, cfg);
+  const modelOut = caps.source === 'fallback'
+    ? OUTPUT_TOKEN_UNKNOWN_FALLBACK
+    : (Number(caps.maxOutput) > 0 ? Math.floor(Number(caps.maxOutput)) : OUTPUT_TOKEN_UNKNOWN_FALLBACK);
+  let cap = Math.min(modelOut, OUTPUT_TOKEN_REQUEST_CAP);
+  const used = Math.max(0, Math.floor(Number(usedTokens) || 0));
+  const room = requestContextWindow(cfg, caps) - used - OUTPUT_CONTEXT_SLACK;
+  cap = Math.min(cap, Math.max(OUTPUT_TOKEN_FLOOR, room));
+  return Math.max(OUTPUT_TOKEN_FLOOR, cap);
 }
 
 /** 档位 id，或两档之间的连续值 `r0.42`（0=Off … 1=Max）。 */
@@ -1275,6 +1344,48 @@ function applyGeminiThinking(generationConfig, cfg) {
   generationConfig.thinkingConfig = { thinkingBudget: budget };
 }
 
+/**
+ * 粗算 token。中日韩字符约 1 token，其余约 4 字符 1 token。
+ * 独立成文件：history-compact 会调用对话接口，适配器不能再反向引用它。
+ */
+
+function estimateTokens(text) {
+  if (!text) return 0;
+  if (Array.isArray(text)) {
+    text = text.map((p) => p?.text || (p?.type === 'image_url' ? '[image]' : '')).join('\n');
+  }
+  const s = String(text);
+  let cjk = 0;
+  let other = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0x3000 && c <= 0x9fff) cjk++;
+    else if (c >= 0xac00 && c <= 0xd7af) cjk++;
+    else if (c >= 0xff00 && c <= 0xffef) cjk++;
+    else other++;
+  }
+  return cjk + Math.ceil(other / 4);
+}
+
+function estimateMessagesTokens(messages) {
+  let total = 0;
+  for (const m of messages || []) {
+    total += estimateTokens(m?.content || '');
+    if (m?.tool_calls) total += estimateTokens(JSON.stringify(m.tool_calls));
+    total += 4;
+  }
+  return total;
+}
+
+/** 当轮请求占用：消息 + 工具定义。 */
+function estimateRequestTokens(messages, tools) {
+  let n = estimateMessagesTokens(messages);
+  if (tools != null && tools !== '') {
+    n += estimateTokens(typeof tools === 'string' ? tools : JSON.stringify(tools));
+  }
+  return n;
+}
+
 /* OpenAI Chat Completions 协议适配器。
  * 覆盖 OpenAI 官方及一切 OpenAI 兼容端点：DeepSeek / 智谱 GLM / 通义 Qwen
  * (compatible-mode) / Kimi / MiniMax / 豆包 / SiliconFlow / OpenRouter /
@@ -1313,14 +1424,14 @@ function buildBody$2(cfg, messages, tools, opts = {}) {
   const body = { model: cfg.model, messages };
   if (Array.isArray(tools) && tools.length > 0) body.tools = tools;
   if (opts.stream) body.stream = true;
-  if (isReasoningModel(cfg.model)) {
-    // 上限参数沿用调用方语义：流式聊天默认 16384，非流式按 opts.maxTokens
-    const cap = opts.maxTokens ?? 16384;
-    if (cap != null) body.max_completion_tokens = cap;
-  } else {
-    body.temperature = opts.temperature ?? 0.7;
-    if (opts.maxTokens != null) body.max_tokens = opts.maxTokens;
-    else if (opts.stream) body.max_tokens = 16384;
+  if (!isReasoningModel(cfg.model)) body.temperature = opts.temperature ?? 0.7;
+  // 未显式指定时：min(目录满额, 25.6 万, 窗口减去本轮已占用)。未知模型用 3.2 万，避免厂商默认 8K。
+  const cap = resolveChatMaxTokens(cfg, opts.maxTokens, {
+    usedTokens: estimateRequestTokens(messages, tools),
+  });
+  if (cap != null) {
+    if (isReasoningModel(cfg.model)) body.max_completion_tokens = cap;
+    else body.max_tokens = cap;
   }
   if (opts.responseFormat) body.response_format = opts.responseFormat;
   applyOpenAIReasoning(body, cfg);
@@ -1357,9 +1468,11 @@ async function chatComplete$3(cfg, messages, opts = {}) {
   if (!response.ok) await raiseResponseError$2(response);
 
   const data = await response.json();
+  const choice = data.choices?.[0];
   return {
-    content: data.choices?.[0]?.message?.content?.trim() || '',
+    content: choice?.message?.content?.trim() || '',
     usage: data.usage || null,
+    finishReason: normalizeFinishReason(choice?.finish_reason),
   };
 }
 
@@ -1434,6 +1547,71 @@ const openaiChat = /*#__PURE__*/Object.freeze(/*#__PURE__*/Object.defineProperty
   resolveEndpoint: resolveEndpoint$1
 }, Symbol.toStringTag, { value: 'Module' }));
 
+/**
+ * 一轮 assistant(tool_calls) + tool 结果落账。
+ * 子代理把 apiMessages 与 historyMessages 指到同一数组；若各 push 一次，
+ * Anthropic 会看到连续两条 tool_use、中间没有 tool_result，下一轮 400。
+ */
+function commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs) {
+  const same = apiMessages === historyMessages;
+  apiMessages.push(assistantMsg);
+  if (!same) historyMessages.push(assistantMsg);
+  for (const pair of toolPairs || []) {
+    apiMessages.push(pair.api);
+    if (!same) historyMessages.push(pair.history);
+  }
+}
+
+/** 前台 browser_act 附在编号表后的视口截图。历史与落盘只留这句话，不留像素。 */
+const VIEWPORT_SHOT_PREFIX = '【视口截图】';
+const VIEWPORT_SHOT_KEEP = 3;
+const VIEWPORT_SHOT_OMITTED = `${VIEWPORT_SHOT_PREFIX}较早的视口截图已省略，以最新一张和编号表为准。`;
+
+function isViewportShotMessage(message) {
+  if (!message || message.role !== 'user' || !Array.isArray(message.content)) return false;
+  return message.content.some((part) => part
+    && part.type === 'text'
+    && String(part.text || '').startsWith(VIEWPORT_SHOT_PREFIX));
+}
+
+function viewportShotMessage(dataUrl) {
+  return {
+    role: 'user',
+    content: [
+      {
+        type: 'text',
+        text: `${VIEWPORT_SHOT_PREFIX}与上一条 browser_act 编号表是同一视口。点选用表中编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。`,
+      },
+      { type: 'image_url', image_url: { url: dataUrl } },
+    ],
+  };
+}
+
+function demoteViewportShot() {
+  return { role: 'user', content: VIEWPORT_SHOT_OMITTED };
+}
+
+/**
+ * 把本轮截图接到发给模型的消息末尾（全部 tool 结果之后）。
+ * api 与 history 不是同一数组时，像素只进 api，历史不写。
+ * 同一数组（子代理）只 push 一次。本轮里最多留 VIEWPORT_SHOT_KEEP 张，更早的改成一句省略说明。
+ */
+function appendViewportShots(apiMessages, historyMessages, dataUrls) {
+  const urls = (dataUrls || []).filter((url) => typeof url === 'string' && url.startsWith('data:image'));
+  if (!urls.length || !Array.isArray(apiMessages)) return;
+  const withImage = [];
+  for (let i = 0; i < apiMessages.length; i++) {
+    const message = apiMessages[i];
+    if (!isViewportShotMessage(message)) continue;
+    if (message.content.some((part) => part && part.type === 'image_url')) withImage.push(i);
+  }
+  const incoming = urls.slice(-VIEWPORT_SHOT_KEEP);
+  const room = Math.max(0, VIEWPORT_SHOT_KEEP - incoming.length);
+  const demoteCount = Math.max(0, withImage.length - room);
+  for (let n = 0; n < demoteCount; n++) apiMessages[withImage[n]] = demoteViewportShot();
+  for (const url of incoming) apiMessages.push(viewportShotMessage(url));
+}
+
 /* Anthropic Messages 协议适配器（Claude 原生 /v1/messages）。
  * 覆盖：Anthropic 官方，以及因 Claude Code 生态而加挂 Anthropic 兼容层的厂商
  * （DeepSeek https://api.deepseek.com/anthropic、智谱 GLM
@@ -1445,7 +1623,6 @@ const openaiChat = /*#__PURE__*/Object.freeze(/*#__PURE__*/Object.defineProperty
 
 
 const ANTHROPIC_VERSION = '2023-06-01';
-const DEFAULT_MAX_TOKENS = 8192;
 
 /** 由 Base URL 推导 /v1/messages 端点。兼容填法：
  *  - 完整端点 .../v1/messages → 原样使用
@@ -1530,7 +1707,14 @@ function convertMessages$1(messages) {
     }
     flushResults();
     if (m.role === 'user') {
-      out.push({ role: 'user', content: toAnthropicContent(m.content) });
+      const blocks = toAnthropicContent(m.content);
+      const prev = out[out.length - 1];
+      const list = Array.isArray(blocks) ? blocks : [{ type: 'text', text: String(blocks || '') }];
+      if (isViewportShotMessage(m) && prev?.role === 'user' && Array.isArray(prev.content)) {
+        prev.content.push(...list);
+      } else {
+        out.push({ role: 'user', content: blocks });
+      }
     } else if (m.role === 'assistant') {
       const blocks = [];
       const text = contentToText(m.content);
@@ -1567,7 +1751,9 @@ function buildBody$1(cfg, messages, tools, opts) {
   const { system, messages: converted } = convertMessages$1(messages);
   const body = {
     model: cfg.model,
-    max_tokens: cfg.maxTokens || DEFAULT_MAX_TOKENS,
+    max_tokens: resolveChatMaxTokens(cfg, opts?.maxTokens, {
+      usedTokens: estimateRequestTokens(messages, tools),
+    }),
     messages: converted,
   };
   if (system) body.system = system;
@@ -1618,6 +1804,7 @@ async function chatComplete$2(cfg, messages, opts = {}) {
     content: text.trim(),
     toolCalls,
     usage: normalizeUsage$1(data.usage?.input_tokens, data.usage?.output_tokens),
+    finishReason: normalizeFinishReason(data.stop_reason),
   };
 }
 
@@ -1798,7 +1985,12 @@ function convertMessages(messages) {
     flush();
     if (m.role === 'user') {
       const parts = toParts(m.content);
-      if (parts.length > 0) contents.push({ role: 'user', parts });
+      const prev = contents[contents.length - 1];
+      if (isViewportShotMessage(m) && prev?.role === 'user' && parts.length) {
+        prev.parts.push(...parts);
+      } else if (parts.length > 0) {
+        contents.push({ role: 'user', parts });
+      }
     } else if (m.role === 'assistant') {
       const parts = toParts(m.content);
       for (const tc of m.tool_calls || []) {
@@ -1830,7 +2022,10 @@ function buildBody(cfg, messages, tools, opts = {}) {
   const { systemInstruction, contents } = convertMessages(messages);
   const generationConfig = {};
   if (opts.temperature != null) generationConfig.temperature = opts.temperature;
-  if (opts.maxTokens != null) generationConfig.maxOutputTokens = opts.maxTokens;
+  const cap = resolveChatMaxTokens(cfg, opts.maxTokens, {
+    usedTokens: estimateRequestTokens(messages, tools),
+  });
+  if (cap != null) generationConfig.maxOutputTokens = cap;
   applyGeminiThinking(generationConfig, cfg);
 
   const body = { contents };
@@ -1890,6 +2085,7 @@ async function chatComplete$1(cfg, messages, opts = {}) {
     content: content.trim(),
     toolCalls: finalizeToolCalls(tcList),
     usage: normalizeUsage(data.usageMetadata),
+    finishReason: normalizeFinishReason(data.candidates?.[0]?.finishReason),
   };
 }
 
@@ -1949,7 +2145,7 @@ const geminiNative = /*#__PURE__*/Object.freeze(/*#__PURE__*/Object.defineProper
  * 规范消息格式（内部统一形状，适配器负责与各家线缆格式互转）：
  *   { role: 'system'|'user'|'assistant'|'tool',
  *     content: string
- *            | [ {type:'text', text} | {type:'image_url', image_url:{url}} ],  // 图片仅 vision 路径用
+ *            | [ {type:'text', text} | {type:'image_url', image_url:{url}} ],  // 用户附件、前台视口截图、vision 旁路
  *     tool_calls?: [ {id, type:'function', function:{name, arguments:JSON字符串}} ],
  *     tool_call_id?: string }
  *
@@ -5835,80 +6031,16 @@ function htmlToText(html, opts = {}) {
   return s;
 }
 
-/* 模型能力注册表（静态模式表 + 运行时探测缓存）。
- *
- * 设计参考 opencode 的 models.dev：视觉/工具等不是"另一种模型角色"，
- * 而是模型记录上的输入模态标志（modalities.input 含 image）。这里只内置
- * 常见家族的模式表（数据对齐 models.dev 的 modality 字段），不追求全量：
- *  - 未命中的模型按不支持处理（乐观提示：已知家族可立刻当视觉用；未知家族先走外挂）
- *  - 真实能力以 vision-client 的探测缓存为准：后台红块探测看见红色写 ok；
- *    只有接口 400/422 拒图才写 no。含糊回答和小图「看不到」都不写缓存。
- */
-
-const VISION_TRUE = [
-  /^gpt-4o/, /^chatgpt-4o/, /^gpt-4\.1/, /^gpt-4-turbo/, /^gpt-4-vision/,
-  /^gpt-5/,
-  /^o[134](-|$)/, // o1 / o3 / o4-mini 接受图像输入
-  /^claude-3/, /^claude-4/, /^claude-\d+/, /^claude-(sonnet|opus|haiku)/,
-  /^gemini-/, /^gemma-3/,
-  /glm-\d+(\.\d+)?v/i, // glm-4v-flash / glm-4.5v …
-  /qwen.*vl/i, /^qvq/i, // qwen-vl / qwen2.5-vl / QVQ
-  /doubao.*vision|vision.*doubao/i,
-  /grok-[234]-vision|^grok-[34]$/i,
-  /pixtral|mistral-(small|large|medium).*(2411|latest)|mistral-ocr/i,
-  /llama-?3\.2-vision|llama-?4/i,
-  /^step-1v|^step-1o/i,
-  /yi-vision/i,
-  /internvl|minicpm-v|deepseek-vl/i,
-  /kimi-vl|moonshot.*vision/i,
-  /ernie.*vl|ernie.*vision/i,
-];
-
-/** 静态表判定。返回 true/false；未知模型返回 false（保守，不自动当视觉模型用）。 */
-function modelSupportsVision(modelId) {
-  const m = String(modelId || '').toLowerCase();
-  if (!m) return false;
-  return VISION_TRUE.some((re) => re.test(m));
-}
-
 /* Vision-LLM client (pure, no DOM). Usable from both the Service Worker
    (background tabs) and the side panel. All traffic goes through the unified
    providers entry (chatComplete), so any protocol works — including Gemini
    native image input without an OpenAI shim.
-   模型选择（resolveVisionModel）按优先级：
-     1. 当前渠道主模型 —— 反应式探测缓存 + 内置能力注册表
-        （主模型能看图就用它，不再绕外挂）
-     2. 显式配置的 visionConfig（主模型不能看图时的兜底）
-   探测缓存是事实来源：注册表只覆盖常见家族，未收录模型靠一次真实调用定论。 */
+   视觉请求一律走当前渠道的主模型，不再外挂单独的 Vision 配置。 */
 
 
 async function getCurrentProjectId() {
   const { currentProject } = await chrome.storage.sync.get('currentProject');
   return currentProject || 'default';
-}
-
-/* ---- 反应式探测缓存（chrome.storage.local.visionProbeCache）---- */
-
-const PROBE_CACHE_VER = 2;
-
-async function readProbeCache() {
-  try {
-    const got = await chrome.storage.local.get(['visionProbeCache', 'visionProbeCacheVer']);
-    if (got.visionProbeCacheVer !== PROBE_CACHE_VER) return {};
-    return got.visionProbeCache || {};
-  } catch (_) {
-    return {};
-  }
-}
-
-/** 带图请求的真实结局写回缓存：ok='ok'；接口明确拒图='no'。key 用小写模型名。 */
-async function recordVisionProbe(model, verdict) {
-  if (!model || (verdict !== 'ok' && verdict !== 'no')) return;
-  try {
-    const cache = await readProbeCache();
-    cache[String(model).toLowerCase()] = verdict;
-    await chrome.storage.local.set({ visionProbeCache: cache, visionProbeCacheVer: PROBE_CACHE_VER });
-  } catch (_) { /* 缓存失败不影响主流程 */ }
 }
 
 /** 判定错误是否为"该模型不接受图片输入"类拒绝（400/422 + 报文关键词） */
@@ -5919,34 +6051,15 @@ function isImageUnsupportedError(err) {
 }
 
 /**
- * 解析当前应使用的视觉模型。
- * 返回 { baseUrl, apiKey, model, protocol, maxTokens?, source } 或全空对象（不可用）。
- * source: 'main'（当前渠道主模型支持视觉）| 'explicit'（设置页外挂兜底）
+ * 当前视觉调用使用的模型：始终是当前渠道主模型。
+ * 返回 { baseUrl, apiKey, model, protocol, source:'main' }，未配置时 apiKey 为空。
  */
 async function resolveVisionModel() {
-  const main = await tryMainVision();
-  if (main) return main;
-
-  const { visionConfig } = await chrome.storage.local.get('visionConfig');
-  if (visionConfig && visionConfig.apiKey) {
-    return { ...visionConfig, protocol: visionConfig.protocol || 'openai', source: 'explicit' };
-  }
-  return { baseUrl: '', apiKey: '', model: '', source: '' };
-}
-
-/** 当前渠道主模型若能看图则返回其配置，否则 null */
-async function tryMainVision() {
   const projCfg = await getProjectConfig(await getCurrentProjectId());
   const model = projCfg.model || '';
   const apiKey = projCfg.apiKey || '';
   const baseUrl = projCfg.baseUrl || '';
-  if (!model || !apiKey) return null;
-
-  const cache = await readProbeCache();
-  const probed = cache[String(model).toLowerCase()];
-  const supports = probed === 'ok' ? true : (probed === 'no' ? false : modelSupportsVision(model));
-  if (!supports) return null;
-
+  if (!model || !apiKey) return { baseUrl: '', apiKey: '', model: '', source: '' };
   return {
     baseUrl,
     apiKey,
@@ -5961,29 +6074,27 @@ async function getVisionConfig() {
   return resolveVisionModel();
 }
 
-/* Send an image + text prompt to the Vision LLM. Returns { ok, content } or
-   { ok:false, error }. No image scaling (caller scales if needed; SW has no
+/* Send an image + text prompt to the current channel model. Returns { ok, content }
+   or { ok:false, error }. No image scaling (caller scales if needed; SW has no
    canvas). 图片以规范内容块传入，协议转换交给各适配器（anthropic→base64 source、
-   gemini→inline_data）。maxTokens is capped by config.maxTokens (default 1024,
-   safe for GLM-4V-Flash). On a 400 mentioning max_tokens, auto-retries with
+   gemini→inline_data）。On a 400 mentioning max_tokens, auto-retries with
    halved value so any model works without manual tuning. */
 async function visionChat(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 30000 } = {}) {
   let cfg;
   try {
     cfg = await resolveVisionModel();
   } catch (err) {
-    return { ok: false, error: `读取 Vision 配置失败: ${err.message}` };
+    return { ok: false, error: `读取渠道配置失败: ${err.message}` };
   }
   if (!cfg.apiKey) {
-    return { ok: false, error: '当前渠道主模型不支持视觉，且未配置外挂 Vision。请换用带视觉的模型，或在设置页「视觉模型」里填一个兜底模型。' };
+    return { ok: false, error: '当前渠道未配置 API Key，无法做视觉识别。请先在设置里配置接入渠道。' };
   }
-  const cfgCap = Number(cfg.maxTokens) > 0 ? Number(cfg.maxTokens) : (cfg.source === 'main' ? maxTokens : 1024);
-  let effective = Math.max(128, Math.min(maxTokens, cfgCap));
+  let effective = Math.max(128, Math.min(maxTokens, Number(cfg.maxTokens) > 0 ? Number(cfg.maxTokens) : maxTokens));
   while (effective >= 128) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const { content } = await chatComplete(cfg, [{ role: 'user', content: [
+      const result = await chatComplete(cfg, [{ role: 'user', content: [
         { type: 'text', text: prompt },
         { type: 'image_url', image_url: { url: imageDataUrl } },
       ] }], {
@@ -5992,8 +6103,7 @@ async function visionChat(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      await recordVisionProbe(cfg.model, 'ok');
-      return { ok: true, content };
+      return { ok: true, content: result.content, finishReason: result.finishReason || 'stop' };
     } catch (err) {
       clearTimeout(timeout);
       if (err.name === 'AbortError') {
@@ -6006,24 +6116,58 @@ async function visionChat(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 
         effective = Math.floor(effective / 2);
         continue;
       }
-      // 真实被拒：该模型不吃图，持久标记，resolveVisionModel 下次不再选它
       if (isImageUnsupportedError(err)) {
-        await recordVisionProbe(cfg.model, 'no');
-        if (cfg.source === 'main') {
-          const again = await resolveVisionModel();
-          if (again.apiKey && again.source === 'explicit') {
-            return visionChat(imageDataUrl, prompt, { maxTokens, timeoutMs });
-          }
-        }
-        return { ok: false, error: `${cfg.model} 不支持图片输入（已记录）。请换用支持视觉的渠道，或在设置页配置外挂 Vision 兜底。` };
+        return { ok: false, error: `${cfg.model} 不支持图片输入。请换一个支持视觉的模型。` };
       }
       return { ok: false, error: `Vision API 调用失败${err.status ? ` (${err.status})` : ''}: ${String(err.message || err).slice(0, 200)}` };
     }
   }
-  return { ok: false, error: 'Vision API 反复返回 max_tokens 非法错误，请到设置页调小 max_tokens 上限。' };
+  return { ok: false, error: 'Vision API 反复返回 max_tokens 非法错误，请换一个输出上限更高的模型。' };
 }
 
 const OCR_PROMPT = '提取这张网页截图中的所有可见文字内容。按从上到下、从左到右的阅读顺序输出纯文本，保持原文的段落分隔。只输出文字本身，不要添加任何解释、标注、页码或格式说明。表格用 | 分隔列。如果截图中没有文字，只返回一个空行。';
+
+/** 单屏 OCR 输出上限。一屏密文可能超过旧的 4000，仍被截断时由 visionOcrScreen 续提。 */
+const OCR_MAX_TOKENS = 16000;
+const OCR_CONTINUE_MAX = 4;
+
+function outputWasCut(content, finishReason, maxTokens) {
+  if (finishReason === 'length') return true;
+  return estimateTokens(content) >= Math.floor(maxTokens * 0.9);
+}
+
+function appendOcrPiece(text, piece) {
+  const next = String(piece || '').trim();
+  if (!next) return text;
+  if (!text) return next;
+  const tail = text.slice(-160);
+  if (tail && next.startsWith(tail)) return text + next.slice(tail.length);
+  return `${text}\n${next}`;
+}
+
+/** 提取一屏截图的文字。输出被上限截断时，带着已写出的结尾再要后续，不把后半屏丢掉。 */
+async function visionOcrScreen(imageDataUrl, { timeoutMs = 45000 } = {}) {
+  let text = '';
+  let prompt = OCR_PROMPT;
+  let truncated = false;
+  for (let i = 0; i < OCR_CONTINUE_MAX; i++) {
+    const vr = await visionChat(imageDataUrl, prompt, { maxTokens: OCR_MAX_TOKENS, timeoutMs });
+    if (!vr.ok) {
+      if (text) return { ok: true, content: text, truncated: true, error: vr.error };
+      return vr;
+    }
+    text = appendOcrPiece(text, vr.content);
+    truncated = outputWasCut(vr.content || '', vr.finishReason, OCR_MAX_TOKENS);
+    if (!truncated) return { ok: true, content: text, truncated: false };
+    const tail = text.slice(-200);
+    prompt = `这张截图的可见文字还没提取完。从下面这段结尾之后继续，按阅读顺序只输出尚未写出的文字，不要重复结尾：\n${tail}`;
+  }
+  return {
+    ok: true,
+    content: text ? `${text}\n［此屏后部未取完］` : text,
+    truncated: true,
+  };
+}
 
 /**
  * CDP 附着 / 前台唤醒 / 超时封装。
@@ -6218,7 +6362,7 @@ async function visionOcrViaCdp(tabId, maxChunks = 20) {
       await new Promise((r) => setTimeout(r, 600));
       const shot = await debuggerSend(tabId, 'Page.captureScreenshot', { format: 'jpeg', quality: 80 });
       if (!shot?.data) continue;
-      const vr = await visionChat('data:image/jpeg;base64,' + shot.data, OCR_PROMPT, { maxTokens: 4000, timeoutMs: 45000 });
+      const vr = await visionOcrScreen('data:image/jpeg;base64,' + shot.data, { timeoutMs: 45000 });
       if (vr.ok && vr.content.trim()) chunks.push(vr.content.trim());
     }
     await debuggerSend(tabId, 'Runtime.evaluate', { expression: `${PAGE_WIN$1}.scrollTo(0,${m.sy || 0})` }).catch(() => {});
@@ -6491,7 +6635,7 @@ async function fetchViaTab(url, options = {}) {
           } catch (_) { /* network capture failed -> fall through to vision */ }
 
           // 3) Vision OCR tier: last resort for font obfuscation / canvas /
-          //    image-rendered text. Only when a Vision model is configured.
+          //    image-rendered text. Uses the current channel model.
           if (scrollResp?.garbled) {
             try {
               const vcfg = await getVisionConfig();
@@ -16503,7 +16647,13 @@ class TabSession {
         if (!text) return;
         if (this._netBuffer.some((c) => c.url === meta.url && c.body === text.slice(0, 200))) return;
         if (this._netBuffer.length >= (this._netMax || NET_MAX_ITEMS)) this._netBuffer.shift();
-        this._netBuffer.push({ url: meta.url, mimeType: meta.mimeType, body: text.slice(0, this._netBodyLimit || NET_BODY_LIMIT) });
+        // 采集护栏（SW 内存保护）仍保留，但必须留下「被砍过」的标记，出口据此如实告知模型。
+        const bodyLimit = this._netBodyLimit || NET_BODY_LIMIT;
+        if (text.length > bodyLimit) {
+          this._netBuffer.push({ url: meta.url, mimeType: meta.mimeType, body: text.slice(0, bodyLimit), bodyTruncated: true, bodyChars: text.length });
+        } else {
+          this._netBuffer.push({ url: meta.url, mimeType: meta.mimeType, body: text });
+        }
       } catch (_) {}
     };
     this._offNetResp = this.on('Network.responseReceived', onResponse);
@@ -17016,10 +17166,16 @@ async function readSection(docId, sel = {}) {
     if (!Array.isArray(offs) || !offs.length) return { error: `doc ${docId} 没有页偏移（非 PDF 或未记录）。改用 offset 或 chunk。` };
     const hit = offs.find((o) => Number(o.page) === p);
     if (!hit) return { error: `页码 ${p} 超范围（1-${offs.length}）。` };
-    const text = full.slice(hit.start, hit.end).slice(0, maxChars);
+    const pageText = full.slice(hit.start, hit.end);
+    const text = pageText.slice(0, maxChars);
+    const next = hit.start + text.length;
+    const hasMore = next < hit.end;
     return {
       doc_id: doc.docId, title: doc.title, url: doc.url, anchor: `${doc.docId}#p${p}`,
-      text, chars: text.length, page: p, pages: doc.pages || offs.length, provenance,
+      text, chars: text.length, page: p, pages: doc.pages || offs.length,
+      offset: hit.start, total: full.length,
+      has_more: hasMore, next_offset: hasMore ? next : null,
+      provenance,
     };
   }
 
@@ -17931,10 +18087,20 @@ async function writeAll(tasks) {
   await ensureHeartbeatAlarm(tasks);
 }
 
+/** 缺省 / 旧数据一律归 default，避免切项目时漏网或串库。 */
+function heartbeatProjectId(task) {
+  return String((task && task.projectId) || 'default');
+}
+
+function taskBelongsToProject(task, projectId) {
+  if (!projectId) return true;
+  return heartbeatProjectId(task) === String(projectId);
+}
+
 async function listHeartbeatTasks(projectId) {
   const all = await readAll();
   if (!projectId) return all;
-  return all.filter((t) => t.projectId === projectId);
+  return all.filter((t) => taskBelongsToProject(t, projectId));
 }
 
 async function getHeartbeatTask(id) {
@@ -17947,7 +18113,8 @@ async function upsertHeartbeatTask(fields, { projectId, createdBy = 'user' } = {
   if (fields.id) {
     const idx = all.findIndex((t) => t.id === fields.id);
     if (idx < 0) throw new Error('找不到该心跳任务');
-    const next = { ...all[idx], ...fields, updatedAt: now };
+    const { projectId: _ignorePid, ...patch } = fields;
+    const next = { ...all[idx], ...patch, updatedAt: now, projectId: heartbeatProjectId(all[idx]) };
     for (const k of SCHEDULE_FIELD_KEYS) delete next[k]; // 原始字段不落库，只留 schedule
     if (applyCadence(next, fields) && next.enabled !== false) {
       next.nextRunAt = null; // 改了周期就重排，不继承旧时刻
@@ -17958,12 +18125,14 @@ async function upsertHeartbeatTask(fields, { projectId, createdBy = 'user' } = {
     await writeAll(all);
     return next;
   }
-  if (all.length >= HEARTBEAT_MAX_TASKS) {
-    throw new Error(`心跳任务最多 ${HEARTBEAT_MAX_TASKS} 条，请先删掉不用的`);
+  const pid = String(projectId || 'default');
+  const mine = all.filter((t) => taskBelongsToProject(t, pid));
+  if (mine.length >= HEARTBEAT_MAX_TASKS) {
+    throw new Error(`该项目心跳任务最多 ${HEARTBEAT_MAX_TASKS} 条，请先删掉不用的`);
   }
   const task = {
     id: 'hb_' + now.toString(36) + Math.random().toString(36).slice(2, 6),
-    projectId: projectId || 'default',
+    projectId: pid,
     name: String(fields.name || '').trim() || '未命名任务',
     prompt: String(fields.prompt || '').trim(),
     enabled: fields.enabled !== false,
@@ -18572,39 +18741,6 @@ async function executeSearchChannel(channel, query, { apiConfig, timeoutMs = 150
 
 
 /**
- * Rough token estimator. Chinese CJK chars ≈ 1 token; ASCII ≈ 4 chars/token.
- * Matches 智谱 GLM's stated ~1:1.6 ratio well enough for budgeting.
- */
-function estimateTokens(text) {
-  if (!text) return 0;
-  if (Array.isArray(text)) {
-    text = text.map((p) => p?.text || (p?.type === 'image_url' ? '[image]' : '')).join('\n');
-  }
-  const s = String(text);
-  let cjk = 0;
-  let other = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0x3000 && c <= 0x9fff) cjk++;
-    else if (c >= 0xac00 && c <= 0xd7af) cjk++;
-    else if (c >= 0xff00 && c <= 0xffef) cjk++;
-    else other++;
-  }
-  return cjk + Math.ceil(other / 4);
-}
-
-function estimateMessagesTokens(messages) {
-  let total = 0;
-  for (const m of messages) {
-    total += estimateTokens(m?.content || '');
-    // 工具调用参数（tool_calls JSON）也随请求重发，计入估算
-    if (m?.tool_calls) total += estimateTokens(JSON.stringify(m.tool_calls));
-    total += 4; // per-message overhead (role + delimiters)
-  }
-  return total;
-}
-
-/**
  * Pick a cut index so that:
  *  - The tail (kept) contains at most `keepTailTokens` tokens.
  *  - The tail starts on a `user` message (so the API sees a normal turn).
@@ -19005,7 +19141,9 @@ const CHAT_TOOLS = [
       description:
         '页面自动化紧循环：观察当前视口控件表并执行一步。每次调用结束后自动返回新表，不必再 number_elements。\n' +
         'op=observe 只观察。click/type/select 必须使用上一次表里的编号（select 用 3:2 这种「元素:选项」）。\n' +
-        '不要发明 CSS、坐标或 JS。点不动/表为空/反爬时再改用 interact_page（cdp_click / vision_find / exec_js_main / capture_network）。\n' +
+        '目标标签已在前台时，编号表后会附上同一视口截图（只在本轮请求里，不写入历史）。后台标签只有表，不要为了截图去 switch。\n' +
+        '点选优先用编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。\n' +
+        '不要发明 CSS 或 JS。点不动/表为空/反爬时再改用 interact_page（cdp_click / vision_find / exec_js_main / capture_network）。\n' +
         '能后台操作就传 tab_id，不要 switch 用户正在看的标签。',
       parameters: {
         type: 'object',
@@ -19862,9 +20000,10 @@ const CHAT_TOOLS = [
         '**无需打开阅读器、无需点「编辑」**；用户正在看的阅读器会自动刷新。' +
         '阅读器是 chrome-extension 内页，禁止 interact_page、禁止让用户去点编辑按钮。' +
         '目标用 doc_id（库内条目 id）；缺省=当前阅读器打开的那份。' +
-        '**docx 文本修改默认以 Word 原生修订痕迹呈现**（track_changes=true：删除线+插入标记+批注，' +
-        'Word/WPS 打开可逐条接受/拒绝，保存也保留痕迹；note 参数写批注理由）。用户明确要求"直接改/不用留痕"时传 track_changes=false。' +
-        '格式类操作（set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改。' +
+        '**docx 修改默认直接写入文档**，对话里会挂一张修改卡（已写入）。' +
+        '只有用户明确要求留痕、修订、给别人审时，replace_text / insert_text 才传 track_changes=true' +
+        '（Word 原生删除线+插入标记+批注；note 写修改理由）。' +
+        '格式类操作（set_format/set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改。' +
         'xlsx 公式以文本写入（如 "=SUM(A1:A3)"），Excel/WPS 打开后计算；无头路径不求值。' +
         '定位用 find 精确匹配，找不到如实报错，绝不模糊替换。**find 以含插入痕迹的当前可见文本为准**；' +
         '目标文本若处于待审修订（插入/删除痕迹）内，引擎会返回明确错误（不产生嵌套痕迹），先 list_revisions + accept/reject 处理该修订再编辑。' +
@@ -19877,8 +20016,9 @@ const CHAT_TOOLS = [
         '上传的 .xls 入库时已转成 xlsx，按 xlsx 编辑。' +
         'txt —— replace_text(find, replace)：替换第一处原文；insert_text(text)：文末插入。无修订痕迹。' +
         'doc —— 用 docx 的 replace_text/insert_text 等；引擎会先把 .doc 转成 docx（同一条目，正文保留）再改。' +
-        'docx —— replace_text(find, replace, note?)：把第一处匹配文本改为 replace（默认修订痕迹）；insert_text(text, note?)：文档末尾插入段落（默认修订痕迹）；' +
-        'set_bold(find)/set_heading(find, level)/add_list(find, ordered?)：定位文本并套格式（直接修改）；' +
+        'docx —— replace_text(find, replace, note?)：把第一处匹配文本改为 replace（默认直接写入）；insert_text(text, note?)：文档末尾插入段落（默认直接写入）；' +
+        'set_format(find, font?, size?, bold?, italic?, underline?, strike?, color?, highlight?, align?, line_spacing?, space_before?, space_after?, indent?)：给找到的文字和所在段落设格式（直接写入，未传的项保持原样）；' +
+        'set_bold(find)/set_heading(find, level)/add_list(find, ordered?)：定位文本并套格式（直接修改，set_format 的特例）；' +
         'add_table(rows, cols, header?)：末尾插入表格；set_cell(row, col, value)：写表格单元格（0 起）。' +
         '通用 —— undo/redo：撤销/重做；export：保存并触发下载。' +
         'sheet 缺省时用当前活动工作表。',
@@ -19887,12 +20027,12 @@ const CHAT_TOOLS = [
         properties: {
           tool: {
             type: 'string',
-            enum: ['set_range', 'set_bold', 'append_row', 'append_col', 'clear_range', 'switch_sheet', 'replace_text', 'insert_text', 'set_heading', 'add_list', 'add_table', 'set_cell', 'undo', 'redo', 'export'],
+            enum: ['set_range', 'set_bold', 'append_row', 'append_col', 'clear_range', 'switch_sheet', 'replace_text', 'insert_text', 'set_format', 'set_heading', 'add_list', 'add_table', 'set_cell', 'undo', 'redo', 'export'],
             description: '要执行的编辑操作。',
           },
           doc_id: { type: 'string', description: '目标文档 id（库内条目 id）。缺省=当前阅读器打开的文档。docx / xlsx / txt 无需阅读器、无需点「编辑」即可直接改。.doc 编辑时会转成 docx。' },
-          track_changes: { type: 'boolean', description: 'docx 文本修改是否带 Word 原生修订痕迹（默认 true）。用户要求"直接改/不用留痕/直接替换"时传 false。' },
-          note: { type: 'string', description: '（docx 修订模式）批注理由：为什么这么改，让用户不看原文也能决定接受与否。' },
+          track_changes: { type: 'boolean', description: 'docx 的 replace_text/insert_text 是否写成 Word 修订痕迹。默认 false（直接写入）。用户要求留痕、修订、给别人审时才传 true。' },
+          note: { type: 'string', description: 'track_changes=true 时的批注理由：为什么这么改。直接写入时不必传。' },
           sheet: { type: 'string', description: '（xlsx）工作表名，缺省用当前活动工作表。' },
           range: { type: 'string', description: '（xlsx）单元格区域，如 "A1"、"B2:C5"。' },
           values: { type: 'array', items: { type: 'array' }, description: '（xlsx set_range）二维数组，外层行、内层列。' },
@@ -19900,6 +20040,18 @@ const CHAT_TOOLS = [
           find: { type: 'string', description: '（docx）要定位的文本。' },
           replace: { type: 'string', description: '（docx replace_text）替换成的文本。' },
           text: { type: 'string', description: '（docx insert_text）要插入的文本，支持多行。' },
+          font: { type: 'string', description: '（docx set_format）字体名，如「微软雅黑」「Times New Roman」。中英文都用这一族。' },
+          size: { type: 'number', description: '（docx set_format）字号，单位磅，1–72。' },
+          italic: { type: 'boolean', description: '（docx set_format）true 斜体 / false 取消。' },
+          underline: { type: 'boolean', description: '（docx set_format）true 下划线 / false 取消。' },
+          strike: { type: 'boolean', description: '（docx set_format）true 删除线 / false 取消。' },
+          color: { type: 'string', description: '（docx set_format）文字颜色，#RRGGBB。' },
+          highlight: { type: 'string', description: '（docx set_format）高亮。Word 色名 yellow/green/cyan/blue/red/magenta 或 #RRGGBB 底色。' },
+          align: { type: 'string', enum: ['left', 'center', 'right', 'justify'], description: '（docx set_format）所在段落的对齐。' },
+          line_spacing: { type: 'number', description: '（docx set_format）行距倍数，如 1、1.15、1.5、2。' },
+          space_before: { type: 'number', description: '（docx set_format）段前间距，磅。' },
+          space_after: { type: 'number', description: '（docx set_format）段后间距，磅。' },
+          indent: { type: 'number', description: '（docx set_format）左缩进，磅。' },
           level: { type: 'number', description: '（docx set_heading）标题级别 1-6，默认 2。' },
           ordered: { type: 'boolean', description: '（docx add_list）true 有序列表 / false 无序。' },
           rows: { type: 'number', description: '（docx add_table）行数。' },
@@ -19919,7 +20071,7 @@ const CHAT_TOOLS = [
       name: 'doc_review',
       description:
         '审阅修订管理（docx）：列出 / 接受 / 拒绝文档里的 AI 修订（Word 原生痕迹）。' +
-        '**提出修订不再用本工具**：改文本用 doc_edit（track_changes 默认 true 即产生修订痕迹）。' +
+        '**提出修订不再用本工具**：普通修改用 doc_edit（默认直接写入）。用户要求留痕时，doc_edit 的 replace_text/insert_text 传 track_changes=true。' +
         'SW 引擎执行，**无需阅读器、无需点「编辑」**。传 doc_id（库内条目 id）。' +
         '动作：list_revisions 查看全部修订及编号；accept(id | "all") / reject(id | "all") 接受/拒绝修订。' +
         '纪律：接受/拒绝只在用户明确指示时调用；保存文件保留修订痕迹，Word 中仍可逐条审阅。' +
@@ -19950,7 +20102,7 @@ const CHAT_TOOLS = [
         '① 每天定点 time="09:00"；② 每周定点 time + weekdays=[1,3,5]；③ 一次性 at="2026-09-15T09:00"（跑完自动停用）；' +
         '④ 固定间隔 every="30m"/"3h"/"1d"（最短 5 分钟）；⑤ 以上都表达不了时才用 cron="0 9 * * 1-5"（分 时 日 月 周）。' +
         'list 查看（返回 schedule 原文）；update 可改 name/prompt 与时间字段；pause/resume/delete 要 id。' +
-        '每个扩展最多 20 条，任务按当前项目隔离。侧栏关闭时任务会排队，打开侧栏后执行。',
+        '每个项目最多 20 条，任务跟当前项目走（list/改删只碰本项目；删项目时一并清掉）。侧栏关闭时任务会排队，打开侧栏后执行。',
       parameters: {
         type: 'object',
         properties: {
@@ -20002,7 +20154,7 @@ const CHAT_TOOLS = [
         '不要用：一次 search_web 摘要就能答；只读用户当前页；改一个已勾选条目。\n' +
         '必须用：两路及以上独立检索/读多源全文；会刷爆主对话的调研；页面自动化支线。用户不必 @。\n' +
         '同一条消息可并行多个 task（最多 {{SUBAGENT_MAX_PARALLEL}}）；覆盖不全可再补一波，只补缺口不要重做。也可同时 read_current_page。派出去后不要自己再做同一件事。\n' +
-        '新任务 prompt 必须详细：目标、约束、要交回的字段。task_id 续传同一子会话。Check 发现内容错误时可用 revision=true 退回一次；第二次失败由你裁决。\n' +
+        '阅读任务的 prompt 写明要覆盖的要点。explore 交回 covered 与 unresolved，不交判断。缺口还会改变做法时只补派缺口。覆盖够了调用 write_document。task_id 续传同一子会话。\n' +
         'background=true 仅侧栏（立刻返回，完成后回注）；浮动窗会忽略并前台等待。不要轮询后台任务。',
       parameters: {
         type: 'object',
@@ -20013,7 +20165,7 @@ const CHAT_TOOLS = [
           },
           prompt: {
             type: 'string',
-            description: '给子代理的完整任务书。新任务必填；续传时可补充指令。必须写清要交回的信息格式。',
+            description: '给子代理的完整任务书。阅读任务写明体裁和要覆盖的要点，要求交回原文段落。不要只写「查一下 X」。',
           },
           subagent_type: {
             type: 'string',
@@ -20033,6 +20185,81 @@ const CHAT_TOOLS = [
           },
         },
         required: ['subagent_type'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_document',
+      description:
+        '按用户要的体裁，用本会话 explore 交回的原文段落写成文档并保存到「产出」。'
+        + '运行时在干净上下文里写一稿，再对照原文改一稿。数字和专名只能来自段落。'
+        + '返回 need_reading 时文档未保存，只为列出的要点再派 explore，然后再次调用。'
+        + '成功后只告诉用户已保存。不要用：用户已经给了全文的表格或文案（用 create_document）；还没有 passages 时先派阅读。',
+      parameters: {
+        type: 'object',
+        properties: {
+          genre: { type: 'string', description: '体裁，如策划方案、纪要、研报、对比、档案。决定章节，不套固定研报结构。' },
+          audience: { type: 'string', description: '读者是谁。' },
+          brief: { type: 'string', description: '这份文档要写什么、怎样算好、范围口径。写作阶段看不到对话，这里要写全。' },
+          must_cover: { type: 'array', items: { type: 'string' }, description: '必须覆盖的要点。' },
+          title: { type: 'string', description: '文档标题。留空从正文取。' },
+          task_ids: { type: 'array', items: { type: 'string' }, description: '只用这些子任务的段落。会话里有无关旧任务时必须传。' },
+          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md。用户要 Word 时 docx。' },
+          tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
+        },
+        required: ['genre', 'brief'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'compose_report',
+      description:
+        '与 write_document 相同，保留给旧调用。新任务请调用 write_document。',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '报告标题。留空由骨架生成。' },
+          question: {
+            type: 'string',
+            description: '报告要回答的核心问题，用用户的话并带上范围确认后的口径（对象、时间窗、地域）。',
+          },
+          brief: {
+            type: 'string',
+            description: '调研简报：用户关心的角度、用途、排除项、范围确认卡的答案。写作阶段看不到对话，这里要写全。',
+          },
+          audience: { type: 'string', description: '读者是谁（如“投研团队”“产品负责人”），决定措辞深浅。' },
+          hypotheses: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '派任务前提出的待检验假设；报告会逐条给出支持 / 削弱 / 无法判断。',
+          },
+          analyst_notes: {
+            type: 'string',
+            description: '你自己读页或对话中得到、但没进核验的观察。只作背景，不会被当成事实写进正文。',
+          },
+          task_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '只用这些子任务的证据。本会话里有不相关的旧任务时必须传；缺省用本会话全部子任务。',
+          },
+          notebook_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '额外纳入的笔记本条目 id（verified 的当事实用，open 的只进不确定性）。',
+          },
+          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md；用户要 Word 时 docx。' },
+          length: {
+            type: 'string',
+            enum: ['brief', 'standard', 'deep'],
+            description: 'brief≈1200–2000 字；standard≈2500–5000 字（默认）；deep≈5000–9000 字（用户要深度/完整报告时）。',
+          },
+          tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
+        },
+        required: ['question'],
       },
     },
   },
@@ -20113,6 +20340,8 @@ const TOOL_LABELS = {
   record_insight: 'Recording insight',
   plan: 'Planning',
   task: 'Delegating',
+  write_document: 'Writing document',
+  compose_report: 'Writing document',
 };
 
 /* ============ 工具参数校验（不合法不执行，错误回喂模型自纠重试） ============
@@ -20816,12 +21045,6 @@ function parseMaybeJson(text) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-function clipText(text, max) {
-  const s = String(text ?? '');
-  if (s.length <= max) return { text: s, truncated: false };
-  return { text: s.slice(0, max), truncated: true, chars: s.length };
-}
-
 async function loadConnectors() {
   try {
     const got = await chrome.storage.local.get(API_CONNECTORS_KEY);
@@ -20946,16 +21169,16 @@ async function executeApiCall(args, opts = {}) {
       redirect: 'follow',
     });
     const rawText = built.method === 'HEAD' ? '' : await resp.text();
-    const clipped = clipText(rawText, CALL_API_MAX_RESPONSE_CHARS);
-    const json = parseMaybeJson(clipped.text);
+    // 不在源头截断：全量文本交给执行器的溢出入库（超 EXEC_OUTPUT_CAP_CHARS 全文进
+    // 工作区，模型拿预览 + doc_id 回读）。巨型响应跳过 JSON 解析（慢且必然溢出）。
+    const json = rawText.length <= 1000000 ? parseMaybeJson(rawText) : null;
     const out = {
       ok: resp.ok,
       status: resp.status,
       url: redactUrl(built.url),
       contentType: resp.headers.get('content-type') || '',
-      truncated: clipped.truncated,
-      ...(clipped.chars ? { chars: clipped.chars } : {}),
-      ...(json != null ? { json } : { text: clipped.text }),
+      chars: rawText.length,
+      ...(json != null ? { json } : { text: rawText }),
     };
     if (!resp.ok) out.error = `HTTP ${resp.status}`;
     return out;
@@ -21090,7 +21313,7 @@ function formatLoopResult(resp, { acted } = {}) {
 
 const PARENT_ONLY_TOOLS = new Set([
   'task', 'clear_context', 'suggest_actions', 'ask_research_scope', 'manage_heartbeat', 'auto_compact',
-  'save_memory', 'notebook', 'plot_chart', 'plan', 'record_insight',
+  'save_memory', 'notebook', 'plot_chart', 'plan', 'record_insight', 'compose_report', 'write_document',
 ]);
 // call_api 不是父级专属：explore 可 GET；save/delete/写入在执行器里再拦。
 
@@ -21119,21 +21342,6 @@ const BROWSER_TOOLS = [
 
 function isExploreInteractAllowed(action) {
   return EXPLORE_INTERACT_ALLOW.has(String(action || ''));
-}
-
-/**
- * 一轮 assistant(tool_calls) + tool 结果落账。
- * 子代理把 apiMessages 与 historyMessages 指到同一数组；若各 push 一次，
- * Anthropic 会看到连续两条 tool_use、中间没有 tool_result，下一轮 400。
- */
-function commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs) {
-  const same = apiMessages === historyMessages;
-  apiMessages.push(assistantMsg);
-  if (!same) historyMessages.push(assistantMsg);
-  for (const pair of toolPairs || []) {
-    apiMessages.push(pair.api);
-    if (!same) historyMessages.push(pair.history);
-  }
 }
 
 /**
@@ -21531,7 +21739,7 @@ async function fetchFeedItemHandler(args, transport = defaultTransport) {
     });
     if (fullResp && fullResp.item) item = fullResp.item;
   }
-  const text = item.fullText || item.summary || '(no content)';
+  const text = item.fullText || item.originalSummary || item.summary || '(no content)';
   return '[' + (item.title || '(no title)') + ']\nlink=' + (item.link || '') + '\n' + text;
 }
 
@@ -21556,7 +21764,8 @@ async function fetchFeedItemsHandler(args, transport = defaultTransport, ctx = {
         });
         if (fullResp && fullResp.item) item = fullResp.item;
       }
-      const rawText = item.fullText || item.summary || '';
+      // 写入工作区的是证据：优先原文，翻译后的 summary 只作最后兜底。
+      const rawText = item.fullText || item.originalSummary || item.summary || '';
       const rec = {
         id: item.id,
         title: item.title || '(no title)',
@@ -22639,14 +22848,18 @@ const SPILL_PREVIEW_CHARS = 800;
 
 /**
  * 超长工具输出：全文进工作区，模型只拿编号。失败则退回全文，不静默 slice。
+ * 默认按衍生材料入库（不可引用）；网站原始数据（网络抓包）传 kind='page' +
+ * trustClass='source' 覆盖，使其可进证据链。
  * @returns {Promise<string>}
  */
-async function spillOversizedOutput(text, ctx, { title = '工具输出', url = '' } = {}) {
+async function spillOversizedOutput(text, ctx, {
+  title = '工具输出', url = '', kind = 'text', provenanceType = '', trustClass = 'derived',
+} = {}) {
   const raw = String(text ?? '');
   if (raw.length <= EXEC_OUTPUT_CAP_CHARS) return raw;
   try {
     const res = await putArtifact({
-      kind: 'text',
+      kind: String(kind || 'text'),
       url: String(url || ''),
       title: String(title || '工具输出').slice(0, 80),
       text: raw,
@@ -22654,8 +22867,8 @@ async function spillOversizedOutput(text, ctx, { title = '工具输出', url = '
         via: 'overflow',
         origin: (ctx && ctx.subagentKind) || 'main',
         projectId: (ctx && ctx.projectId) || '',
-        provenanceType: 'derived',
-        trustClass: 'derived',
+        provenanceType: String(provenanceType || (String(kind) === 'page' ? 'web' : 'derived')),
+        trustClass: String(trustClass || 'derived'),
       },
     });
     if (res && res.docId) {
@@ -23082,10 +23295,15 @@ async function planTool(args = {}, ctx = {}) {
  *
  *   turn（用户输入 / 心跳运行 / 子代理回报）
  *     ├─ agent     主代理本回合的回复
- *     └─ subagent  派出的子代理
- *          ├─ claim       断言（status = 核验 verdict，text = 理由）
- *          ├─ unresolved  未解决项
- *          └─ action      执行的操作
+ *     ├─ subagent  派出的子代理
+ *     │    ├─ finding     子代理对任务书问题的判断（meta.support / counter = claim 节点 id）
+ *     │    ├─ claim       断言（status = 核验 verdict，text = 理由）
+ *     │    ├─ unresolved  未解决项
+ *     │    └─ action      执行的操作
+ *     └─ report    compose_report 产出的研报（text = BLUF，refs.entryId = 产出条目）
+ *          ├─ kj          核心判断（meta.support / counter = evidence 节点 id）
+ *          ├─ evidence    判断引用的证据快照（status = 核验 verdict）
+ *          └─ unresolved  不确定性（subtype=uncertainty）/ 信息缺口（subtype=gap）
  *
  * 判断 / 观测不在这里存：它们的权威数据在笔记本（supersedes 链、history），读图时合并。
  *
@@ -23101,7 +23319,10 @@ const CHANNEL = 'citecat-trace';
 const TRACE_MAX_PER_PROJECT = 3000;
 const TRIM_EVERY = 40;
 
-const TRACE_KINDS = ['turn', 'agent', 'subagent', 'claim', 'unresolved', 'action', 'insight'];
+const TRACE_KINDS = [
+  'turn', 'agent', 'subagent', 'claim', 'unresolved', 'action', 'insight',
+  'finding', 'report', 'kj', 'evidence',
+];
 const CHAT_THREAD = 'chat';
 
 const TITLE_MAX = 160;
@@ -23110,6 +23331,8 @@ const TEXT_MAX = 600;
 const META_CONFIDENCE = ['high', 'medium', 'low'];
 const META_TREND = ['up', 'down', 'flat'];
 const META_TRIGGER = ['user', 'refuted', 'failure', 'new-info', 'other'];
+const META_MODALITY = ['confirmed', 'claimed', 'reported', 'denied', 'assessed', 'speculative'];
+const MAX_LINKS = 40;
 
 /**
  * insight 节点的结构化附加字段（主代理上报的决策要素）。只保留白名单标量，
@@ -23129,6 +23352,17 @@ function normalizeMeta(m) {
   if (x.supersedes) out.supersedes = clip$2(x.supersedes, 60);
   if (x.supersededBy) out.supersededBy = clip$2(x.supersededBy, 60);
   if (Number(x.dueAt) > 0) out.dueAt = Number(x.dueAt);
+  if (META_MODALITY.includes(x.modality)) out.modality = x.modality;
+  if (x.attribution) out.attribution = clip$2(x.attribution, 80);
+  if (x.eventTime) out.eventTime = clip$2(x.eventTime, 40);
+  if (Number(x.sources) > 0) out.sources = Math.min(99, Math.floor(Number(x.sources)));
+  if (x.likelihood) out.likelihood = clip$2(x.likelihood, 12);
+  if (x.question) out.question = clip$2(x.question, 300);
+  for (const k of ['support', 'counter']) {
+    if (!Array.isArray(x[k])) continue;
+    const ids = x[k].map((v) => clip$2(v, 160)).filter(Boolean).slice(0, MAX_LINKS);
+    if (ids.length) out[k] = ids;
+  }
   return out;
 }
 
@@ -23150,7 +23384,7 @@ function normalizeTraceNode(n) {
   const kind = TRACE_KINDS.includes(x.kind) ? x.kind : 'action';
   const refsIn = x.refs && typeof x.refs === 'object' ? x.refs : {};
   const refs = {};
-  for (const k of ['taskId', 'checkRunId', 'docId', 'noteId']) {
+  for (const k of ['taskId', 'checkRunId', 'docId', 'noteId', 'entryId']) {
     if (refsIn[k]) refs[k] = clip$2(refsIn[k], 80);
   }
   return {
@@ -23369,6 +23603,19 @@ function subagentReportNodes({ projectId, parentId, threadId, report, verificati
   const mk = (kind, fields) => normalizeTraceNode({
     projectId, parentId, threadId, kind, ts: base + (i++), ...fields,
   });
+  const claimNodeId = (cid) => `${parentId}:${cid}`;
+  (report.findings || []).forEach((f, idx) => {
+    nodes.push(mk('finding', {
+      id: `${parentId}:f${idx + 1}`,
+      subtype: f.confidence || '',
+      title: f.question,
+      text: f.answer,
+      meta: {
+        support: (f.supporting || []).map(claimNodeId),
+        counter: (f.contradicting || []).map(claimNodeId),
+      },
+    }));
+  });
   for (const c of report.claims || []) {
     const v = verdictById.get(c.id);
     nodes.push(mk('claim', {
@@ -23377,12 +23624,90 @@ function subagentReportNodes({ projectId, parentId, threadId, report, verificati
       title: c.claim,
       text: v ? (v.reason || '') : '',
       status: v ? v.verdict : '',
+      meta: {
+        modality: c.modality,
+        attribution: c.attribution,
+        eventTime: c.event_time,
+        sources: v ? v.independentSources : 0,
+      },
     }));
   }
   for (const u of report.unresolved || []) nodes.push(mk('unresolved', { id: `${parentId}:u${i}`, title: u }));
   for (const a of report.actions || []) {
     nodes.push(mk('action', { id: `${parentId}:a${i}`, title: a.description, refs: a.result_ref ? { docId: a.result_ref } : {} }));
   }
+  return nodes;
+}
+
+/**
+ * compose_report 的论证结构 -> report / kj / evidence / unresolved 节点。纯函数。
+ * evidence 是判断所引证据的快照（不指回子代理的 claim 节点：同一主张可能来自多个子任务，已在证据池里合并）。
+ * @param {object} input
+ * @param {object} input.outline  validateOutline 之后的骨架
+ * @param {Array}  input.evidence 证据池条目（report-writer buildEvidencePool().items）
+ */
+function reportTraceNodes({
+  projectId, parentId = '', threadId, ts, reportId, title, question, entryId = '', outline, evidence = [],
+}) {
+  if (!outline || !reportId) return [];
+  const base = Number(ts) > 0 ? Number(ts) : Date.now();
+  let i = 0;
+  const mk = (kind, fields) => normalizeTraceNode({
+    projectId, threadId, kind, ts: base + (i++), parentId: reportId, ...fields,
+  });
+  const evId = (e) => `${reportId}:${e}`;
+  const used = new Set();
+  const judgments = outline.key_judgments || [];
+  for (const k of judgments) for (const e of [...(k.basis || []), ...(k.counter || [])]) used.add(e);
+  for (const u of outline.uncertainties || []) for (const e of u.basis || []) used.add(e);
+  const items = evidence.filter((item) => used.has(item.id));
+  const nodes = [normalizeTraceNode({
+    id: reportId,
+    projectId,
+    parentId,
+    threadId,
+    kind: 'report',
+    ts: base + (i++),
+    title: title || outline.title,
+    text: outline.bluf,
+    status: 'ok',
+    refs: entryId ? { entryId } : {},
+    meta: { question, sources: items.length },
+  })];
+  judgments.forEach((k, idx) => {
+    nodes.push(mk('kj', {
+      id: `${reportId}:K${idx + 1}`,
+      subtype: k.confidence || '',
+      title: k.judgment,
+      text: k.reasoning,
+      meta: { likelihood: k.likelihood, support: (k.basis || []).map(evId), counter: (k.counter || []).map(evId) },
+    }));
+  });
+  for (const item of items) {
+    const src = (item.sources || []).find((s) => s.quote) || (item.sources || [])[0] || {};
+    nodes.push(mk('evidence', {
+      id: evId(item.id),
+      subtype: item.confidence || '',
+      title: item.claim,
+      text: src.quote || '',
+      status: item.verdict,
+      refs: src.doc_id ? { docId: src.doc_id } : {},
+      meta: {
+        modality: item.modality,
+        attribution: item.attribution,
+        eventTime: item.eventTime,
+        sources: item.independentSources,
+      },
+    }));
+  }
+  (outline.uncertainties || []).forEach((u, idx) => {
+    nodes.push(mk('unresolved', {
+      id: `${reportId}:u${idx + 1}`, subtype: 'uncertainty', title: u.issue, meta: { support: (u.basis || []).map(evId) },
+    }));
+  });
+  (outline.gaps || []).forEach((g, idx) => {
+    nodes.push(mk('unresolved', { id: `${reportId}:g${idx + 1}`, subtype: 'gap', title: g }));
+  });
   return nodes;
 }
 
@@ -23537,6 +23862,181 @@ async function insightTool(args = {}, ctx = {}) {
   return brief({ ok: true, id, ...(prev ? { superseded: prev.id } : {}) });
 }
 
+const TYPE_LABEL = {
+  goal: '目标', decision: '决策', conclusion: '结论', pivot: '转向', risk: '风险', ask: '待用户拍板', next: '下一步',
+};
+
+/**
+ * 注入每轮动态前言的决策板摘要：只列仍然有效的条目，带 id，方便 resolve / supersedes，
+ * 也避免重复上报。控制在 ~900 字符内。
+ */
+function formatInsightDigest(insights, { maxChars = 900 } = {}) {
+  const live = (Array.isArray(insights) ? insights : [])
+    .filter(isLiveInsight)
+    .sort((a, b) => b.ts - a.ts);
+  if (!live.length) return '';
+  const lines = ['### 决策板（你用 record_insight 上报过且仍有效的条目；已处理的用 resolve 关掉，推翻旧结论用 supersedes）'];
+  let size = lines[0].length;
+  let shown = 0;
+  for (const n of live) {
+    const bits = [`[${TYPE_LABEL[n.subtype] || n.subtype}]`, n.id, '|', clip$1(n.title, 80)];
+    if (n.meta.confidence) bits.push(`(置信${n.meta.confidence === 'high' ? '高' : n.meta.confidence === 'low' ? '低' : '中'})`);
+    if (n.meta.dueAt) bits.push(`预计 ${new Date(n.meta.dueAt).toISOString().slice(0, 16).replace('T', ' ')}`);
+    const line = `- ${bits.join(' ')}`;
+    if (size + line.length > maxChars) break;
+    lines.push(line);
+    size += line.length;
+    shown += 1;
+  }
+  if (shown < live.length) lines.push(`- …另有 ${live.length - shown} 条（record_insight(list) 查看）`);
+  return lines.join('\n');
+}
+
+/**
+ * 按用户指定体裁写文档。
+ * 输入是子代理交回的原文段落，不是核验过的判断。
+ * 一次写成，再对照原文改一稿。会改变做法、但完全没有原文的要点不保存，退回补读。
+ */
+
+
+const GENRE_GUIDE = {
+  策划方案: '章节按方案写：背景、目标、对象、做法、节奏、资源与审批、风险。每个动作写明责任主体和时间。',
+  纪要: '按议题写：结论、决定、负责人、时间。',
+  研报: '先写判断，再用原文论证。数字和机构名必须能回到原文。',
+  对比: '按同一组维度对齐各方，缺材料的格子写明假设或空缺原因。',
+  档案: '按对象写清是什么、谁在做、关键事实和尚未见到的部分。',
+};
+
+const DOC_MARK = '<<<DOC>>>';
+const GAP_MARK = '<<<GAPS>>>';
+
+function genreGuide(genre) {
+  const name = String(genre).trim();
+  return GENRE_GUIDE[name] || `按体裁「${name || '文档'}」安排章节。结构以写作说明为准。`;
+}
+
+function collectPassages(sessions = [], taskIds = null) {
+  const wanted = Array.isArray(taskIds) && taskIds.length ? new Set(taskIds.map(String)) : null;
+  const passages = [];
+  const seen = new Set();
+  for (const session of sessions) {
+    if (!session || !session.report) continue;
+    if (wanted && !wanted.has(String(session.id))) continue;
+    for (const raw of session.report.passages || []) {
+      const quote = String(raw.quote || '').trim();
+      const docId = String(raw.doc_id || '').trim();
+      const anchor = String(raw.anchor || '').trim();
+      const use = String(raw.use || '').trim();
+      if (!quote || !docId || !anchor) continue;
+      const key = `${docId}#${anchor}|${quote}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      passages.push({ use: use || '未标明', doc_id: docId, anchor, quote });
+    }
+  }
+  return passages;
+}
+
+function splitDraft(text) {
+  const raw = String(text || '').trim();
+  const docAt = raw.indexOf(DOC_MARK);
+  const body = docAt >= 0 ? raw.slice(docAt + DOC_MARK.length) : raw;
+  const gapAt = body.indexOf(GAP_MARK);
+  const markdown = (gapAt >= 0 ? body.slice(0, gapAt) : body).trim();
+  const gaps = gapAt < 0 ? [] : body.slice(gapAt + GAP_MARK.length)
+    .split('\n')
+    .map((line) => line.replace(/^[-*\d.、\s]+/, '').trim())
+    .filter(Boolean);
+  return { markdown, gaps };
+}
+
+function formatPassages(passages) {
+  return passages.map((p, i) => `[P${i + 1}] 用于：${p.use}\n出处：${p.doc_id}#${p.anchor}\n「${p.quote}」`).join('\n\n');
+}
+
+function titleOf(markdown, genre, explicit) {
+  const given = String(explicit || '').trim();
+  if (given) return given;
+  const heading = String(markdown || '').match(/^#\s+(.+)$/m);
+  return (heading && heading[1].trim()) || String(genre).trim() || '文档';
+}
+
+function asList(value) {
+  if (Array.isArray(value)) return value.map((v) => String(v || '').trim()).filter(Boolean);
+  const one = String(value || '').trim();
+  return one ? [one] : [];
+}
+
+/**
+ * @returns {Promise<{ok:true,title:string,markdown:string,passageCount:number}|{ok:false,error?:string,need_reading?:string[],note?:string}>}
+ */
+async function writeDocument(args = {}, {
+  apiConfig, signal, ctx = {}, sessions = [], chat = streamChatWithTools,
+} = {}) {
+  const brief = String(args.brief || args.question || '').trim();
+  const genre = String(args.genre || '').trim() || '文档';
+  if (!brief) return { ok: false, error: 'write_document 需要 brief：这份文档要写什么、怎样算好。' };
+  if (!apiConfig || !apiConfig.apiKey) return { ok: false, error: '没有可用 API，无法写文档。' };
+  const passages = collectPassages(sessions, args.task_ids);
+  if (!passages.length) {
+    return { ok: false, error: '还没有原文段落。先派 explore，任务书写明要覆盖的要点；交回 passages 后再调用 write_document。' };
+  }
+  const poolText = formatPassages(passages);
+  const cover = asList(args.must_cover);
+  const briefBlock = [
+    `体裁：${genre}`,
+    args.audience ? `读者：${String(args.audience).trim()}` : '',
+    `写作说明：${brief}`,
+    cover.length ? `必须覆盖：${cover.join('、')}` : '',
+  ].filter(Boolean).join('\n');
+
+  const draft = await chat([
+    {
+      role: 'system',
+      content: [
+        `你按用户要的体裁「${genre}」写一份可交付文档。只输出文档正文。`,
+        genreGuide(genre),
+        '数字、机构名、期限和专名只能来自给定原文。原文没有的，写成文档中的假设，并在句中标明假设。',
+        '不要套用固定的研报章节，除非体裁就是研报。',
+      ].join('\n'),
+    },
+    { role: 'user', content: `${briefBlock}\n\n## 原文\n${poolText}` },
+  ], [], apiConfig, () => {}, signal);
+  emitUsage(ctx, draft.usage);
+  let markdown = String(draft.content || '').trim();
+  if (!markdown) return { ok: false, error: '写作没有返回正文。' };
+
+  const revised = await chat([
+    {
+      role: 'system',
+      content: [
+        '对照原文改这一份文档。只输出下面两段，不要解释。',
+        `${DOC_MARK}`,
+        '改后的完整文档。删掉原文没有的数字、机构名和期限，或改成句中标明的假设。',
+        `${GAP_MARK}`,
+        '每行一个仍会改变做法、但原文里完全没有的要点。正文里已经写成假设的不要列入。没有就留空。',
+      ].join('\n'),
+    },
+    { role: 'user', content: `${briefBlock}\n\n## 原文\n${poolText}\n\n## 初稿\n${markdown}` },
+  ], [], apiConfig, () => {}, signal);
+  emitUsage(ctx, revised.usage);
+  const split = splitDraft(revised.content || '');
+  if (split.markdown) markdown = split.markdown;
+  if (split.gaps.length) {
+    return {
+      ok: false,
+      need_reading: split.gaps,
+      note: '这些要点没有原文，文档未保存。只为它们再派 explore，交回 passages 后再次调用 write_document。',
+    };
+  }
+  return {
+    ok: true,
+    title: titleOf(markdown, genre, args.title),
+    markdown,
+    passageCount: passages.length,
+  };
+}
+
 /**
  * 文档「修改痕迹」—— doc_edit 每次改动留下的可验收证据。
  *
@@ -23580,10 +24080,11 @@ function formatEditsForModel(card) {
   const lines = list.slice(0, 8).map((e) => {
     const loc = e.location ? `（${e.location}）` : '';
     if (e.op === 'review') return `- ${e.note || '修订已处理'}`;
-    if (e.op === 'format') return `- ${loc}${e.note || '格式'}「${clip(e.before, MODEL_EDIT_CHARS)}」`;
-    if (e.op === 'insert') return `- ${loc}新增：「${clip(e.after, MODEL_EDIT_CHARS)}」`;
-    if (e.op === 'delete') return `- ${loc}删除：「${clip(e.before, MODEL_EDIT_CHARS)}」`;
-    return `- ${loc}「${clip(e.before, MODEL_EDIT_CHARS)}」→「${clip(e.after, MODEL_EDIT_CHARS)}」`;
+    const mark = e.tracked ? '待审修订 ' : '';
+    if (e.op === 'format') return `- ${loc}${mark}${e.note || '格式'}「${clip(e.before, MODEL_EDIT_CHARS)}」`;
+    if (e.op === 'insert') return `- ${loc}${mark}新增：「${clip(e.after, MODEL_EDIT_CHARS)}」`;
+    if (e.op === 'delete') return `- ${loc}${mark}删除：「${clip(e.before, MODEL_EDIT_CHARS)}」`;
+    return `- ${loc}${mark}「${clip(e.before, MODEL_EDIT_CHARS)}」→「${clip(e.after, MODEL_EDIT_CHARS)}」`;
   });
   const extra = list.length > 8 ? `\n…另有 ${list.length - 8} 处（对话里的修改卡可看全）` : '';
   const who = card.doc_name || card.doc_id || '文档';
@@ -23608,15 +24109,50 @@ const evidenceSchema = {
   required: ['doc_id', 'anchor', 'quote'],
 };
 
+/**
+ * 陈述性质：区分“事情发生了”与“某方说事情发生了”。Check 据此判断引文是否只支持了较弱的一层。
+ * confirmed 只用于来源以自身名义直接发布或观察到的事实（官方公告原文、原始数据、现场记录）。
+ */
+const CLAIM_MODALITIES = ['confirmed', 'claimed', 'reported', 'denied', 'assessed', 'speculative'];
+
 const claimSchema = {
   type: 'object',
   properties: {
     id: { type: 'string' },
-    claim: { type: 'string', description: '一句可核查的事实主张。' },
+    claim: { type: 'string', description: '一句可核查的主张。某方说法要写成“X 称……”，不要把声称写成既成事实。' },
+    attribution: {
+      type: 'string',
+      description: '这句话最初是谁说的：原始发布方或发言主体（如“乌克兰空军，经路透社转述”）。不是转载它的网站。',
+    },
+    modality: {
+      type: 'string',
+      enum: CLAIM_MODALITIES,
+      description: 'confirmed=来源以自身名义直接发布/观察；claimed=当事方声称；reported=媒体转述或匿名信源；denied=某方否认；assessed=分析机构评估或预测；speculative=推测传闻。',
+    },
+    event_time: { type: 'string', description: '事件发生时间（YYYY-MM-DD 或区间），不是报道或采集时间；未知留空。' },
     confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
     evidence: { type: 'array', minItems: 1, maxItems: MAX_EVIDENCE, items: evidenceSchema },
   },
-  required: ['id', 'claim', 'evidence'],
+  required: ['id', 'claim', 'attribution', 'modality', 'evidence'],
+};
+
+const MAX_FINDINGS = 12;
+/** claims 达到这个数量的调研型交回必须给 findings，否则就只是证据堆。 */
+const FINDINGS_REQUIRED_MIN_CLAIMS = 3;
+
+const findingSchema = {
+  type: 'object',
+  properties: {
+    question: { type: 'string', description: '任务书里要回答的问题（或你识别出的关键问题）。' },
+    answer: {
+      type: 'string',
+      description: '你对这个问题的回答：一到三句判断，说明这些事实意味着什么，不是把 claim 再抄一遍。证据不足就明说“尚不能判断，因为……”。',
+    },
+    supporting: { type: 'array', items: { type: 'string' }, description: '支撑该回答的 claim id。' },
+    contradicting: { type: 'array', items: { type: 'string' }, description: '与该回答相反或削弱它的 claim id；没有就空数组。' },
+    confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+  },
+  required: ['question', 'answer', 'supporting', 'confidence'],
 };
 
 const SUBMIT_REPORT_TOOL = {
@@ -23624,11 +24160,14 @@ const SUBMIT_REPORT_TOOL = {
   function: {
     name: 'submit_report',
     description:
-      '提交给父代理的最终结构化报告。只有本工具成功才算任务完成。事实必须拆成 claims 并附逐字引文与 doc_id#anchor；操作型任务可让 claims 为空、把结果写入 actions。',
+      '提交给父代理的最终结构化报告。只有本工具成功才算任务完成。'
+      + '阅读任务把原文放进 passages（use + doc_id + anchor + 逐字 quote），claims 传空数组，不要写 findings。'
+      + '操作型任务把结果写入 actions，事实才拆成 claims。',
     parameters: {
       type: 'object',
       properties: {
-        summary: { type: 'string', description: '任务结果短摘要，不超过 800 字。' },
+        summary: { type: 'string', description: '任务结果短摘要，不超过 800 字。先写结论，再写依据。' },
+        findings: { type: 'array', maxItems: MAX_FINDINGS, items: findingSchema },
         claims: { type: 'array', maxItems: MAX_CLAIMS, items: claimSchema },
         actions: {
           type: 'array',
@@ -23643,6 +24182,21 @@ const SUBMIT_REPORT_TOOL = {
           },
         },
         unresolved: { type: 'array', maxItems: 40, items: { type: 'string' } },
+        passages: {
+          type: 'array',
+          maxItems: 40,
+          description: '阅读任务的交回。每条是可写进文档的原文，不要写成判断。',
+          items: {
+            type: 'object',
+            properties: {
+              use: { type: 'string', description: '这段原文准备写进文档的哪一条要点。' },
+              doc_id: { type: 'string' },
+              anchor: { type: 'string', description: 'cN / pN / oN。' },
+              quote: { type: 'string', description: '来源中的逐字引文。' },
+            },
+            required: ['use', 'doc_id', 'anchor', 'quote'],
+          },
+        },
       },
       required: ['summary', 'claims', 'actions', 'unresolved'],
     },
@@ -23659,7 +24213,46 @@ function normalizeEvidence(raw = {}) {
   };
 }
 
-function validateTaskReport(raw) {
+/** 缺省按“转述”处理：宁可把事实看弱，也不默认成已确认。 */
+function normalizeModality(value) {
+  const v = String(value || '').trim().toLowerCase();
+  return CLAIM_MODALITIES.includes(v) ? v : 'reported';
+}
+
+function normalizeFindings(rawFindings, claimIds) {
+  if (rawFindings == null) return { findings: [] };
+  if (!Array.isArray(rawFindings)) return { error: 'findings 必须是数组。' };
+  const findings = [];
+  for (let i = 0; i < Math.min(rawFindings.length, MAX_FINDINGS); i++) {
+    const src = rawFindings[i] || {};
+    const question = String(src.question || '').trim();
+    const answer = String(src.answer || '').trim();
+    if (!question || !answer) return { error: `finding ${i + 1} 需要 question 和 answer。` };
+    const refs = (list) => (Array.isArray(list) ? list : []).map((v) => String(v || '').trim()).filter(Boolean);
+    const supporting = refs(src.supporting);
+    const contradicting = refs(src.contradicting);
+    const unknown = [...supporting, ...contradicting].filter((id) => !claimIds.has(id));
+    if (unknown.length) return { error: `finding ${i + 1} 引用了不存在的 claim id：${unknown.join(', ')}。` };
+    if (!supporting.length && !contradicting.length) {
+      return { error: `finding ${i + 1} 至少要引用一条 claim（supporting 或 contradicting）。` };
+    }
+    findings.push({
+      question: question.slice(0, 300),
+      answer: answer.slice(0, 1200),
+      supporting,
+      contradicting,
+      confidence: ['high', 'medium', 'low'].includes(src.confidence) ? src.confidence : 'medium',
+    });
+  }
+  return { findings };
+}
+
+/**
+ * @param {object} raw
+ * @param {object} [opts]
+ * @param {boolean} [opts.requireFindings] 调研型交回（claims 足够多）缺 findings 时拒收
+ */
+function validateTaskReport(raw, { requireFindings = false } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: '报告必须是对象。' };
   const summary = String(raw.summary || '').trim();
   if (!summary) return { error: 'summary 不能为空。' };
@@ -23686,6 +24279,9 @@ function validateTaskReport(raw) {
     claims.push({
       id,
       claim,
+      attribution: String(src.attribution || '').trim().slice(0, 120),
+      modality: normalizeModality(src.modality),
+      event_time: String(src.event_time || src.eventTime || '').trim().slice(0, 40),
       confidence: ['high', 'medium', 'low'].includes(src.confidence) ? src.confidence : 'medium',
       evidence,
     });
@@ -23695,28 +24291,105 @@ function validateTaskReport(raw) {
     result_ref: String(a?.result_ref || '').trim(),
   })).filter((a) => a.description);
   const unresolved = raw.unresolved.slice(0, 40).map((v) => String(v || '').trim()).filter(Boolean);
+  const passageList = Array.isArray(raw.passages) ? raw.passages : [];
+  if (passageList.length > 40) return { error: 'passages 最多 40 条。' };
+  const passages = [];
+  for (let i = 0; i < passageList.length; i++) {
+    const src = passageList[i] || {};
+    const use = String(src.use || '').trim();
+    const docId = String(src.doc_id || src.docId || '').trim();
+    const anchor = String(src.anchor || '').replace(/^.*#/, '').trim();
+    const quote = String(src.quote || '').trim();
+    if (!use || !docId || !anchor || !quote) {
+      return { error: `passage ${i + 1} 需要 use、doc_id、anchor、quote。` };
+    }
+    passages.push({ use: use.slice(0, 80), doc_id: docId, anchor, quote: quote.slice(0, 800) });
+  }
+  const normalized = normalizeFindings(raw.findings, ids);
+  if (normalized.error) return { error: normalized.error };
+  if (requireFindings && claims.length >= FINDINGS_REQUIRED_MIN_CLAIMS && !normalized.findings.length) {
+    return {
+      error: `有 ${claims.length} 条 claims 但没有 findings。按任务书里的问题逐个回答：answer 写这些事实意味着什么（判断），supporting/contradicting 填 claim id。`,
+    };
+  }
   return {
     report: {
       summary: summary.slice(0, 800),
+      findings: normalized.findings,
       claims,
+      passages,
       actions,
       unresolved,
     },
   };
 }
 
+function claimForMain(c) {
+  return {
+    id: c.id,
+    claim: c.claim,
+    ...(c.attribution ? { attribution: c.attribution } : {}),
+    modality: c.modality || 'reported',
+    ...(c.event_time ? { event_time: c.event_time } : {}),
+    confidence: c.confidence,
+    sources: (c.evidence || []).map((e) => `${e.doc_id}#${e.anchor}`),
+  };
+}
+
+const NOTE_PASSAGES = 'covered 是已有原文的要点，unresolved 是还没找到原文的要点。缺口还会改变文档做法时，只为缺口再派阅读。覆盖够了调用 write_document。不要把段落抄进对话。';
+const NOTE_FINDINGS = '按 findings 回答：answer 是判断，写成段落；supporting / contradicting 是这条判断用到的事实，写进同一段并括注 sources，不要另起清单。用户要一份文档时调用 write_document，不要自己重写正文。';
+const NOTE_FEW = '这次没有 findings。用 summary 作答；claims 是少量事实，写进段落并括注 sources，不要逐条照抄。';
+const NOTE_PILE = '事实较多但没有 findings，这里不展开 claims。要成文就派阅读补 passages，再调用 write_document。';
+
+/**
+ * 主代理看到的短摘要。有 findings 时事实挂在判断下面，不再平铺 claims；
+ * 未被任何 finding 引用的事实只留条数。完整 claims 与引文留在子会话，供 Check 与 compose_report。
+ */
 function reportForMain(report) {
   if (!report) return null;
-  return {
+  const claims = report.claims || [];
+  const byId = new Map(claims.map((c) => [c.id, c]));
+  const rawFindings = report.findings || [];
+  const findings = rawFindings.map((f) => ({
+    question: f.question,
+    answer: f.answer,
+    confidence: f.confidence,
+    supporting: (f.supporting || []).map((id) => byId.get(id)).filter(Boolean).map(claimForMain),
+    contradicting: (f.contradicting || []).map((id) => byId.get(id)).filter(Boolean).map(claimForMain),
+  }));
+  const used = new Set();
+  for (const f of rawFindings) {
+    for (const id of [...(f.supporting || []), ...(f.contradicting || [])]) used.add(id);
+  }
+  const unreferenced = claims.filter((c) => !used.has(c.id)).length;
+  const base = {
     summary: report.summary,
-    claims: (report.claims || []).map((c) => ({
-      id: c.id,
-      claim: c.claim,
-      confidence: c.confidence,
-      sources: c.evidence.map((e) => `${e.doc_id}#${e.anchor}`),
-    })),
     actions: report.actions || [],
     unresolved: report.unresolved || [],
+  };
+  const passages = report.passages || [];
+  if (passages.length) {
+    const covered = [];
+    for (const p of passages) {
+      if (p.use && !covered.includes(p.use)) covered.push(p.use);
+    }
+    return { ...base, note: NOTE_PASSAGES, covered, passage_count: passages.length };
+  }
+  if (findings.length) {
+    return {
+      ...base,
+      note: NOTE_FINDINGS,
+      findings,
+      ...(unreferenced ? { unreferenced_claims: unreferenced } : {}),
+    };
+  }
+  if (claims.length >= FINDINGS_REQUIRED_MIN_CLAIMS) {
+    return { ...base, note: NOTE_PILE, claim_count: claims.length };
+  }
+  return {
+    ...base,
+    note: NOTE_FEW,
+    ...(claims.length ? { claims: claims.map(claimForMain) } : {}),
   };
 }
 
@@ -23738,6 +24411,18 @@ function reportForMain(report) {
  *                                 SW 直调自身 handler，避免自发消息收不到）
  */
 
+
+/** 把引擎回带的 edits 挂到对话修改卡，并返回拼进工具结果的紧凑摘要。 */
+function publishDocEdits(ctx, args, r, tool) {
+  if (!r || typeof r !== 'object' || !r.ok || !Array.isArray(r.edits) || !r.edits.length) return '';
+  const docId = String(r.doc_id || (args && args.doc_id) || '');
+  const entry = (ctx.entries || []).find((e) => e && e.id === docId);
+  const name = r.doc_name || (entry && (entry.aiTitle || entry.originalTitle)) || '';
+  const card = makeEditsCard({ doc_id: docId, doc_name: name, tool: String(tool || ''), edits: r.edits });
+  if (!card) return '';
+  try { if (typeof ctx.onDocEdit === 'function') ctx.onDocEdit(card); } catch (_) {}
+  return formatEditsForModel(card);
+}
 
 /** 由 subagent.js 在模块加载时注册，避免 chat-executor ↔ subagent 顶层循环依赖。 */
 let runTaskToolImpl = null;
@@ -23777,7 +24462,7 @@ function contextCompactBudget(cfg) {
 const WRITE_TOOLS = new Set([
   'delete_entry', 'update_entry', 'reorder_entries',
   'collect_content', 'confirm_collect', 'cancel_collect', 'create_document',
-  'collect_feed_items',
+  'collect_feed_items', 'compose_report', 'write_document',
 ]);
 
 /* 默认消息桥：panel 场景（发消息到 SW）。SW 场景用 ctx.bridge 覆盖为直调自身 handler。 */
@@ -23978,8 +24663,74 @@ function rememberLoopFingerprint(ctx, tabId, snap) {
   if (fp) ctx._pageLoop[tabId] = fp;
 }
 
+const VIEWPORT_SHOT_NOTE = '\n（已附当前视口截图，与本表同一画面。编号优先；截图中有而本表没有的控件再用 interact_page 的 click_at。）';
+
+function bytesToBase64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+/** 压到最长边 1280 的 JPEG。本模块会打进 SW 包，不能引用 document，只用 OffscreenCanvas。失败则退回原图。 */
+async function shrinkScreenshot(dataUrl, maxDim = 1280) {
+  try {
+    if (typeof OffscreenCanvas === 'undefined') return dataUrl;
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height);
+    if (typeof bitmap.close === 'function') bitmap.close();
+    const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.6 });
+    return `data:image/jpeg;base64,${bytesToBase64(new Uint8Array(await out.arrayBuffer()))}`;
+  } catch (_) {
+    return dataUrl;
+  }
+}
+
+/** 标签已在聚焦窗口的前台时截当前视口。不激活标签、不抢焦点。 */
+async function captureForegroundViewport(tab) {
+  if (!tab?.id) return null;
+  let fresh = tab;
+  try {
+    fresh = await chrome.tabs.get(tab.id);
+  } catch (_) {
+    return null;
+  }
+  if (!fresh?.active) return null;
+  try {
+    const [visible] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!visible || visible.id !== fresh.id) return null;
+  } catch (_) {
+    return null;
+  }
+  let dataUrl = '';
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab(fresh.windowId, { format: 'jpeg', quality: 60 });
+  } catch (_) {
+    return null;
+  }
+  if (!dataUrl || !dataUrl.startsWith('data:image') || dataUrl.length < 100) return null;
+  const shrunk = await shrinkScreenshot(dataUrl);
+  if (!shrunk || !shrunk.startsWith('data:image') || shrunk.length > 500000) return null;
+  return shrunk;
+}
+
+async function finishBrowserAct(ctx, tab, text) {
+  const shot = await captureForegroundViewport(tab);
+  if (!shot || !ctx) return text;
+  ctx._viewportShot = shot;
+  return text + VIEWPORT_SHOT_NOTE;
+}
+
 /** 全员默认页面循环（Main / general / browser）。不抢前台。 */
 async function executeBrowserAct(args, ctx = {}) {
+  if (ctx) ctx._viewportShot = null;
   const op = String((args && args.op) || '').trim();
   if (!BROWSER_ACT_OPS.includes(op)) {
     return `browser_act 不支持 op=${op || '(空)'}。可用：${BROWSER_ACT_OPS.join(', ')}`;
@@ -24015,12 +24766,12 @@ async function executeBrowserAct(args, ctx = {}) {
     }
     const snap = await sendLoopMessage(tab.id, { action: 'loop_observe' });
     rememberLoopFingerprint(ctx, tab.id, snap);
-    return formatLoopResult(snap, { acted: `navigate ${dest}` });
+    return finishBrowserAct(ctx, tab, formatLoopResult(snap, { acted: `navigate ${dest}` }));
   }
   if (op === 'observe') {
     const snap = await sendLoopMessage(tab.id, { action: 'loop_observe' });
     rememberLoopFingerprint(ctx, tab.id, snap);
-    return formatLoopResult(snap);
+    return finishBrowserAct(ctx, tab, formatLoopResult(snap));
   }
   const fingerprint = (ctx._pageLoop && ctx._pageLoop[tab.id]) || '';
   const resp = await sendLoopMessage(tab.id, {
@@ -24035,7 +24786,7 @@ async function executeBrowserAct(args, ctx = {}) {
   const acted = op === 'type'
     ? `type [${args.index}]`
     : (op === 'select' || op === 'click' ? `${op} [${args.index}]` : op);
-  return formatLoopResult(resp, { acted });
+  return finishBrowserAct(ctx, tab, formatLoopResult(resp, { acted }));
 }
 
 /* 库中条目摘要（与侧栏 buildDynamicContext 同格式，保证两侧提示词一致） */
@@ -24219,36 +24970,38 @@ async function runMainWorldJS(tabId, code) {
   return { ok: true, value: result };
 }
 
-/* Shared Vision-LLM call: takes a data-URL image + text prompt, returns
-   { ok, content, scaleInfo } or { ok:false, error }. Handles image
-   downscaling (>1920px) via canvas (DOM 场景；SW 无 DOM 时跳过缩放)，
-   然后委托 vision-client.visionChat 完成 API 调用。 */
-async function callVisionModel(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 30000 } = {}) {
-  let imgDataUrl = imageDataUrl;
+/* 视口图超过 1920px 时缩小再送视觉模型。SW 无 DOM，跳过缩放。 */
+async function scaleVisionDataUrl(imageDataUrl) {
   const scaleInfo = { origW: 0, origH: 0, scaledW: 0, scaledH: 0 };
-  const doc = typeof document !== 'undefined' ? document : null; // SW 无 DOM，跳过缩放
-  if (doc && typeof Image !== 'undefined') {
-    try {
-      const img = new Image();
-      img.src = imageDataUrl;
-      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; setTimeout(rej, 3000); });
-      scaleInfo.origW = img.width; scaleInfo.origH = img.height;
-      scaleInfo.scaledW = img.width; scaleInfo.scaledH = img.height;
-      const maxDim = 1920;
-      if (img.width > maxDim || img.height > maxDim) {
-        const ratio = Math.min(maxDim / img.width, maxDim / img.height);
-        const canvas = doc.createElement('canvas');
-        canvas.width = Math.round(img.width * ratio);
-        canvas.height = Math.round(img.height * ratio);
-        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-        imgDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-        scaleInfo.scaledW = canvas.width; scaleInfo.scaledH = canvas.height;
-      }
-    } catch (_) {}
+  const doc = typeof document !== 'undefined' ? document : null;
+  if (!doc || typeof Image === 'undefined') return { dataUrl: imageDataUrl, scaleInfo };
+  try {
+    const img = new Image();
+    img.src = imageDataUrl;
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; setTimeout(rej, 3000); });
+    scaleInfo.origW = img.width; scaleInfo.origH = img.height;
+    scaleInfo.scaledW = img.width; scaleInfo.scaledH = img.height;
+    const maxDim = 1920;
+    if (img.width <= maxDim && img.height <= maxDim) return { dataUrl: imageDataUrl, scaleInfo };
+    const ratio = Math.min(maxDim / img.width, maxDim / img.height);
+    const canvas = doc.createElement('canvas');
+    canvas.width = Math.round(img.width * ratio);
+    canvas.height = Math.round(img.height * ratio);
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    scaleInfo.scaledW = canvas.width; scaleInfo.scaledH = canvas.height;
+    return { dataUrl: canvas.toDataURL('image/jpeg', 0.85), scaleInfo };
+  } catch (_) {
+    return { dataUrl: imageDataUrl, scaleInfo };
   }
-  const vr = await visionChat(imgDataUrl, prompt, { maxTokens, timeoutMs });
+}
+
+/* Shared Vision-LLM call: takes a data-URL image + text prompt, returns
+   { ok, content, scaleInfo } or { ok:false, error }. */
+async function callVisionModel(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 30000 } = {}) {
+  const { dataUrl, scaleInfo } = await scaleVisionDataUrl(imageDataUrl);
+  const vr = await visionChat(dataUrl, prompt, { maxTokens, timeoutMs });
   if (!vr.ok) return vr;
-  return { ok: true, content: vr.content, scaleInfo };
+  return { ok: true, content: vr.content, finishReason: vr.finishReason || 'stop', scaleInfo };
 }
 
 /* Capture the currently visible viewport of a tab as JPEG. 先拉前台再截，20s 超时。 */
@@ -24264,6 +25017,29 @@ async function captureViewport(tab, quality = 85) {
   } catch (err) {
     return null;
   }
+}
+
+/**
+ * 抓包单条响应 → 模型可见文本。超 EXEC_OUTPUT_CAP_CHARS 的整条溢出入库
+ * （抓包数据来自网站原始响应，按 page/source 标记，可进证据链），
+ * 采集护栏截过头的如实注明——任何进历史的抓包结果要么全文、要么带 doc_id。
+ */
+async function captureBodyForModel(c, ctx) {
+  const body = String(c?.body || '');
+  if (body.length > EXEC_OUTPUT_CAP_CHARS) {
+    const envelope = await spillOversizedOutput(body, ctx, {
+      title: `网络抓包 ${String(c?.url || '').slice(0, 60)}`,
+      url: String(c?.url || ''),
+      kind: 'page',
+      provenanceType: 'web',
+      trustClass: 'source',
+    });
+    const capNote = c?.bodyTruncated
+      ? `\n（注意：抓包采集护栏在采集时已把原始响应截到 ${NET_BODY_LIMIT} 字符，完整原始响应共 ${c.bodyChars} 字符）`
+      : '';
+    return `${envelope}${capNote}`;
+  }
+  return body;
 }
 
 /* 指定标签页的 CDP 操作（走 SW TabSession；attach 前激活/聚焦，20s 超时） */
@@ -24302,7 +25078,10 @@ async function operateBackgroundTab(ctx, tabId, args) {
     case 'capture_network': {
       const caps = r.captures || [];
       if (!caps.length) return `[网络抓包] 后台标签页 #${tabId} 未捕获到 JSON 接口（可加大 wait_ms 或调整 text 过滤词）。`;
-      const lines = caps.map((c) => `- ${c.url}\n  ${c.body}`);
+      const lines = [];
+      for (const c of caps) {
+        lines.push(`- ${c.url}\n  ${await captureBodyForModel(c, ctx)}`);
+      }
       return `[网络抓包] 后台标签页 #${tabId} 共 ${caps.length} 条：\n${lines.join('\n')}`;
     }
     case 'screenshot': {
@@ -24373,12 +25152,21 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
       return { content: errContent, history: errContent, write: false };
     }
     const toolResult = await executeToolCall(tc.name, tc.arguments, ctx);
+    const image = ctx && typeof ctx._viewportShot === 'string' ? ctx._viewportShot : '';
+    if (ctx) ctx._viewportShot = null;
     hooks.done?.(label);
     logToolCall({ ctx, name: tc.name, args: tc.arguments, result: toolResult, durationMs: Date.now() - t0 });
     const elapsed = Date.now() - t0;
     if (elapsed < minAcceptDelayMs) await new Promise((r) => setTimeout(r, minAcceptDelayMs - elapsed));
-    return { content: toolResult, history: toolResult, write: WRITE_TOOLS.has(tc.name), name: tc.name };
+    return {
+      content: toolResult,
+      history: toolResult,
+      write: WRITE_TOOLS.has(tc.name),
+      name: tc.name,
+      image,
+    };
   } catch (err) {
+    if (ctx) ctx._viewportShot = null;
     console.warn('[Citecat] tool failed:', tc.name, err);
     const errContent = `Error: ${err.message}`;
     hooks.fail?.(label);
@@ -24482,6 +25270,60 @@ async function processRoundToolCalls({
     }
   }
   commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs);
+  appendViewportShots(apiMessages, historyMessages, slots.map((slot) => slot && slot.image));
+}
+
+async function runDocumentWrite(args, ctx) {
+  let composed;
+  try {
+    composed = await writeDocument({
+      ...args,
+      brief: args.brief || args.question,
+      genre: args.genre || (args.question ? '文档' : ''),
+    }, {
+      apiConfig: ctx.apiConfig,
+      signal: ctx.subagentParentSignal || undefined,
+      ctx,
+      sessions: ctx.subagentSessions ? [...ctx.subagentSessions.values()] : [],
+    });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: `写文档失败：${err.message || String(err)}` });
+  }
+  if (!composed.ok) return JSON.stringify(composed);
+  const format = args.format === 'docx' ? 'docx' : 'md';
+  const saved = await executeToolCall('create_document', {
+    title: composed.title,
+    content: composed.markdown,
+    format,
+    summary: String(args.brief || args.question || composed.title).slice(0, 200),
+    tags: Array.isArray(args.tags) && args.tags.length ? args.tags : [String(args.genre || '文档')],
+  }, ctx);
+  if (!String(saved).startsWith('已创建文档')) {
+    return JSON.stringify({ ok: false, error: String(saved) });
+  }
+  try {
+    const pid = ctx.projectId || 'default';
+    const parentId = typeof ctx.getTraceTurnId === 'function' ? String(ctx.getTraceTurnId() || '') : '';
+    const threadId = (typeof ctx.getTraceThreadId === 'function' && ctx.getTraceThreadId()) || CHAT_THREAD;
+    for (const n of reportTraceNodes({
+      projectId: pid,
+      parentId,
+      threadId,
+      reportId: newTraceId('rp'),
+      title: composed.title,
+      question: String(args.brief || args.question || ''),
+      entryId: ctx.lastCreatedDocId || '',
+      outline: { title: composed.title, bluf: '', key_judgments: [] },
+      evidence: [],
+    })) putTrace(n);
+  } catch (_) { /* 追踪失败不影响文档本身 */ }
+  return JSON.stringify({
+    ok: true,
+    title: composed.title,
+    entry_id: ctx.lastCreatedDocId || '',
+    saved: '已保存到工作区「产出」。',
+    next: '只告诉用户文档已保存。不要在聊天里重写正文。',
+  });
 }
 
 async function executeToolCall(name, args, ctx = {}) {
@@ -24715,7 +25557,7 @@ async function executeToolCall(name, args, ctx = {}) {
           try {
             const visionCfg = await getVisionConfig();
             if (!visionCfg.apiKey) {
-              return '当前渠道主模型不支持视觉，且未配置外挂 Vision。请换用带视觉的模型，或在设置页「视觉模型」里填一个兜底模型。';
+              return '当前渠道未配置 API Key，无法做视觉提取。请先在设置里配置接入渠道。';
             }
             const dims = await chrome.scripting.executeScript({
               target: { tabId: tab.id },
@@ -24736,7 +25578,8 @@ async function executeToolCall(name, args, ctx = {}) {
               await new Promise((r) => setTimeout(r, 600)); // let render settle
               const dataUrl = await captureViewport(tab, 80);
               if (!dataUrl || dataUrl.length < 100) continue;
-              const vr = await callVisionModel(dataUrl, OCR_PROMPT, { maxTokens: 4000, timeoutMs: 45000 });
+              const { dataUrl: scaled } = await scaleVisionDataUrl(dataUrl);
+              const vr = await visionOcrScreen(scaled, { timeoutMs: 45000 });
               if (!vr.ok) { chunks.push(`[第${i + 1}屏提取失败: ${vr.error}]`); continue; }
               chunks.push(vr.content.trim());
             }
@@ -25032,10 +25875,11 @@ async function executeToolCall(name, args, ctx = {}) {
               return `网络抓包完成（${Math.round(duration / 1000)}s），未捕获到 XHR/Fetch JSON 响应。${urlFilter ? `过滤词: ${urlFilter}。` : ''}可能页面无异步数据请求，或已被缓存。`;
             }
             const top = captured.slice(-12);
-            const parts = top.map((c, i) => {
-              const body = c.body.length > NET_BODY_LIMIT ? c.body.slice(0, NET_BODY_LIMIT) + '\n...(截断)' : c.body;
-              return `--- ${i + 1}. ${c.url}\n[${c.mimeType}]\n${body}`;
-            });
+            const parts = [];
+            for (let i = 0; i < top.length; i++) {
+              const c = top[i];
+              parts.push(`--- ${i + 1}. ${c.url}\n[${c.mimeType}]\n${await captureBodyForModel(c, ctx)}`);
+            }
             return `[网络抓包] 共 ${captured.length} 条 JSON/文本响应（显示最近 ${top.length} 条）\n\n${parts.join('\n\n')}`;
           } catch (err) {
             return `网络抓包失败: ${err.message || String(err)}`;
@@ -25547,7 +26391,7 @@ async function executeToolCall(name, args, ctx = {}) {
           capturedAt: ts,
           trustClass: 'derived',
         },
-        sourceTier: 'high',
+        sourceTier: '',
         tags: (args.tags || []).slice(0, 3),
         format: format,
         structuredData: args.structured_data || null,
@@ -25574,6 +26418,7 @@ async function executeToolCall(name, args, ctx = {}) {
         }
       }
       await saveEntry(entry, ctx.projectId);
+      ctx.lastCreatedDocId = id;
       ctx.entries = await getEntries(ctx.projectId);
       ctx.onEntriesChanged && ctx.onEntriesChanged();
       notifyCollectionStatusChanged(ctx, { urls: [entry.url] });
@@ -25635,21 +26480,15 @@ async function executeToolCall(name, args, ctx = {}) {
       // 缺失时直接返回可用工具清单，让模型看到错误即可自纠重试
       const editTool = args.tool || args.action || args.act || args.op;
       if (!editTool) {
-        return JSON.stringify({ ok: false, error: 'doc_edit 缺少必填参数 tool。可用：xlsx 为 set_range/set_bold/append_row/append_col/clear_range/switch_sheet；docx 与 .doc（会先转成 docx）为 replace_text/insert_text/set_bold/set_heading/add_list/add_table/set_cell（docx 文本修改默认修订痕迹，可传 track_changes=false 直接改）；txt 为 replace_text/insert_text；通用 undo/redo/export。请带 tool 重试' });
+        return JSON.stringify({ ok: false, error: 'doc_edit 缺少必填参数 tool。可用：xlsx 为 set_range/set_bold/append_row/append_col/clear_range/switch_sheet；docx 与 .doc（会先转成 docx）为 replace_text/insert_text/set_format/set_bold/set_heading/add_list/add_table/set_cell（默认直接写入；用户要求留痕时 replace_text/insert_text 传 track_changes=true）；txt 为 replace_text/insert_text；通用 undo/redo/export。请带 tool 重试' });
       }
       const r = await b.docEdit({ tool: String(editTool), args });
       // 改动痕迹：引擎在返回值里带了 {op, location, before, after}——挂到对话的修改卡，
       // 同时把紧凑摘要回喂模型当自证材料（原始 edits 不再进 JSON，避免重复占上下文）
       if (r && typeof r === 'object' && r.ok && Array.isArray(r.edits) && r.edits.length) {
-        const docId = String(r.doc_id || args.doc_id || '');
-        const entry = (ctx.entries || []).find((e) => e && e.id === docId);
-        const name = r.doc_name || (entry && (entry.aiTitle || entry.originalTitle)) || '';
-        const card = makeEditsCard({ doc_id: docId, doc_name: name, tool: String(editTool), edits: r.edits });
-        if (card) {
-          try { if (typeof ctx.onDocEdit === 'function') ctx.onDocEdit(card); } catch (_) {}
-          const { edits: _rawEdits, ...rest } = r;
-          return JSON.stringify(rest) + formatEditsForModel(card);
-        }
+        const note = publishDocEdits(ctx, args, r, editTool);
+        const { edits: _rawEdits, ...rest } = r;
+        return JSON.stringify(rest) + note;
       }
       return typeof r === 'string' ? r : JSON.stringify(r);
     }
@@ -25663,6 +26502,11 @@ async function executeToolCall(name, args, ctx = {}) {
         return JSON.stringify({ ok: false, error: 'doc_review 缺少必填参数 tool。可用动作：list_revisions / accept(id|"all") / reject(id|"all")。提出修订走 doc_edit，无需点「编辑」。请带 tool 重试' });
       }
       const r = await b.docReview({ tool: String(reviewTool), args });
+      if (r && typeof r === 'object' && r.ok && Array.isArray(r.edits) && r.edits.length) {
+        const note = publishDocEdits(ctx, args, r, reviewTool);
+        const { edits: _rawEdits, ...rest } = r;
+        return JSON.stringify(rest) + note;
+      }
       return typeof r === 'string' ? r : JSON.stringify(r);
     }
     case 'manage_heartbeat': {
@@ -25692,12 +26536,16 @@ async function executeToolCall(name, args, ctx = {}) {
           || (typeof ctx.getActiveHeartbeatTaskId === 'function' ? String(ctx.getActiveHeartbeatTaskId() || '') : '');
         if (!id) return JSON.stringify({ ok: false, error: 'complete 只能在心跳触发的那轮对话里用（或显式传 id）。' });
         const t = await getHeartbeatTask(id).catch(() => null);
-        if (!t) return JSON.stringify({ ok: false, error: `找不到任务 ${id}` });
+        if (!t || !taskBelongsToProject(t, pid)) return JSON.stringify({ ok: false, error: `找不到任务 ${id}` });
         await deleteHeartbeatTask(id);
         notify();
         return JSON.stringify({ ok: true, completed: id, name: t.name });
       }
       if (!args.id) return JSON.stringify({ ok: false, error: '需要 id（先 list）' });
+      const owned = await getHeartbeatTask(args.id).catch(() => null);
+      if (!owned || !taskBelongsToProject(owned, pid)) {
+        return JSON.stringify({ ok: false, error: `找不到任务 ${args.id}` });
+      }
       if (action === 'delete') {
         await deleteHeartbeatTask(args.id);
         notify();
@@ -25721,10 +26569,12 @@ async function executeToolCall(name, args, ctx = {}) {
     }
     case 'submit_report': {
       if (!ctx.subagentKind) return JSON.stringify({ ok: false, error: 'submit_report 仅供 Sub 使用。' });
-      const checked = validateTaskReport(args);
+      const checked = validateTaskReport(args, { requireFindings: !ctx.subagentBudgetForced });
       if (checked.error) return JSON.stringify({ ok: false, error: checked.error });
       ctx.submittedReport = checked.report;
-      return JSON.stringify({ ok: true, accepted: true, claims: checked.report.claims.length });
+      return JSON.stringify({
+        ok: true, accepted: true, claims: checked.report.claims.length, findings: checked.report.findings.length,
+      });
     }
     case 'section_job': {
       if (!ctx.subagentKind) return JSON.stringify({ ok: false, error: 'section_job 仅供 Sub 使用。' });
@@ -25736,6 +26586,11 @@ async function executeToolCall(name, args, ctx = {}) {
         return 'task 未就绪：子代理运行时没有加载。';
       }
       return runTaskToolImpl(args, ctx);
+    }
+    case 'write_document':
+    case 'compose_report': {
+      if (ctx.subagentKind) return JSON.stringify({ ok: false, error: 'write_document 仅供主代理使用。' });
+      return runDocumentWrite(args, ctx);
     }
     case 'plot_chart': {
       const built = buildPlotOption(args);
@@ -25781,7 +26636,7 @@ async function executeToolCall(name, args, ctx = {}) {
     case 'call_api': {
       const result = await executeApiCall(args, { subagentKind: ctx.subagentKind });
       const dumped = JSON.stringify(result);
-      return spillOversizedOutput(dumped, ctx, { title: 'call_api', url: result && result.url });
+      return spillOversizedOutput(dumped, ctx, { title: `call_api ${(result && result.url) || ''}`.slice(0, 80), url: (result && result.url) || '' });
     }
     default:
       return '未知工具: ' + name;
@@ -25830,9 +26685,16 @@ async function executeToolCall(name, args, ctx = {}) {
 // v34: 子代理 task（explore/general/browser + 自定义）；独立上下文、同轮并行、depth=1。
 // v31: 经验记忆按当前页 URL 前缀优先注入（url_prefixes）；tag 命中再加分。
 // v30: docx 编辑引擎迁入 SW（无需阅读器/编辑模式，每次修改即时落库并刷新阅读器）；
-//      doc_edit 新增 doc_id/track_changes（docx 文本修改默认修订痕迹）；doc_review 瘦身为
-//      修订管理（list/accept/reject），提出修订统一走 doc_edit；settings.xml 注入 trackChanges
-const PROMPT_PROTOCOL_VERSION = 'citecat-v47-2026-09-22';
+//      doc_edit 新增 doc_id/track_changes；doc_review 瘦身为修订管理。
+// v52: 前台 browser_act 在编号表后附上同一视口截图（本轮请求可见，不写入历史）。
+// v50: docx 默认直接写入并在对话修改卡展示；track_changes 仅在用户要求留痕时打开。
+//      doc_edit 增加 set_format（字体/字号/颜色/高亮/对齐/行距/缩进）。
+// v48: claim 带 modality/attribution/event_time；独立信源按原始发布方去重；子代理预算强制交回。
+// v49: 决策板（record_insight 仍有效条目）注入动态前言，清空对话后 AI 不失忆。
+// v53: 研究与写作分离：先定问题树/假设再派 task；子代理交 findings；调研报告走 compose_report。
+// v55: 成文走 write_document。explore 交原文段落，按体裁写一稿并对照原文改一稿。
+// v54: 主代理看到的 task 结果按判断分组，不再平铺 claims；verification 只留未通过项。
+const PROMPT_PROTOCOL_VERSION = 'citecat-v55-2026-10-14';
 
 const STATIC_PREFIX = `你是 Citecat，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
 
@@ -25851,7 +26713,8 @@ P4. **本地优先、联网兜底**：能在库中条目或 RSS 订阅库解决�
 | 当前网页 | 用户正在浏览的页面 | 「这个页面/这页/总结这个/分析这篇/收藏这页/滚动/点击」 | read_current_page / browser_act（点选填表）/ interact_page（逃生口） |
 | 多标签页 | 切换/打开/关闭/刷新标签页 | 「另一个标签页/切到/新开/关掉/刷新」 | manage_tabs(list 快照) + read_tab / read_many（无需切换）+ browser_act(tab_id=...)
 | 采集 | URL 或粘贴文本加入来源 | 用户给出 URL 或说「加入/入库/采集/收藏」 | collect_content → confirm_collect / cancel_collect |
-| AI 文档 | 生成报告/数据/文案存入产出 | 「整理/调研/写一份/导出数据/做个 Excel」 | create_document |
+| 文档 | 子代理交原文段落 → 按体裁成文 → 对照原文改一稿 → 存产出 | 「策划方案/纪要/研报/档案/对比/写一份」且已有段落 | write_document |
+| AI 文档 | 数据/文案存入产出 | 「整理/导出数据/做个 Excel/写个文案」 | create_document |
 | 画图 | 把已对齐的表画在对话里 | 「画个图/折线/柱状对比/标上事件」 | plot_chart |
 | 外部 API | Fed/数据库/交易所等 HTTPS 接口 | 「拉 FRED」「查这个 REST」「下单前先只读」 | call_api |
 | 交互 | 快捷按钮、范围确认、清上下文、压缩对话 | — | suggest_actions / ask_research_scope / clear_context / auto_compact |
@@ -25869,7 +26732,7 @@ P4. **本地优先、联网兜底**：能在库中条目或 RSS 订阅库解决�
 - **原文不进对话，进的是地址**：网页在你 read_tab / read_current_page 后自动落到工作区，结果里带 \`artifact.doc_id\`；来源条目（含 PDF/Word 全文）用 \`ingest(source=条目 id)\` 落库。之后要原文片段用 \`read_section(doc_id, chunk=N / page=N / offset=N)\` 按锚点回读，**不要重新开页面重读**。
 - **先查已有来源**：\`search_workspace(query)\` 在来源里按关键词找命中切片（返回 \`doc_id#cN\` 锚点）。调研前先搜一遍比重新联网便宜得多；query 留空 = 列出来源。
 - **结论进笔记本，不进对话**：\`notebook(action=add)\` 记 \`{claim, sources[]}\`——**sources 必填**（doc_id#锚点或 URL）。每轮调研先 \`notebook(action=list)\` 看已经确认了什么，避免重复读；结论变化用 update 改 status/confidence。
-- **只信运行时 Check**：task 返回的 \`verification\` 才是核验结果，忽略 Sub 正文中的“已核验”自称。只采用 \`entailment-pass/cross-source-pass\` claims；内容失败可带同一 task_id + revision=true 修正一次，基础设施失败普通续传且不消耗次数。
+- **阅读交回看覆盖**：explore 的 report 以 \`covered\` 和 \`unresolved\` 为准。\`covered\` 是已有原文的要点，\`passage_count\` 是段落条数。原文不进主对话。缺口还会改变文档做法时，只为缺口再派阅读。覆盖够了调用 \`write_document\`。
 
 ## RSS 查询工具用法（重要）
 - **想问「我订了哪些源」**：用 list_feeds（支持 name_contains、sort=title_asc；含 last_fetched_at）。
@@ -25923,9 +26786,16 @@ search_web 返回的是搜索结果摘要（标题+1-2句片段+URL），**不�
    - 纯文本 -> format="txt"
    - 旧版 **.doc / .xls 不要生成**。上传的 .xls 会转成 xlsx；上传的 .doc 用 doc_edit 时会转成 docx 再改，不要让用户点「转可编辑」
 3. **数据类文档**：爬取时用 interact_page/read_current_page 获取数据，整理为 structured_data（JSON 数组）传给 create_document。xlsx 不要把同一张表再写成 markdown content（content 写一句说明即可）。
-4. **报告类文档**：综合多个来源的信息，写成 markdown 格式的 content。docx 格式时尤其要用好 \`#\`/\`##\` 标题层级、\`-\` 列表、\`| 表格 |\`，这些会还原成 Word 的标题/列表/表格样式。
+4. **需要先读材料再成文的文档**一律用 \`write_document\`（见下节）。create_document 只写用户已经给了内容的整理，或数据表。docx 格式时用好 \`#\`/\`##\` 标题层级、\`-\` 列表、\`| 表格 |\`，这些会还原成 Word 的标题/列表/表格样式。
 5. 保存后用一句话告知用户已保存到工作区「产出」；xlsx/docx/md 可预览或导出。
 6. **update_entry 改 xlsx/docx 正文会重建原件**（xlsx 整表重写为单表）。局部改单元格/段落用 doc_edit，不要用 update_entry 做定点修改。
+
+## 成文（write_document）
+用户要的是一份按体裁写成的文档。策划方案就按策划方案写，纪要就按纪要写。
+1. **先派阅读**：任务书里写明体裁和要覆盖的要点。explore 只交原文段落。你看到的是 \`covered\` 和 \`unresolved\`。
+2. **缺口还在就再派**：只补 unresolved 里还会改变做法的要点，不要重做已经 covered 的。
+3. **覆盖够了调用 write_document**：\`genre\` 用用户要的体裁，\`brief\` 写清文档要做什么、怎样算好。写作阶段看不到对话。返回 \`need_reading\` 时文档没保存，只为那些要点再派阅读，然后再次调用。
+4. **之后回复用户**：一句「已保存」。不要在聊天里写正文，不要复述段落。
 
 ## 对话内画图（plot_chart）
 把**已经对齐**的小表画在当前对话里，用户能直接看到图，不要用 ASCII 或 Markdown 表格冒充图。
@@ -25950,8 +26820,8 @@ search_web 返回的是搜索结果摘要（标题+1-2句片段+URL），**不�
 阅读器地址是 \`chrome-extension://…/src/reader/index.html?doc=<id>\`，属于扩展内页：content script 不注入，\`interact_page\` 无效。读正文用 \`read_current_page\` / \`read_tab\`；改内容只用 \`doc_edit\`。
 
 1. **直接改，不必先读全文，不必进编辑模式**：doc_edit 每一步都会返回执行结果；需要确认文档内容时 read_tab(阅读器 tab_id)。首次编辑某文档时返回会附带 doc_digest，据此确认改的是哪个文档。
-2. **工具分派**：\`tool\` 按文档类型选——xlsx 用 set_range/set_bold/append_row/append_col/clear_range/switch_sheet；docx 与 .doc 用 replace_text/insert_text/set_bold/set_heading/add_list/add_table/set_cell；txt 用 replace_text/insert_text。通用 undo/redo/export。
-3. **docx 文本修改默认带修订痕迹（重要）**：replace_text / insert_text 默认以 Word 原生修订（删除线+插入标记+批注）呈现，\`note\` 写清楚修改理由，用户可在阅读器修订面板或 Word 里逐条接受/拒绝。**用户明确说"直接改/不用留痕"时才传 track_changes=false**。
+2. **工具分派**：\`tool\` 按文档类型选——xlsx 用 set_range/set_bold/append_row/append_col/clear_range/switch_sheet；docx 与 .doc 用 replace_text/insert_text/set_format/set_bold/set_heading/add_list/add_table/set_cell；txt 用 replace_text/insert_text。通用 undo/redo/export。
+3. **默认直接写入，对话里能看到改了什么**：replace_text / insert_text / set_format 写进文件，对话修改卡标「已写入」。向用户汇报改了哪几处即可，不要叫用户去 Word 里接受。**只有用户明确说留痕、修订、给别人审时**，replace_text / insert_text 才传 \`track_changes=true\`（此时卡片标「待审修订」）。格式用 \`set_format\`：字体、字号（磅）、加粗/斜体/下划线/删除线、颜色 \`#RRGGBB\`、高亮、对齐、行距倍数、段前段后和左缩进（磅）。没传的项保持原样。
 4. **公式直接写表达式**：xlsx 单元格填公式时 values 里写 \`"=SUM(A1:A3)"\` 这样的字符串；无头引擎按文本保存，Excel/WPS 打开后计算，不要手工算结果。不要为了算公式让用户点阅读器「编辑」。
 5. **一次改完批量汇报**：多个修改连续调用 doc_edit（无需每步停顿），最后用一句话汇总"改了什么、改在哪"。
 6. **保存**：docx / xlsx 每次修改已自动落库；需要下载到本地时调 doc_edit(tool=export)，或提醒用户点「保存」。
@@ -25959,7 +26829,7 @@ search_web 返回的是搜索结果摘要（标题+1-2句片段+URL），**不�
 8. **导出自证**：doc_edit(tool=export) 的响应会说明"导出文件含 N 条待审修订痕迹"，与 list_revisions 核对一致后再告诉用户下载完成；阅读器工具栏有「待审 N」徽标。
 
 ## 审阅修订管理（doc_review，重要）
-doc_review 只管**修订的查看与接受/拒绝**（docx，SW 引擎，无需阅读器/无需点「编辑」）；**提出修订统一走 doc_edit（track_changes 默认 true）**，不要再调 suggest_*（已移除）：
+doc_review 只管**已经写成修订痕迹的条目**的查看与接受/拒绝（docx，SW 引擎，无需阅读器/无需点「编辑」）。普通修改不要走这里，也不要再调 suggest_*：
 1. **查看**：list_revisions 列出全部修订及编号（find/replacement/note/status）。
 2. **处理**：accept(id | "all") / reject(id | "all") **只应在用户明确指示时调用**，不要替用户接受。
 3. **修订不落定**：保存文件保留修订痕迹（Word/WPS 打开仍可逐条审阅，且修订模式自动开启），不会自动接受。
@@ -26011,7 +26881,7 @@ doc_review 只管**修订的查看与接受/拒绝**（docx，SW 引擎，无需
 - **不要用 read_many 读超过 10 个标签页**；交互操作（点击/滚动触发懒加载）保持串行，避免页面状态竞争。
 
 ## Vision 视觉能力（三条渠道，重要）
-看真实浏览器页面时，截当前可见标签页发给视觉模型。当前渠道主模型若支持视觉则直接用它；只有主模型不能看图时才走设置里的外挂 Vision。三个动作：
+看真实浏览器页面时，截当前可见标签页发给当前渠道的主模型（需支持视觉）。三个动作：
 1. **vision_find**：DOM 找不到控件时，截图让 Vision 定位坐标并点击。升级顺序：browser_act → interact_page(cdp_click / ax_click) → vision_find。
 2. **vision_read**：截图让 Vision 回答关于当前页面的问题。用于：页面布局/类型判断、图片内容理解、复杂可视化读数、DOM 文本与视觉不符时核实。text=你的问题。
 3. **vision_extract**：逐屏截图 OCR 提取整页文字。**反爬兜底专用**：当 read_current_page / exec_js 拿到乱码（字体混淆）、空内容（Canvas/图片渲染文字）、或明显残缺时，用 vision_extract 走视觉提取。会自动滚动逐屏截图拼接。
@@ -26040,8 +26910,8 @@ doc_review 只管**修订的查看与接受/拒绝**（docx，SW 引擎，无需
 2. **多步是常态**：一个调研任务调用 10-20 次工具完全正常。不要做 2-3 步就停下来说"以上是初步结果"。
 3. **深入而非浅尝**：多来源/多维度的全文阅读派 explore 去做；你综合它们交回的摘要。针孔查询（一搜或只读当前页）才自己做。
 4. **遇阻换路不放弃**：工具失败时换参数、换方法、换工具，不要一次失败就放弃整个任务。
-5. **完成标志**：任务完成 = 已拿到用户需要的全部信息（自己读的或子代理交回的）并已通过 create_document 保存或完整汇报。做了一步不算完成。
-6. **汇报简洁但执行深入**：执行时多步深入，但最终汇报简洁--用户要的是结果，不是过程。
+5. **完成标志**：用户要文档时，完成 = write_document 已保存。做了一步阅读不算完成。
+6. **汇报讲结论不讲过程**：执行时多步深入；最终汇报不复述你调了哪些工具、读了哪些页，而是给结论和判断。简洁指不讲过程，不是把分析砍成一张证据清单。
 
 ## 经验记忆系统（save_memory）
 你有长期记忆能力。系统会在每轮对话前自动注入相关历史经验：当前页 URL 命中记忆的网站前缀时该站经验会优先出现（即使用户没提站名）；用户消息命中 domain/tags 再加分。
@@ -26054,7 +26924,7 @@ doc_review 只管**修订的查看与接受/拒绝**（docx，SW 引擎，无需
 ## 心跳定时任务（manage_heartbeat）
 用户要求定时/每隔/每天/每周/某天做某事时，用 manage_heartbeat 真正创建任务，不要只口头答应。
 - create：name 短标题 + prompt 写成可直接执行的指令 + **时间字段五选一**（本地时区）：\`time\`=每天 09:00；\`time\`+\`weekdays\`=[1,3,5]=每周一三五；\`at\`="2026-09-15T09:00"=一次性（跑完自动停用，不能是过去）；\`every\`="30m"/"3h"/"1d"=固定间隔；上面都表达不了才用 \`cron\`="0 9 * * 1-5"（分 时 日 月 周）。
-- 最短间隔 5 分钟；改时间用 update（传新的时间字段即可）；暂时关掉用 pause。
+- 最短间隔 5 分钟；改时间用 update（传新的时间字段即可）；暂时关掉用 pause。任务跟当前项目走，list/改删只碰本项目。
 - **不确定哪天发生的事**（「会议 1 月开，帮我盯着」）：用 \`time\`/\`every\` 反复查 + \`until\`="2026-01-31" 兜底，prompt 里写「一旦确认到日期就调 manage_heartbeat(action="complete") 结束本任务」；到期未达成会自动停用并保留，不会静默消失。
 - 到期后系统会把 prompt 当作一轮对话执行（侧栏关闭则排队，打开后跑）。prompt 里写清要用哪些工具（例如 list_feeds + query_feed_items）。
 
@@ -26065,7 +26935,7 @@ doc_review 只管**修订的查看与接受/拒绝**（docx，SW 引擎，无需
 
 **自己做**：一次 search_web 摘要就够、只读当前页、改一个已勾选条目。
 
-**并行与任务书**：同一条消息可多个 task（最多 {{SUBAGENT_MAX_PARALLEL}}）；先派 {{SUBAGENT_MAX_PARALLEL}} 个，覆盖不全再补一波——只补缺口，不要重做已经拿到的。也可夹杂 read_current_page 等无依赖工具。prompt 写清范围、要核查的 claims 与允许的操作；子代理必须 submit_report，系统随后强制 Check。只根据运行时 verification 总结，失败项不要当事实。task_id 可续传；内容修正显式 revision=true 且最多一次；后台不要轮询。浮动窗会忽略 background 并前台等完。
+**并行与任务书**：同一条消息可多个 task（最多 {{SUBAGENT_MAX_PARALLEL}}）；先派 {{SUBAGENT_MAX_PARALLEL}} 个，覆盖不全再补一波——只补缺口，不要重做已经拿到的。也可夹杂 read_current_page 等无依赖工具。阅读任务的 prompt 写明体裁和要覆盖的要点。explore 交回 covered / unresolved。后台不要轮询。浮动窗会忽略 background 并前台等完。
 
 ## 采集纪律（两阶段 + 逐条串行）
 1. \`collect_content\` 只做暂存；\`confirm_collect\` 才真正入库；\`cancel_collect\` 丢弃暂存。系统同一时刻只保留一条暂存内容，暂存被覆盖前必须结算上一条。
@@ -26099,6 +26969,8 @@ doc_review 只管**修订的查看与接受/拒绝**（docx，SW 引擎，无需
 用户请求涉及页面操作时，先判断属于哪类原语，再选工具：
 1. **ACT（操作）**——用户要"点击/输入/选择/滚动/提交/勾选"等动作。
    - 默认 \`browser_act\`：先 observe（或沿用上一张自动返回的表），再 click/type/select 编号。不要 number_elements。
+   - 目标标签已在前台时，编号表后会附上同一视口截图（只在本轮请求里，不写入历史）。后台标签只有表，不要为了截图去切换用户正在看的页。
+   - 点选优先用编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。
    - 控件不在视口：scroll_down/up。页面还在加载：wait。
    - 点不动/表为空/反爬再升级：interact_page 的 cdp_click → ax_click → vision_find。
 2. **EXTRACT（提取）**——用户要"读取/总结/获取/列出"页面或库中的信息。
@@ -26152,6 +27024,7 @@ function buildDynamicPreamble({
   agentCatalog,
   mentionedAgents,
   notebookNotes,
+  insights,
   plan,
   apiCatalog,
 }) {
@@ -26181,6 +27054,12 @@ function buildDynamicPreamble({
   if (nbBlock) {
     parts.push('');
     parts.push(nbBlock);
+  }
+
+  const insightBlock = formatInsightDigest(insights);
+  if (insightBlock) {
+    parts.push('');
+    parts.push(insightBlock);
   }
 
   if (agentCatalog) {
@@ -26225,21 +27104,44 @@ const SECTION_JOB_TOOL = {
   function: {
     name: 'section_job',
     description:
-      '把已经进入来源库的长文档片段交给无状态章节 Worker 抽取。仅在单篇 PDF/长文超出当前上下文时使用；可在同一轮并行多个不同章节。返回带逐字引文的结构化 claims。',
+      '把已经进入来源库的长文档片段交给无状态章节 Worker 抽取。仅在单篇 PDF/长文超出当前上下文时使用；可在同一轮并行多个不同章节。返回带逐字引文的结构化 claims。'
+      + `单次最多读 ${SECTION_WORKER_MAX_CHARS} 字。结果里 content_has_more=true 时，用相同 doc_id 与 goal，只传 offset=content_next_offset 再调，直到 content_has_more=false。这是分页，不是文件上限。`,
     parameters: {
       type: 'object',
       properties: {
         doc_id: { type: 'string' },
-        chunk: { type: 'number', description: '块号，0 起。' },
-        page: { type: 'number', description: 'PDF 页码，1 起。' },
-        offset: { type: 'number', description: '字符偏移。' },
-        max_chars: { type: 'number', description: `本作业最多读取字符数，上限 ${SECTION_WORKER_MAX_CHARS}。` },
-        goal: { type: 'string', description: '本章节要找什么；必须具体。' },
+        chunk: { type: 'number', description: '块号，0 起。续拉时不要传。' },
+        page: { type: 'number', description: 'PDF 页码，1 起。续拉时不要传。' },
+        offset: { type: 'number', description: '字符偏移。续拉时传上一次的 content_next_offset。' },
+        max_chars: { type: 'number', description: `单次分页大小，默认且不超过 ${SECTION_WORKER_MAX_CHARS}。` },
+        goal: { type: 'string', description: '本章节要找什么；必须具体。续拉时保持不变。' },
       },
       required: ['doc_id', 'goal'],
     },
   },
 };
+
+/** 把 readSection 的分页字段收成与 read_tab 相同的续拉游标。 */
+function sectionJobCursor(section = {}) {
+  const hasMore = !!section.has_more && section.next_offset != null;
+  const cursor = {
+    content_returned: Number(section.chars) || String(section.text || '').length,
+    content_has_more: hasMore,
+  };
+  if (Number.isFinite(Number(section.offset))) cursor.content_offset = Number(section.offset);
+  if (Number.isFinite(Number(section.total))) cursor.content_total = Number(section.total);
+  if (hasMore) cursor.content_next_offset = section.next_offset;
+  return cursor;
+}
+
+function withCursor(payload, section) {
+  const cursor = sectionJobCursor(section);
+  const body = { ...payload, ...cursor };
+  if (cursor.content_has_more) {
+    body.hint = '正文未读完。用相同 doc_id 和 goal，只传 offset=content_next_offset 再调用 section_job，直到 content_has_more=false。';
+  }
+  return JSON.stringify(body);
+}
 
 function assistantToolMessage(result) {
   return {
@@ -26268,11 +27170,17 @@ async function runSectionJob(args = {}, ctx = {}) {
     return JSON.stringify({ ok: false, error: `${docId} 不是可核验来源；AI 产出、自由文本和 derived 材料不能派章节作业。` });
   }
 
-  const section = await readSection(docId, {
+  const pageSize = Math.min(SECTION_WORKER_MAX_CHARS, Math.max(1000, Number(args.max_chars) || SECTION_WORKER_MAX_CHARS));
+  // 续拉偏移优先：否则带着上一次的 page/chunk 会从该页开头重读，游标失效。
+  const continuing = Number(args.offset) > 0;
+  const section = await readSection(docId, continuing ? {
+    offset: args.offset,
+    maxChars: pageSize,
+  } : {
     chunk: args.chunk,
     page: args.page,
     offset: args.offset,
-    maxChars: Math.min(SECTION_WORKER_MAX_CHARS, Math.max(1000, Number(args.max_chars) || SECTION_WORKER_MAX_CHARS)),
+    maxChars: pageSize,
   });
   if (section.error) return JSON.stringify({ ok: false, error: section.error });
 
@@ -26294,7 +27202,8 @@ async function runSectionJob(args = {}, ctx = {}) {
       content:
         '你是 Citecat 的无状态章节抽取 Worker。只处理给定原文，不得使用外部知识。'
         + '完成时必须调用 submit_report：actions=[]；每条 claim 的 evidence 必须使用系统给定 doc_id、anchor，并从原文逐字复制 quote。'
-        + '原文没有直接支持的内容放 unresolved。不要输出长篇正文。',
+        + '每条 claim 写 attribution（原文里最初说这话的主体）与 modality；当事方说法用 claimed、转述用 reported，不要写成 confirmed。'
+        + '原文没有直接支持的内容放 unresolved。给你的原文可能只是文件中的一段，只抽取这一段，不要声称文件到此结束。不要输出长篇正文。',
     },
     {
       role: 'user',
@@ -26310,12 +27219,12 @@ async function runSectionJob(args = {}, ctx = {}) {
       if (submit) {
         const checked = validateTaskReport(submit.arguments);
         if (!checked.error) {
-          return JSON.stringify({
+          return withCursor({
             ok: true,
             doc_id: docId,
             anchor: section.anchor,
             report: checked.report,
-          });
+          }, section);
         }
         messages.push(assistantToolMessage(result));
         messages.push({ role: 'tool', tool_call_id: submit.id, content: JSON.stringify({ ok: false, error: checked.error }) });
@@ -26324,10 +27233,15 @@ async function runSectionJob(args = {}, ctx = {}) {
       messages.push({ role: 'assistant', content: result.content || '' });
       messages.push({ role: 'user', content: '[RUNTIME] 必须调用 submit_report 提交；不要输出自然语言报告。' });
     }
-    return JSON.stringify({ ok: false, error: '章节 Worker 未提交结构化结果。', doc_id: docId, anchor: section.anchor });
+    return withCursor({ ok: false, error: '章节 Worker 未提交结构化结果。', doc_id: docId, anchor: section.anchor }, section);
   } catch (error) {
     const timeout = controller.signal.aborted && !(parentSignal && parentSignal.aborted);
-    return JSON.stringify({ ok: false, error: timeout ? '章节 Worker 超时。' : (error.message || String(error)), doc_id: docId, anchor: section.anchor });
+    return withCursor({
+      ok: false,
+      error: timeout ? '章节 Worker 超时。' : (error.message || String(error)),
+      doc_id: docId,
+      anchor: section.anchor,
+    }, section);
   } finally {
     clearTimeout(timer);
     if (parentSignal) parentSignal.removeEventListener('abort', onAbort);
@@ -26389,6 +27303,108 @@ function evidenceExcerpt(text, maxChars = 500) {
   return clean.length > maxChars ? `${clean.slice(0, maxChars)}…` : clean;
 }
 
+/**
+ * 独立信源计数。
+ *
+ * 只按网站域名计数会把转载算成交叉印证：雅虎转路透、五家媒体引同一份国防部声明，
+ * 在情报上都只算一个来源（循环报道）。这里做两步归并：
+ *   1. 身份：发布方名称优先，其次可注册主域名（news.bbc.co.uk 与 bbc.co.uk 同源）。
+ *   2. 文本：不同身份但引文几乎一样（通稿 / 转载），视为同一原始来源。
+ */
+
+
+const SECOND_LEVEL = new Set(['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'mil', 'or', 'ne', 'go']);
+const SYNDICATION_JACCARD = 0.6;
+const MIN_QUOTE_CHARS = 24;
+
+function registrableDomain(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
+  if (!host || /^\d+(\.\d+){3}$/.test(host)) return host;
+  const parts = host.split('.');
+  if (parts.length <= 2) return host;
+  const tld = parts[parts.length - 1];
+  const sld = parts[parts.length - 2];
+  if (tld.length === 2 && SECOND_LEVEL.has(sld)) return parts.slice(-3).join('.');
+  return parts.slice(-2).join('.');
+}
+
+function normalizePublisher(name) {
+  return String(name || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s·・.,，。"'“”‘’()（）-]+/g, '')
+    .trim();
+}
+
+/** 证据的来源身份：`pub:<发布方>` 或 `dom:<主域名>`，都取不到时回落 doc 级 id。 */
+function sourceIdentityOf({ publisher = '', url = '', fallback = '' } = {}) {
+  const pub = normalizePublisher(publisher);
+  if (pub) return `pub:${pub}`;
+  try {
+    if (url) return `dom:${registrableDomain(new URL(url).hostname)}`;
+  } catch (_) { /* ignore */ }
+  return fallback ? `doc:${fallback}` : '';
+}
+
+function shingles(text, n = 3) {
+  const t = normalizeQuoteText(text).toLowerCase().replace(/\s+/g, '');
+  const out = new Set();
+  for (let i = 0; i + n <= t.length; i++) out.add(t.slice(i, i + n));
+  return out;
+}
+
+function quoteSimilarity(a, b) {
+  const na = normalizeQuoteText(a).toLowerCase();
+  const nb = normalizeQuoteText(b).toLowerCase();
+  if (!na || !nb) return 0;
+  if (na.length >= MIN_QUOTE_CHARS && nb.length >= MIN_QUOTE_CHARS && (na.includes(nb) || nb.includes(na))) return 1;
+  const sa = shingles(na);
+  const sb = shingles(nb);
+  if (!sa.size || !sb.size) return 0;
+  let inter = 0;
+  for (const s of sa) if (sb.has(s)) inter += 1;
+  return inter / (sa.size + sb.size - inter);
+}
+
+/**
+ * @param {Array<{sourceIdentity?: string, evidence?: {quote?: string}}>} passed 已通过引文核验的证据
+ * @returns {{count: number, groups: string[][]}} 独立来源数与每组包含的身份
+ */
+function independentSources(passed = []) {
+  const items = (passed || []).filter((e) => e && e.sourceIdentity);
+  const ids = [...new Set(items.map((e) => e.sourceIdentity))];
+  const parent = new Map(ids.map((id) => [id, id]));
+  const find = (x) => {
+    while (parent.get(x) !== x) {
+      parent.set(x, parent.get(parent.get(x)));
+      x = parent.get(x);
+    }
+    return x;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      const a = items[i];
+      const b = items[j];
+      if (a.sourceIdentity === b.sourceIdentity) continue;
+      const qa = a.evidence && a.evidence.quote;
+      const qb = b.evidence && b.evidence.quote;
+      if (qa && qb && quoteSimilarity(qa, qb) >= SYNDICATION_JACCARD) union(a.sourceIdentity, b.sourceIdentity);
+    }
+  }
+  const groups = new Map();
+  for (const id of ids) {
+    const r = find(id);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(id);
+  }
+  return { count: groups.size, groups: [...groups.values()] };
+}
+
 function selectorFromAnchor(anchor) {
   const value = String(anchor || '').replace(/^.*#/, '').trim();
   if (/^c\d+$/i.test(value)) return { chunk: Number(value.slice(1)) };
@@ -26397,11 +27413,10 @@ function selectorFromAnchor(anchor) {
   return null;
 }
 
-function sourceIdentity(doc) {
-  try {
-    if (doc.url) return new URL(doc.url).hostname.replace(/^www\./, '').toLowerCase();
-  } catch (_) {}
-  return doc.sourceEntryId || doc.docId;
+function sourceIdentity(doc, publisherOf) {
+  let publisher = '';
+  try { publisher = (typeof publisherOf === 'function' && publisherOf(doc)) || ''; } catch (_) { /* ignore */ }
+  return sourceIdentityOf({ publisher, url: doc.url, fallback: doc.sourceEntryId || doc.docId });
 }
 
 async function sha256Hex(text) {
@@ -26410,7 +27425,7 @@ async function sha256Hex(text) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function verifyEvidence(evidence, { projectId = '' } = {}) {
+async function verifyEvidence(evidence, { projectId = '', publisherOf = null } = {}) {
   const docId = String(evidence.doc_id || '');
   const selector = selectorFromAnchor(evidence.anchor);
   if (!docId || !selector) {
@@ -26500,7 +27515,7 @@ async function verifyEvidence(evidence, { projectId = '' } = {}) {
     evidence,
     checkedAnchor: section.anchor,
     contentHash: doc.contentHash || '',
-    sourceIdentity: sourceIdentity(doc),
+    sourceIdentity: sourceIdentity(doc, publisherOf),
     sourceUrl: doc.url || '',
     match,
   };
@@ -26572,13 +27587,18 @@ async function judgeBatch(items, apiConfig, parentSignal, ctx) {
       content:
         '你是严格的证据蕴含判定器。不得使用外部知识。只判断 CLAIM 是否由 QUOTES 直接支持：'
         + 'entails=完整直接支持；overclaim=方向相关但加入引文没有的范围/因果/数字；'
-        + 'contradicts=引文明示相反；unclear=无法判断。必须调用 submit_verdicts。',
+        + 'contradicts=引文明示相反；unclear=无法判断。'
+        + '每条还带 attribution（说话主体）与 modality（confirmed/claimed/reported/denied/assessed/speculative）。'
+        + '把它们当作 CLAIM 的一部分一起判：modality=confirmed 但引文只显示某方声称、媒体转述或匿名消息，判 overclaim；'
+        + 'attribution 与引文里的说话主体不符，判 overclaim。必须调用 submit_verdicts。',
     },
     {
       role: 'user',
       content: JSON.stringify(items.map((item) => ({
         id: item.id,
         claim: item.claim,
+        attribution: item.attribution || '',
+        modality: item.modality || 'reported',
         quotes: item.quotes,
       }))),
     },
@@ -26622,7 +27642,7 @@ async function judgeEntailment(items, apiConfig, signal, ctx) {
   return { verdicts: out, usage };
 }
 
-const CHECKER_VERSION = 'citecat-check-v1';
+const CHECKER_VERSION = 'citecat-check-v2';
 
 function newCheckRunId() {
   return `chk_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -26639,30 +27659,57 @@ function deriveClaimVerdict(citationResult, entailment) {
   if (!entailment || entailment.verdict === 'unclear') return 'source-unverified';
   if (entailment.verdict === 'overclaim') return 'overclaim';
   if (entailment.verdict === 'contradicts') return 'source-conflict';
-  const independent = new Set(citationResult.passed.map((e) => e.sourceIdentity).filter(Boolean));
-  return independent.size >= 2 ? 'cross-source-pass' : 'entailment-pass';
+  return independentSources(citationResult.passed).count >= 2 ? 'cross-source-pass' : 'entailment-pass';
 }
 
+/** 来源条目的发布方名称（AI 摘要阶段写入 entry.source / provenance.publisher）。 */
+async function loadPublisherResolver(projectId) {
+  let entries = [];
+  try { entries = await getEntries(projectId || 'default'); } catch (_) { return null; }
+  const byId = new Map();
+  for (const e of entries || []) {
+    const name = (e && e.provenance && e.provenance.publisher) || (e && e.source) || '';
+    if (e && e.id && name) byId.set(e.id, name);
+  }
+  if (!byId.size) return null;
+  return (doc) => byId.get(doc.sourceEntryId) || '';
+}
+
+/**
+ * @param {object} report validateTaskReport 之后的报告
+ * @param {object} opts
+ * @param {object} opts.apiConfig      撰写报告的模型（审查模型未配置时兜底）
+ * @param {object} [opts.judgeApiConfig] 独立审查模型；与撰写者同一模型时判定错误是相关的
+ */
 async function runCheckPipeline(report, {
   projectId = '',
   apiConfig = null,
+  judgeApiConfig = null,
   signal,
   ctx,
 } = {}) {
   const claims = (report?.claims || []).slice(0, CHECK_MAX_CLAIMS);
+  const publisherOf = await loadPublisherResolver(projectId);
   const citationResults = [];
   for (const claim of claims) {
-    citationResults.push(await verifyClaimCitations(claim, { projectId }));
+    citationResults.push(await verifyClaimCitations(claim, { projectId, publisherOf }));
   }
+
+  const judgeCfg = judgeApiConfig && judgeApiConfig.apiKey ? judgeApiConfig : apiConfig;
+  const sameModelJudge = !judgeApiConfig || !judgeApiConfig.apiKey
+    || (String(judgeApiConfig.model || '') === String(apiConfig?.model || '')
+      && String(judgeApiConfig.baseUrl || '') === String(apiConfig?.baseUrl || ''));
 
   const judgeItems = citationResults
     .filter((item) => item.citation === 'citation-pass')
     .map((item) => ({
       id: item.claim.id,
       claim: item.claim.claim,
+      attribution: item.claim.attribution || '',
+      modality: item.claim.modality || 'reported',
       quotes: item.passed.map((e) => e.evidence.quote),
     }));
-  const judged = await judgeEntailment(judgeItems, apiConfig, signal, ctx);
+  const judged = await judgeEntailment(judgeItems, judgeCfg, signal, ctx);
 
   const checkedClaims = citationResults.map((item) => {
     const entailment = judged.verdicts.get(item.claim.id) || null;
@@ -26671,10 +27718,14 @@ async function runCheckPipeline(report, {
     return {
       id: item.claim.id,
       claim: item.claim.claim,
+      attribution: item.claim.attribution || '',
+      modality: item.claim.modality || 'reported',
+      eventTime: item.claim.event_time || '',
       confidence: item.claim.confidence,
       verdict,
       citation: item.citation,
       entailment: entailment?.verdict || 'skipped',
+      independentSources: independentSources(item.passed).count,
       reason: entailment?.reason || item.evidence.find((e) => e.status !== 'citation-pass')?.reason || '',
       infrastructureError: citationInfrastructure || !!entailment?.infrastructure,
       evidence: item.evidence,
@@ -26696,6 +27747,8 @@ async function runCheckPipeline(report, {
     checkRunId: newCheckRunId(),
     checkerVersion: CHECKER_VERSION,
     checkedAt: Date.now(),
+    judgeModel: judgeCfg?.model || '',
+    sameModelJudge,
     taskClaimCount: claims.length,
     claims: checkedClaims,
     counts: countByVerdict(checkedClaims),
@@ -26706,31 +27759,50 @@ async function runCheckPipeline(report, {
   };
 }
 
+const PASS_VERDICTS = new Set(['entailment-pass', 'cross-source-pass']);
+
+function failureForMain(c) {
+  return {
+    id: c.id,
+    claim: c.claim,
+    ...(c.attribution ? { attribution: c.attribution } : {}),
+    modality: c.modality || 'reported',
+    verdict: c.verdict,
+    independent_sources: Number(c.independentSources) || 0,
+    reason: c.reason,
+    sources: (c.evidence || [])
+      .filter((e) => e.status === 'citation-pass')
+      .map((e) => `${e.evidence.doc_id}#${e.evidence.anchor}`),
+    failure_evidence: (c.evidence || [])
+      .filter((e) => e.status !== 'citation-pass')
+      .map((e) => ({
+        source: `${e.evidence?.doc_id || ''}#${e.evidence?.anchor || ''}`,
+        reason: e.reason,
+        excerpt: e.excerpt || '',
+      })),
+  };
+}
+
+/** 主代理只看未通过项。通过的主张在 report.findings 里，完整核验留在子会话。 */
 function verificationForMain(verification) {
   if (!verification) return null;
+  const failures = (verification.claims || [])
+    .filter((c) => !PASS_VERDICTS.has(c.verdict))
+    .map(failureForMain);
   return {
     check_run_id: verification.checkRunId,
     checker: verification.checkerVersion,
     checked_at: verification.checkedAt,
+    ...(verification.sameModelJudge
+      ? { judge_note: '审查与撰写是同一模型，蕴含判定可能偏宽；高影响结论请人工点开锚点复核。' }
+      : {}),
     counts: verification.counts,
     content_failure: verification.contentFailure,
     infrastructure_failure: verification.infrastructureFailure,
-    claims: verification.claims.map((c) => ({
-      id: c.id,
-      claim: c.claim,
-      verdict: c.verdict,
-      reason: c.reason,
-      sources: c.evidence
-        .filter((e) => e.status === 'citation-pass')
-        .map((e) => `${e.evidence.doc_id}#${e.evidence.anchor}`),
-      failure_evidence: c.evidence
-        .filter((e) => e.status !== 'citation-pass')
-        .map((e) => ({
-          source: `${e.evidence?.doc_id || ''}#${e.evidence?.anchor || ''}`,
-          reason: e.reason,
-          excerpt: e.excerpt || '',
-        })),
-    })),
+    note: failures.length
+      ? 'failures 是未通过核验的主张，不要写成事实。其余主张已通过，写在 report.findings 的 supporting / contradicting 里。'
+      : '没有未通过项。report.findings 下的事实已通过核验，可以引用，仍须保留 modality。',
+    failures,
   };
 }
 
@@ -26747,11 +27819,14 @@ const BUILTIN_AGENTS = [
       '只读调研。当需要多路检索、多源读全文、或检索会刷爆主对话时主动使用（不必等用户 @）。' +
       '不能点击/填表/入库/改文档。一次 search_web 或只读当前页不必用。',
     prompt:
-      '你是只读调研子代理。目标：按父代理的任务搜集事实并交回结构化报告。\n' +
+      '你是只读调研子代理。目标：按任务书里的要点收集可直接写进文档的原文段落。\n' +
+      '- 交回 passages：每条写 use（对应哪一条要点）、doc_id、anchor、逐字 quote。claims 传空数组，不要写 findings。\n' +
+      '- 长文档用 section_job。返回 content_has_more=true 时，用相同 doc_id 与 goal、只传 offset=content_next_offset 续拉，直到 false，再把 quote 收进 passages。\n' +
       '- 任务涉及订阅/RSS/信源/我订的：先 list_feeds / query_feed_items；用户要「最新」时先 refresh_feeds。本地订阅不够再 search_web。\n' +
-      '- 其他调研优先 search_web 拿 URL，再用 manage_tabs(open) 开新标签（后台，不抢用户当前页）+ read_tab(tab_id) 读全文。\n' +
+      '- 其他调研优先 search_web 拿 URL，再用 manage_tabs(open) 开新标签（后台，不抢用户当前页）+ read_tab(tab_id) 读全文。已入库材料用 search_workspace / read_section。\n' +
       '- 公开 HTTP API（含已保存的免费渠道）用 call_api GET；目录里有的优先 connector=名称。不要把密钥写进参数。写入/save 连接交给父代理。\n' +
       '- 任务结束会自动关掉你开过的页；读完也可立刻 manage_tabs(close, tab_id)。\n' +
+      '- 查过但没有原文的要点写进 unresolved。summary 只列覆盖了哪些 use。\n' +
       '- 禁止 click/type/采集/写库/编辑文档。不要 switch 用户正在看的标签。\n' +
       '- 完成后必须调用 submit_report；自然语言正文不算交回。不要向用户打招呼。',
     tools: [...EXPLORE_TOOLS],
@@ -26777,7 +27852,8 @@ const BUILTIN_AGENTS = [
     prompt:
       '你是页面自动化子代理。目标：在真实标签页上完成父代理交代的操作并交回结果。\n' +
       '- 默认只用 browser_act：系统会先给你一张视口控件表；每步 click/type/select/scroll/wait/navigate 后自动返回新表。\n' +
-      '- click/type/select 只能用表里的编号。不要 number_elements，不要发明 CSS/坐标/JS。\n' +
+      '- 目标标签已在前台时，编号表后会附上同一视口截图。后台标签只有表，不要为了截图去切换用户正在看的页。\n' +
+      '- click/type/select 只能用表里的编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。不要 number_elements，不要发明 CSS/JS。\n' +
       '- 字段已经是目标值就不要再填。TYPE 之后若出现建议列表，再 click 对应建议。\n' +
       '- 需要的控件不在视口里：scroll_down/up。页面还在加载：wait。证据已可见：submit_report。\n' +
       '- 连续失败或表为空/反爬：再改用 interact_page 的 cdp_click / vision_find / capture_network / exec_js_main。\n' +
@@ -26887,26 +27963,42 @@ function ensureRuntime(ctx) {
   return ctx;
 }
 
-async function resolveSubagentApiConfig(ctx, agent) {
-  if (agent && agent.channelId) {
-    try {
-      const chans = await getAiChannels();
-      const cur = (chans || []).find((c) => c.id === agent.channelId);
-      if (cur && (cur.apiKey || cur.baseUrl)) {
-        const active = resolveChannelModel(cur);
-        const ctxRaw = Number(active.contextTokens ?? cur.contextTokens);
-        return {
-          apiKey: cur.apiKey || '',
-          baseUrl: cur.baseUrl || '',
-          model: active.name || cur.model || '',
-          protocol: cur.protocol || 'openai',
-          contextTokens: Number.isFinite(ctxRaw) ? ctxRaw : ctx.apiConfig && ctx.apiConfig.contextTokens,
-          effort: active.effort || cur.effort || '',
-        };
-      }
-    } catch (_) {}
+async function channelApiConfig(channelId, fallbackContextTokens) {
+  if (!channelId) return null;
+  try {
+    const chans = await getAiChannels();
+    const cur = (chans || []).find((c) => c.id === channelId);
+    if (!cur || !(cur.apiKey || cur.baseUrl)) return null;
+    const active = resolveChannelModel(cur);
+    const ctxRaw = Number(active.contextTokens ?? cur.contextTokens);
+    return {
+      apiKey: cur.apiKey || '',
+      baseUrl: cur.baseUrl || '',
+      model: active.name || cur.model || '',
+      protocol: cur.protocol || 'openai',
+      contextTokens: Number.isFinite(ctxRaw) ? ctxRaw : fallbackContextTokens,
+      effort: active.effort || cur.effort || '',
+    };
+  } catch (_) {
+    return null;
   }
-  return ctx.apiConfig;
+}
+
+async function resolveSubagentApiConfig(ctx, agent) {
+  const fromChannel = await channelApiConfig(agent && agent.channelId, ctx.apiConfig && ctx.apiConfig.contextTokens);
+  return fromChannel || ctx.apiConfig;
+}
+
+/** Check 审查模型：设置里指定了渠道就用它，否则返回 null（由 Check 回落到撰写模型并打标）。 */
+async function resolveJudgeApiConfig(ctx, limits) {
+  return channelApiConfig(limits && limits.checkChannelId, ctx.apiConfig && ctx.apiConfig.contextTokens);
+}
+
+function budgetState(budget, usedTokens, startedAt) {
+  const tokenRatio = budget.tokens > 0 ? usedTokens / budget.tokens : 0;
+  const timeRatio = budget.ms > 0 ? (Date.now() - startedAt) / budget.ms : 0;
+  const ratio = Math.max(tokenRatio, timeRatio);
+  return { ratio, by: tokenRatio >= timeRatio ? 'token' : 'time' };
 }
 
 async function closeSubagentTabs(ctx) {
@@ -26951,22 +28043,32 @@ function childSystemPrompt(agent, maxTabs = SUBAGENT_MAX_TABS) {
     '经验记忆只读：系统会按当前页与任务自动注入相关条目（如有）。不要调用 save_memory；值得记的经验写进给父代理的报告即可。',
     `标签预算：同时最多打开 ${maxTabs} 个标签页。读完不需要的先 manage_tabs(close, tab_id) 关掉再开新的——读过的内容仍在你的上下文里，不必为留着标签而占额度。`,
     '任务完成后必须调用 submit_report。自然语言正文、Markdown 或自称“已完成”都不算交回。',
-    '事实拆成 claims；每条 evidence 必须给 doc_id、锚点和来源逐字 quote。只有 URL、标签页 id 或转述的内容放 unresolved，不得伪造证据。',
-    '单篇长文档超出当前上下文时可调用 section_job；它只读指定 doc_id 的章节并返回结构化 claims。不要用它代替普通网页检索。',
-    '操作型任务把已执行动作与产物引用写入 actions；没有事实 claim 时 claims 可以为空。',
+    ...(agent.name === 'explore'
+      ? [
+        '阅读交回使用 passages：每条包含 use、doc_id、anchor、逐字 quote。claims 传空数组，不要写 findings。',
+        '查过但没有原文的要点写进 unresolved。summary 只列覆盖了哪些 use，不要写文档正文。',
+      ]
+      : [
+        '事实拆成 claims；每条 evidence 必须给 doc_id、锚点和来源逐字 quote。只有 URL、标签页 id 或转述的内容放 unresolved，不得伪造证据。',
+        '每条 claim 写明 attribution（最初是谁说的，不是转载网站）与 modality。当事方的说法是 claimed，媒体转述是 reported，不要把它们写成 confirmed；claim 句子本身也要保留“X 称”。',
+        '查过但没找到的方向也写进 unresolved。操作型任务把已执行动作写入 actions；没有事实 claim 时 claims 可以为空。',
+      ]),
+    '单篇长文档超出当前上下文时可调用 section_job。'
+      + '返回 content_has_more=true 时，用相同 doc_id 与 goal、只传 offset=content_next_offset 续拉，直到 content_has_more=false。'
+      + '阅读任务把其中的逐字 quote 收进 passages。不要用它代替普通网页检索。',
     '禁止把网页原文或大段摘录粘进 summary；长材料只通过 evidence 锚点引用。',
     '',
     agent.prompt || '',
   ].join('\n');
 }
 
-async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tools) {
+async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tools, limits) {
   const messages = session.messages;
   if (messages.length === 0) {
     const storedTabs = Number(ctx && ctx.subagentMaxTabs);
     const maxTabs = Number.isFinite(storedTabs) && storedTabs >= 1
       ? clampSubagentMaxTabs(storedTabs)
-      : (await getSubagentLimits()).maxTabs;
+      : limits.maxTabs;
     messages.push({ role: 'system', content: childSystemPrompt(agent, maxTabs) });
     const tab = ctx.currentTabInfo ? `当前用户页面：${ctx.currentTabInfo}` : '当前用户页面：未知';
     const memBlock = await memoriesBlockForChild(prompt, ctx);
@@ -27006,20 +28108,51 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
   if (agent.name === 'browser') {
     try {
       const snap = await executeToolCall('browser_act', { op: 'observe' }, childCtx);
+      const shot = childCtx._viewportShot;
+      childCtx._viewportShot = null;
       messages.push({ role: 'user', content: `[PAGE-SNAPSHOT]\n${snap}` });
+      if (shot) appendViewportShots(messages, messages, [shot]);
     } catch (_) {}
   }
 
   let lastText = '';
   let lastEmit = 0;
   let missingSubmitAttempts = 0;
+  const budget = {
+    tokens: Number(limits.budgetTokens) || 0,
+    ms: (Number(limits.budgetMinutes) || 0) * 60000,
+  };
+  const startedAt = Date.now();
+  let usedTokens = 0;
+  let warned = false;
+  let forced = false;
+  let forcedRounds = 0;
+  const submitOnly = [SUBMIT_REPORT_TOOL];
   try {
-    // 不设轮次上限（2026-09-10 用户拍板）：子代理做到自己交出最终报告为止。
-    // 唯一终止是模型某轮不再调工具，或父代理 abort（signal）。
+    // 不设轮次上限；按 token / 耗时预算收口。耗尽时只留 submit_report，强制交回已有工作。
     for (;;) {
     if (signal && signal.aborted) break;
+    const state = budgetState(budget, usedTokens, startedAt);
+    if (!forced && state.ratio >= 1) {
+      forced = true;
+      session.card.budgetExhausted = state.by;
+      childCtx.subagentAllowedTools = new Set(['submit_report']);
+      childCtx.subagentBudgetForced = true;
+      messages.push({
+        role: 'user',
+        content: `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：已核实的写进 claims，能回答的问题写进 findings，没查完的方向和原因写进 unresolved。`,
+      });
+    } else if (!warned && !forced && state.ratio >= SUBAGENT_BUDGET_WARN_RATIO) {
+      warned = true;
+      messages.push({
+        role: 'user',
+        content: '[RUNTIME] 预算已用掉大部分。停止扩大检索范围，补齐最关键的缺口后尽快调用 submit_report。',
+      });
+    }
+    if (forced && forcedRounds >= SUBAGENT_FORCED_SUBMIT_ROUNDS) break;
+    if (forced) forcedRounds += 1;
     let roundStarted = false;
-    const result = await streamChatWithTools(messages, tools, apiCfg, (chunk) => {
+    const result = await streamChatWithTools(messages, forced ? submitOnly : tools, apiCfg, (chunk) => {
       if (!chunk) return;
       if (!roundStarted) {
         lastText = '';
@@ -27034,11 +28167,18 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
       try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
     }, signal);
     emitUsage(ctx, result.usage);
+    usedTokens += usageTotalTokens(result.usage);
+    session.card.budget = { usedTokens, elapsedMs: Date.now() - startedAt, tokens: budget.tokens, ms: budget.ms };
     if (result.content) lastText = result.content;
     session.card.report = lastText;
     try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
     if (!result.toolCalls || result.toolCalls.length === 0) {
-      if (childCtx.submittedReport || missingSubmitAttempts >= 1) break;
+      if (childCtx.submittedReport) break;
+      if (forced) {
+        messages.push({ role: 'user', content: '[RUNTIME] 预算已用完，唯一可做的是调用 submit_report。' });
+        continue;
+      }
+      if (missingSubmitAttempts >= 1) break;
       missingSubmitAttempts += 1;
       messages.push({
         role: 'user',
@@ -27091,6 +28231,7 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
     text: lastText || '',
     report: childCtx.submittedReport,
     submitted: !!childCtx.submittedReport,
+    budgetExhausted: forced ? (session.card.budgetExhausted || 'token') : '',
   };
 }
 
@@ -27260,21 +28401,30 @@ async function runTaskTool(args, ctx = {}) {
       })) putTrace(n);
     };
     try {
-      const result = await runSubagentLoop(session, effectivePrompt || '请继续上次未完成的任务并调用 submit_report。', ctx, signal, agent, apiCfg, tools);
+      const limits = await getSubagentLimits().catch(() => ({}));
+      const result = await runSubagentLoop(session, effectivePrompt || '请继续上次未完成的任务并调用 submit_report。', ctx, signal, agent, apiCfg, tools, limits);
       const aborted = signal && signal.aborted;
       const incomplete = !aborted && !result.submitted;
       const state = aborted ? 'error' : (incomplete ? 'incomplete' : 'completed');
       session.report = result.report || null;
-      session.verification = result.submitted
+      const passageOnly = !!(result.report && (result.report.passages || []).length && !(result.report.claims || []).length);
+      session.verification = result.submitted && !passageOnly
         ? await runCheckPipeline(result.report, {
           projectId: ctx.projectId || 'default',
           apiConfig: apiCfg,
+          judgeApiConfig: await resolveJudgeApiConfig(ctx, limits),
           signal,
           ctx,
         })
         : null;
+      const budgetNote = result.budgetExhausted
+        ? `${result.budgetExhausted === 'time' ? '耗时' : 'token'}预算用完后被强制交回，覆盖可能不全，见 unresolved。`
+        : '';
       session.card.status = state;
-      session.card.error = aborted ? '已中断' : (incomplete ? '未调用 submit_report，任务未完成' : '');
+      session.card.error = aborted ? '已中断' : (incomplete
+        ? (result.budgetExhausted ? '预算用完且未能提交报告，任务未完成' : '未调用 submit_report，任务未完成')
+        : '');
+      session.card.budgetNote = budgetNote;
       session.card.currentTool = '';
       session.card.currentLabel = '';
       session.card.report = result.report?.summary || result.text || '';
@@ -27293,7 +28443,7 @@ async function runTaskTool(args, ctx = {}) {
         type: session.type,
         state,
         summary: aborted ? `已中断: ${description}` : (incomplete ? `未完成: ${description}` : description),
-        text: aborted ? '子代理已中断。' : (incomplete ? session.card.error : ''),
+        text: aborted ? '子代理已中断。' : (incomplete ? session.card.error : budgetNote),
         report: result.report,
         verification: verificationForMain(session.verification),
       });
@@ -36311,8 +37461,8 @@ function bodyInsertPoint() {
 
 const editBuf$2 = [];
 
-function recordEdit$2(op, location, before, after, note) {
-  editBuf$2.push({ op, location, before, after, note });
+function recordEdit$2(op, location, before, after, note, extra) {
+  editBuf$2.push({ op, location, before, after, note, ...(extra || {}) });
 }
 
 function attachEdits$2(r) {
@@ -36620,6 +37770,92 @@ function unwrap(wrapEl) {
   removeNode$1(wrapEl);
 }
 
+/** 从 comments.xml 把批注正文填回修订 w:id。引擎重载后内存表是空的，列表才能看到 note。 */
+async function hydrateRevisionNotes() {
+  if (!xmlDoc || !zip$1) return;
+  const file = zip$1.file('word/comments.xml');
+  if (!file) return;
+  let commentsXml;
+  try {
+    commentsXml = parseXml$1(await file.async('string'), 'comments.xml');
+  } catch (_) {
+    return;
+  }
+  const texts = new Map();
+  for (const c of Array.from(commentsXml.getElementsByTagNameNS(W, 'comment'))) {
+    const id = attr(c, 'id');
+    if (!id) continue;
+    let text = '';
+    for (const t of Array.from(c.getElementsByTagNameNS(W, 't'))) text += t.textContent || '';
+    texts.set(id, text);
+  }
+  const remember = (node, note, cid) => {
+    if (!node || !note) return;
+    if (node.localName !== 'ins' && node.localName !== 'del') return;
+    const wid = attr(node, 'id');
+    if (!wid) return;
+    revNoteMap.set(wid, note);
+    const n = parseInt(cid, 10);
+    if (Number.isFinite(n)) revCommentMap.set(wid, n);
+  };
+  for (const start of Array.from(xmlDoc.getElementsByTagNameNS(W, 'commentRangeStart'))) {
+    const note = texts.get(attr(start, 'id') || '');
+    if (!note) continue;
+    const cid = attr(start, 'id');
+    let cur = nextElementSiblingOf(start);
+    while (cur && !(cur.localName === 'commentRangeEnd' && attr(cur, 'id') === cid)) {
+      remember(cur, note, cid);
+      cur = nextElementSiblingOf(cur);
+    }
+    let prev = start.previousSibling;
+    while (prev) {
+      if (prev.nodeType === 1) {
+        if (prev.localName === 'del') remember(prev, note, cid);
+        break;
+      }
+      prev = prev.previousSibling;
+    }
+  }
+}
+
+/**
+ * 列表编号在本次结果里唯一。w:id 撞车时只让文档序的第一条沿用它，
+ * 其余另编号，accept/reject 因此不会一次打中两条。
+ */
+function assignListIds(items) {
+  const seen = new Map();
+  const kept = new Set();
+  for (const item of items) {
+    const wId = Number.isFinite(item.wId) && item.wId > 0 ? item.wId : 0;
+    const n = (seen.get(wId) || 0) + 1;
+    seen.set(wId, n);
+    if (n === 1 && wId > 0) kept.add(wId);
+  }
+  seen.clear();
+  let max = 0;
+  for (const id of kept) if (id > max) max = id;
+  const used = new Set(kept);
+  for (const item of items) {
+    const wId = Number.isFinite(item.wId) && item.wId > 0 ? item.wId : 0;
+    const n = (seen.get(wId) || 0) + 1;
+    seen.set(wId, n);
+    if (n === 1 && wId > 0) {
+      item.id = wId;
+      continue;
+    }
+    do { max += 1; } while (used.has(max));
+    used.add(max);
+    item.id = max;
+  }
+  return items;
+}
+
+function revisionListId(el) {
+  if (!el) return null;
+  const hit = scanRevisions().find((r) => r.delEl === el || r.insEl === el);
+  return hit ? hit.id : null;
+}
+
 /**
  * 文档序扫描修订列表；相邻的 del+ins（同作者，中间允许批注锚点）合并为
  * 一条 replace。返回条目含 DOM 元素引用，accept/reject 直接用。
@@ -36639,9 +37875,8 @@ function scanRevisions() {
     const delText = Array.from(node.getElementsByTagNameNS(W, 'delText')).map((d) => d.textContent).join('');
     const insText = insEl ? Array.from(insEl.getElementsByTagNameNS(W, 't')).map((t) => t.textContent).join('') : '';
     items.push({
-      // 稳定 id = 元素的 w:id（revSeq 单调分配、永不复用）。曾用 items.length+1
-      // 位置编号：accept/reject 后列表移位导致编号错位，reject(9) 命中错误对象
-      id: parseInt(attr(node, 'id'), 10) || items.length + 1,
+      // w:id 可能在 del 与 ins 上重复。列表 id 由 assignListIds 保证本次唯一。
+      wId: parseInt(attr(node, 'id'), 10),
       type: insEl ? 'replace' : 'delete',
       find: delText,
       replacement: insText,
@@ -36656,7 +37891,7 @@ function scanRevisions() {
     if (seen.has(node)) continue;
     const insText = Array.from(node.getElementsByTagNameNS(W, 't')).map((t) => t.textContent).join('');
     items.push({
-      id: parseInt(attr(node, 'id'), 10) || items.length + 1,
+      wId: parseInt(attr(node, 'id'), 10),
       type: 'insert',
       find: '',
       replacement: insText,
@@ -36667,7 +37902,7 @@ function scanRevisions() {
       insEl: node,
     });
   }
-  return items;
+  return assignListIds(items);
 }
 
 async function applyRevisionVerdict(item, accept) {
@@ -36742,6 +37977,7 @@ async function initWordEditor(container, arrayBuffer) {
   redoStack$1 = [];
   revCommentMap = new Map();
   revNoteMap = new Map();
+  await hydrateRevisionNotes();
 
   await renderDoc();
 }
@@ -36778,6 +38014,181 @@ function pendingReviewCount() {
 
 /* ---------- 工具执行入口 ---------- */
 
+const HIGHLIGHT_ALIAS = {
+  yellow: 'yellow', 黄: 'yellow', 黄色: 'yellow',
+  green: 'green', 绿: 'green', 绿色: 'green',
+  cyan: 'cyan', 青: 'cyan', 青色: 'cyan',
+  magenta: 'magenta', 品红: 'magenta',
+  blue: 'blue', 蓝: 'blue', 蓝色: 'blue',
+  red: 'red', 红: 'red', 红色: 'red',
+  darkblue: 'darkBlue', darkcyan: 'darkCyan', darkgreen: 'darkGreen',
+  darkmagenta: 'darkMagenta', darkred: 'darkRed', darkyellow: 'darkYellow',
+  darkgray: 'darkGray', gray: 'darkGray', grey: 'darkGray', 灰: 'darkGray', 灰色: 'darkGray',
+  lightgray: 'lightGray',
+  black: 'black', 黑: 'black', 黑色: 'black',
+  white: 'white', 白: 'white', 白色: 'white',
+};
+
+const ALIGN_ALIAS = {
+  left: 'left', 左: 'left', 左对齐: 'left',
+  center: 'center', 中: 'center', 居中: 'center',
+  right: 'right', 右: 'right', 右对齐: 'right',
+  justify: 'both', both: 'both', 两端: 'both', 两端对齐: 'both',
+};
+
+function hexColor(v) {
+  const s = String(v || '').trim().replace(/^#/, '');
+  if (/^[0-9A-Fa-f]{6}$/.test(s)) return s.toUpperCase();
+  if (/^[0-9A-Fa-f]{3}$/.test(s)) return s.split('').map((c) => c + c).join('').toUpperCase();
+  return '';
+}
+
+function asBool(v) {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (v === true || v === 1 || v === 'true') return true;
+  if (v === false || v === 0 || v === 'false') return false;
+  return null;
+}
+
+function ensureChild(parent, name) {
+  let n = childByName(parent, name);
+  if (!n) { n = el$1(name); parent.appendChild(n); }
+  return n;
+}
+
+function dropChild(parent, name) {
+  const n = childByName(parent, name);
+  if (n) removeNode$1(n);
+}
+
+function setFlag(rPr, tag, on) {
+  if (on) { if (!childByName(rPr, tag)) rPr.appendChild(el$1(tag)); }
+  else dropChild(rPr, tag);
+}
+
+/** 校验 set_format 参数。返回 {fmt} 或 {error}。空字段忽略，非法值拒绝，避免写进一半。 */
+function parseFormatArgs(args) {
+  const fmt = {};
+  const bools = ['bold', 'italic', 'underline', 'strike'];
+  for (const key of bools) {
+    if (args[key] === undefined) continue;
+    const b = asBool(args[key]);
+    if (b === null) return { error: `${key} 需要 true 或 false` };
+    fmt[key] = b;
+  }
+  if (args.font) fmt.font = String(args.font).trim().slice(0, 64);
+  if (args.size !== undefined && args.size !== '') {
+    const pt = Number(args.size);
+    if (!Number.isFinite(pt) || pt < 1 || pt > 72) return { error: 'size 是字号（磅），范围 1–72' };
+    fmt.size = pt;
+  }
+  if (args.color) {
+    const hex = hexColor(args.color);
+    if (!hex) return { error: 'color 需要 #RRGGBB' };
+    fmt.color = hex;
+  }
+  if (args.highlight) {
+    const raw = String(args.highlight).trim();
+    const named = HIGHLIGHT_ALIAS[raw] || HIGHLIGHT_ALIAS[raw.toLowerCase()];
+    const hex = hexColor(raw);
+    if (named) fmt.highlight = { kind: 'name', value: named };
+    else if (hex) fmt.highlight = { kind: 'hex', value: hex };
+    else return { error: 'highlight 用 Word 色名（yellow/red/blue…）或 #RRGGBB' };
+  }
+  if (args.align) {
+    const val = ALIGN_ALIAS[String(args.align).trim()] || ALIGN_ALIAS[String(args.align).trim().toLowerCase()];
+    if (!val) return { error: 'align 用 left / center / right / justify' };
+    fmt.align = val;
+  }
+  if (args.line_spacing !== undefined && args.line_spacing !== '') {
+    const mult = Number(args.line_spacing);
+    if (!Number.isFinite(mult) || mult < 0.5 || mult > 5) return { error: 'line_spacing 是倍数，如 1、1.5、2' };
+    fmt.line_spacing = mult;
+  }
+  for (const key of ['space_before', 'space_after', 'indent']) {
+    if (args[key] === undefined || args[key] === '') continue;
+    const pt = Number(args[key]);
+    if (!Number.isFinite(pt) || pt < 0 || pt > 400) return { error: `${key} 是磅，范围 0–400` };
+    fmt[key] = pt;
+  }
+  if (!Object.keys(fmt).length) return { error: 'set_format 至少指定一项格式（字体、字号、颜色、对齐、行距等）' };
+  return { fmt };
+}
+
+function formatNote(fmt) {
+  const bits = [];
+  if (fmt.font) bits.push(`字体 ${fmt.font}`);
+  if (fmt.size) bits.push(`${fmt.size}磅`);
+  if (fmt.bold === true) bits.push('加粗');
+  if (fmt.bold === false) bits.push('取消加粗');
+  if (fmt.italic === true) bits.push('斜体');
+  if (fmt.italic === false) bits.push('取消斜体');
+  if (fmt.underline === true) bits.push('下划线');
+  if (fmt.underline === false) bits.push('取消下划线');
+  if (fmt.strike === true) bits.push('删除线');
+  if (fmt.strike === false) bits.push('取消删除线');
+  if (fmt.color) bits.push(`颜色 #${fmt.color}`);
+  if (fmt.highlight) bits.push(fmt.highlight.kind === 'hex' ? `底色 #${fmt.highlight.value}` : `高亮 ${fmt.highlight.value}`);
+  if (fmt.align) bits.push(`对齐 ${fmt.align === 'both' ? '两端' : fmt.align}`);
+  if (fmt.line_spacing) bits.push(`行距 ${fmt.line_spacing}`);
+  if (fmt.space_before != null) bits.push(`段前 ${fmt.space_before}磅`);
+  if (fmt.space_after != null) bits.push(`段后 ${fmt.space_after}磅`);
+  if (fmt.indent != null) bits.push(`左缩进 ${fmt.indent}磅`);
+  return bits.join('，');
+}
+
+function applyRunFormat(run, fmt) {
+  let rPr = childByName(run, 'rPr');
+  if (!rPr) {
+    rPr = el$1('rPr');
+    run.insertBefore(rPr, run.firstChild);
+  }
+  if (fmt.bold !== undefined) { setFlag(rPr, 'b', fmt.bold); setFlag(rPr, 'bCs', fmt.bold); }
+  if (fmt.italic !== undefined) { setFlag(rPr, 'i', fmt.italic); setFlag(rPr, 'iCs', fmt.italic); }
+  if (fmt.strike !== undefined) setFlag(rPr, 'strike', fmt.strike);
+  if (fmt.underline !== undefined) {
+    if (fmt.underline) setAttr(ensureChild(rPr, 'u'), 'val', 'single');
+    else dropChild(rPr, 'u');
+  }
+  if (fmt.font) {
+    const fonts = ensureChild(rPr, 'rFonts');
+    for (const slot of ['ascii', 'hAnsi', 'eastAsia', 'cs']) setAttr(fonts, slot, fmt.font);
+  }
+  if (fmt.size) {
+    const half = String(Math.round(fmt.size * 2));
+    setAttr(ensureChild(rPr, 'sz'), 'val', half);
+    setAttr(ensureChild(rPr, 'szCs'), 'val', half);
+  }
+  if (fmt.color) setAttr(ensureChild(rPr, 'color'), 'val', fmt.color);
+  if (fmt.highlight) {
+    if (fmt.highlight.kind === 'name') {
+      dropChild(rPr, 'shd');
+      setAttr(ensureChild(rPr, 'highlight'), 'val', fmt.highlight.value);
+    } else {
+      dropChild(rPr, 'highlight');
+      const shd = ensureChild(rPr, 'shd');
+      setAttr(shd, 'val', 'clear');
+      setAttr(shd, 'fill', fmt.highlight.value);
+    }
+  }
+}
+
+function applyParaFormat(para, fmt) {
+  let pPr = directChildren(para, 'pPr')[0];
+  if (!pPr) { pPr = el$1('pPr'); para.insertBefore(pPr, para.firstChild); }
+  if (fmt.align) setAttr(ensureChild(pPr, 'jc'), 'val', fmt.align);
+  if (fmt.line_spacing != null || fmt.space_before != null || fmt.space_after != null) {
+    const sp = ensureChild(pPr, 'spacing');
+    if (fmt.line_spacing != null) {
+      setAttr(sp, 'line', String(Math.round(fmt.line_spacing * 240)));
+      setAttr(sp, 'lineRule', 'auto');
+    }
+    if (fmt.space_before != null) setAttr(sp, 'before', String(Math.round(fmt.space_before * 20)));
+    if (fmt.space_after != null) setAttr(sp, 'after', String(Math.round(fmt.space_after * 20)));
+  }
+  if (fmt.indent != null) setAttr(ensureChild(pPr, 'ind'), 'left', String(Math.round(fmt.indent * 20)));
+}
+
 async function execWordTool(tool, args = {}) {
   editBuf$2.length = 0;
   return attachEdits$2(await execWordToolInner(tool, args));
@@ -36790,6 +38201,11 @@ async function execWordToolInner(tool, args = {}) {
       case 'replace_text': {
         const find = String(args.find || '');
         if (!find) return { ok: false, error: '缺少 find 参数' };
+        const replacement = String(args.replace ?? '');
+        if (find === replacement) {
+          if (!locateRuns(find)) return { ok: false, error: `未找到文本: ${find}` };
+          return { ok: true, noop: true, summary: `「${find}」与替换文本相同，未修改` };
+        }
         const loc = locateRuns(find);
         if (!loc) return { ok: false, error: `未找到文本: ${find}` };
         const g1 = guardPendingRevision(loc);
@@ -36797,7 +38213,6 @@ async function execWordToolInner(tool, args = {}) {
         pushUndo$1();
         const first = loc.runs[0];
         const where = paraLocation(first); // 必须在移除 run 之前取（移除后找不到宿主段落）
-        const replacement = String(args.replace ?? '');
         if (replacement) first.parentNode.insertBefore(makeRun(replacement, first), first);
         for (const r of loc.runs) removeNode$1(r);
         recordEdit$2('replace', where, find, replacement);
@@ -36841,7 +38256,7 @@ async function execWordToolInner(tool, args = {}) {
             else if (!wantBold && existing) removeNode$1(existing);
           }
         }
-        recordEdit$2('format', paraLocation(loc.runs[0]), find, find, wantBold ? '加粗' : '取消加粗');
+        recordEdit$2('format', paraLocation(loc.runs[0]), find, '', wantBold ? '加粗' : '取消加粗');
         dirty$1 = true;
         scheduleRender();
         return { ok: true, summary: `已${wantBold ? '加粗' : '取消加粗'}「${find}」` };
@@ -36862,7 +38277,7 @@ async function execWordToolInner(tool, args = {}) {
         let pStyle = directChildren(pPr, 'pStyle')[0];
         if (!pStyle) { pStyle = el$1('pStyle'); pPr.insertBefore(pStyle, pPr.firstChild); }
         setAttr(pStyle, 'val', styleId);
-        recordEdit$2('format', paraLocation(loc.runs[0]), find, find, `设为标题 ${level}`);
+        recordEdit$2('format', paraLocation(loc.runs[0]), find, '', `设为标题 ${level}`);
         dirty$1 = true;
         scheduleRender();
         return { ok: true, summary: `已将「${find}」所在段落设为标题 ${level}（样式 ${styleId}）` };
@@ -36883,10 +38298,42 @@ async function execWordToolInner(tool, args = {}) {
         if (!numPr) { numPr = el$1('numPr'); pPr.insertBefore(numPr, pPr.firstChild); }
         const ilvl = el$1('ilvl'); setAttr(ilvl, 'val', '0'); numPr.appendChild(ilvl);
         const nid = el$1('numId'); setAttr(nid, 'val', String(numId)); numPr.appendChild(nid);
-        recordEdit$2('format', paraLocation(loc.runs[0]), find, find, args.ordered ? '转为有序列表' : '转为无序列表');
+        recordEdit$2('format', paraLocation(loc.runs[0]), find, '', args.ordered ? '转为有序列表' : '转为无序列表');
         dirty$1 = true;
         scheduleRender();
         return { ok: true, summary: `已将「${find}」所在段落转为${args.ordered ? '有序' : '无序'}列表` };
+      }
+      case 'set_format': {
+        const find = String(args.find || '');
+        if (!find) return { ok: false, error: '缺少 find 参数' };
+        const parsed = parseFormatArgs(args);
+        if (parsed.error) return { ok: false, error: parsed.error };
+        const loc = locateRuns(find);
+        if (!loc) return { ok: false, error: `未找到文本: ${find}` };
+        const gFmt = guardPendingRevision(loc);
+        if (gFmt) return gFmt;
+        pushUndo$1();
+        const where = paraLocation(loc.runs[0]);
+        const fmt = parsed.fmt;
+        const runKeys = ['bold', 'italic', 'underline', 'strike', 'font', 'size', 'color', 'highlight'];
+        const paraKeys = ['align', 'line_spacing', 'space_before', 'space_after', 'indent'];
+        if (runKeys.some((k) => fmt[k] !== undefined)) {
+          for (const run of loc.runs) applyRunFormat(run, fmt);
+        }
+        if (paraKeys.some((k) => fmt[k] !== undefined)) {
+          const seen = new Set();
+          for (const run of loc.runs) {
+            const para = paragraphOfRun(run);
+            if (!para || seen.has(para)) continue;
+            seen.add(para);
+            applyParaFormat(para, fmt);
+          }
+        }
+        const note = formatNote(fmt);
+        recordEdit$2('format', where, find, '', note);
+        dirty$1 = true;
+        scheduleRender();
+        return { ok: true, summary: `已直接设置「${find}」的格式：${note}` };
       }
       case 'add_table': {
         const rows = Math.max(1, parseInt(args.rows, 10) || 2);
@@ -36977,7 +38424,7 @@ async function execWordToolInner(tool, args = {}) {
         return { ok: true, summary: '已重做' };
       }
       default:
-        return { ok: false, error: `未知 Word 工具: ${tool}。可用：replace_text / insert_text / set_bold / set_heading / add_list / add_table / set_cell / undo / redo（export 由阅读器保存流程处理）` };
+        return { ok: false, error: `未知 Word 工具: ${tool}。可用：replace_text / insert_text / set_format / set_bold / set_heading / add_list / add_table / set_cell / undo / redo（export 由阅读器保存流程处理）` };
     }
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
@@ -37000,6 +38447,14 @@ async function execReviewToolInner(tool, args = {}) {
         const find = String(args.find || '');
         const replacement = String(args.replacement ?? '');
         if (!find) return { ok: false, error: '缺少 find 参数' };
+        if (find === replacement) {
+          if (!locateRuns(find)) return { ok: false, error: `未找到文本: ${find}` };
+          return { ok: true, noop: true, summary: `「${find}」与替换文本相同，未写入修订` };
+        }
+        const dup = scanRevisions().find((r) => r.type === 'replace' && r.find === find && r.replacement === replacement);
+        if (dup) {
+          return { ok: true, already_pending: true, summary: `已有相同待审修订 #${dup.id}，未重复添加`, revision: { id: dup.id } };
+        }
         const loc = locateRuns(find);
         if (!loc) return { ok: false, error: `未找到文本: ${find}` };
         const g5 = guardPendingRevision(loc);
@@ -37033,8 +38488,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty$1 = true;
         scheduleRender();
-        const id = scanRevisions().length;
-        recordEdit$2('replace', where, find, replacement, note ? `修订留痕 · ${note}` : '修订留痕');
+        const id = revisionListId(insEl) || revisionListId(delEl);
+        recordEdit$2('replace', where, find, replacement, note ? `待审修订 · ${note}` : '待审修订', { tracked: true });
         return { ok: true, summary: `已提出修订 #${id}：把「${find}」改为「${replacement}」${note ? `（${note}）` : ''}，Word 原生修订痕迹`, revision: { id } };
       }
       case 'suggest_insert': {
@@ -37061,8 +38516,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty$1 = true;
         scheduleRender();
-        const id = scanRevisions().length;
-        recordEdit$2('insert', '文末', '', text, note ? `修订留痕 · ${note}` : '修订留痕');
+        const id = revisionListId(lastIns);
+        recordEdit$2('insert', '文末', '', text, note ? `待审修订 · ${note}` : '待审修订', { tracked: true });
         return { ok: true, summary: `已在文档末尾插入修订 #${id}：${text.slice(0, 40)}${text.length > 40 ? '…' : ''}${note ? `（${note}）` : ''}`, revision: { id } };
       }
       case 'suggest_delete': {
@@ -37095,8 +38550,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty$1 = true;
         scheduleRender();
-        const id = scanRevisions().length;
-        recordEdit$2('delete', where, find, '', note ? `修订留痕 · ${note}` : '修订留痕');
+        const id = revisionListId(delEl);
+        recordEdit$2('delete', where, find, '', note ? `待审修订 · ${note}` : '待审修订', { tracked: true });
         return { ok: true, summary: `已提出删除修订 #${id}：「${find}」${note ? `（${note}）` : ''}`, revision: { id } };
       }
       case 'list_revisions': {
@@ -37128,7 +38583,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty$1 = true;
         scheduleRender();
-        recordEdit$2('review', '', '', '', `已${tool === 'accept' ? '接受' : '拒绝'} ${done} 条修订，剩余 ${scanRevisions().length} 条`);
+        const left = scanRevisions().length;
+        recordEdit$2('review', '', '', '', `已${tool === 'accept' ? '接受' : '拒绝'} ${done} 条修订，剩余 ${left} 条`, { pending: left > 0 });
         return {
           ok: true,
           summary: `已${tool === 'accept' ? '接受' : '拒绝'} ${done} 条修订，剩余 ${scanRevisions().length} 条待处理`,
@@ -38296,8 +39752,8 @@ function extractLegacyDocText(ab) {
  *   - 阅读器退化为渲染器 + 修订面板：SW 每次编辑后广播 DOC_UPDATED{docId}，
  *     正在看该文档的阅读器页重渲染（renderChanges 显示修订痕迹）。
  *   - 每次成功编辑即持久化写回 IDB：SW 被杀 / 切换文档后从 IDB 重建引擎不丢改动。
- *   - docx 文本修改默认走原生修订痕迹（w:ins/w:del + 批注，doc_edit 的
- *     track_changes 默认 true），用户明确要求"直接改"才裸改。
+ *   - docx 文本修改默认直接写入。track_changes=true 才走原生修订痕迹
+ *     （w:ins/w:del + 批注），留给用户明确要求留痕、给别人审的时候。
  *   - 首次编辑某文档时附带 doc_digest（字符数/段落数/开头片段），模型据此
  *     知道自己在改什么（read-before-write 的轻量等价；find 定位失败即硬错，
  *     不会盲改）。
@@ -38390,9 +39846,9 @@ async function updateEntryFullText(docId) {
 
 /**
  * AI doc_edit 的 docx 执行入口。
- * track_changes 默认 true：replace_text/insert_text 走原生修订痕迹
- * （w:ins/w:del + 批注 note）；显式 false 才裸改。格式类操作
- * （set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改（无修订语义）。
+ * track_changes 默认 false：replace_text/insert_text 直接写入。
+ * 显式 true 才走原生修订痕迹（w:ins/w:del + 批注 note）。
+ * 格式类操作（set_format/set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改。
  */
 async function editWordDoc(docId, tool, args = {}) {
   return withDocLock(docId, async () => {
@@ -38402,7 +39858,7 @@ async function editWordDoc(docId, tool, args = {}) {
       return { ok: false, error: err.message || String(err) };
     }
     let r;
-    const track = args.track_changes !== false;
+    const track = args.track_changes === true || args.track_changes === 'true';
     if (tool === 'replace_text' && track) {
       const find = String(args.find || '');
       r = await execReviewTool('suggest_replace', {
@@ -38418,9 +39874,10 @@ async function editWordDoc(docId, tool, args = {}) {
     } else {
       r = await execWordTool(tool, args);
     }
-    if (r && r.ok) {
+    if (r && r.ok && !r.noop && !r.already_pending) {
       // execWordTool/execReviewTool 改动即 ok；undo 空栈等也算 ok 但无字节变化，
-      // persistAndNotify 幂等（重新导出写回同样内容），无副作用
+      // persistAndNotify 幂等（重新导出写回同样内容），无副作用。
+      // 相同文本、已有相同待审修订不写盘。
       await persistAndNotify(docId, r);
     }
     if (r && r.ok && !digestSent.has(docId)) {
@@ -38449,6 +39906,7 @@ async function reviewWordDoc(docId, tool, args = {}) {
     if (r && r.ok && (tool === 'accept' || tool === 'reject')) {
       await persistAndNotify(docId, r);
     }
+    if (r && typeof r === 'object') r.doc_id = docId;
     return r;
   });
 }
@@ -39536,6 +40994,7 @@ async function dispatchDocReview(d) {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'ann-chat') return;
   let abortCtrl = null;
+  let chatGen = 0;
   const portState = {
     pid: null,
     entries: [],
@@ -39629,17 +41088,30 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
     if (msg.type !== 'CHAT') return;
-    if (!(await isRuntimeLicensed())) {
-      try { port.postMessage({ type: 'error', error: LICENSE_DENIED.error }); } catch (_) {}
-      return;
-    }
+    const myGen = ++chatGen;
+    const live = () => myGen === chatGen;
+    const emit = (payload) => {
+      if (!live()) return;
+      try { port.postMessage(payload); } catch (_) {}
+    };
     if (abortCtrl) abortCtrl.abort();
     abortCtrl = new AbortController();
     const { signal } = abortCtrl;
+    if (!(await isRuntimeLicensed())) {
+      emit({ type: 'error', error: LICENSE_DENIED.error });
+      return;
+    }
+    if (!live()) return;
     const pid = await getCurrentProject();
+    if (!live()) return;
     const apiConfig = await getProjectConfig(pid);
+    if (!live()) return;
     if (!apiConfig.apiKey) {
-      try { port.postMessage({ type: 'error', error: '未配置 API Key，请先在设置中填写' }); } catch (_) {}
+      emit({ type: 'error', error: '未配置 API Key，请先在设置中填写' });
+      return;
+    }
+    if (signal.aborted) {
+      emit({ type: 'done', messages: portState.messages, aborted: true });
       return;
     }
     const projectSwitched = portState.pid !== pid;
@@ -39650,31 +41122,22 @@ chrome.runtime.onConnect.addListener((port) => {
       portState.entries = await getEntries(pid);
       portState.entriesDirty = false;
     }
+    if (!live()) return;
     portState.pendingSuggestions = null;
     portState.pendingScopeQuiz = null;
     portState.pendingCharts = [];
+    let roundText = '';
+    let savedFinal = false;
+    let showedQuiz = false;
+    let turnDone = false;
     try {
       // ---- 消息组装（与侧栏 buildMessagesForApi 同构）----
       // system（静态前缀）→ 压缩摘要 → 历史 → 动态前言 → 本条用户消息
       const userMessages = Array.isArray(msg.messages) ? msg.messages.filter((m) => m && m.role === 'user') : [];
       const lastUser = userMessages[userMessages.length - 1] || { role: 'user', content: '' };
       const userText = (lastUser.content || '').toString();
-      // 权威历史维护：用户消息入史（done 回传 content 覆盖本地历史，保证跨轮一致）。
-      // 之前只 push assistant/tool、调 API 时又只带 user 消息 —— 模型看不到自己
-      // 上轮的回答与工具结果，多轮对话失忆（"第二点呢"答不上来）。
-      portState.messages.push(lastUser);
       const { maxParallel } = await getSubagentLimits().catch(() => ({ maxParallel: undefined }));
-      const callMessages = [
-        { role: 'system', content: getStaticSystemPrompt({ maxParallel }) },
-      ];
-      if (portState.summary) {
-        callMessages.push({
-          role: 'system',
-          content: `## 前情摘要（早期对话已压缩，仅供参考，如有冲突以最新上下文为准）\n${portState.summary}`,
-        });
-      }
-      // 历史：除当前这条用户消息外全部带上（含上轮 assistant/tool 消息，与侧栏 buildMessagesForApi 同构）
-      callMessages.push(...portState.messages.slice(0, -1));
+      if (!live()) return;
 
       // 动态前言（与侧栏 buildDynamicContext 同源；tab 信息用发起聊天的页面）
       const now = new Date();
@@ -39688,6 +41151,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const memories = await retrieveMemories(userText, {
         currentUrl: (senderTab && senderTab.url) || '',
       });
+      if (!live()) return;
       const agents = await listAgents().catch(() => []);
       const mentionedAgents = parseAgentMentions(userText, agents.map((a) => a.name));
       const selCtx = msg.context || {};
@@ -39707,9 +41171,30 @@ chrome.runtime.onConnect.addListener((port) => {
         memories,
         agentCatalog: formatAgentCatalog(agents),
         mentionedAgents,
+        notebookNotes: await listNotes(pid),
+        insights: await listInsights(pid),
         plan: await getPlan(pid),
         apiCatalog: formatApiCatalog(await loadConnectors()),
       });
+      if (!live()) return;
+      if (signal.aborted) {
+        emit({ type: 'done', messages: portState.messages, aborted: true });
+        return;
+      }
+      // 用户消息在开问之前入史。最终回答（无 tool_calls 的那一轮）也必须入史，
+      // 否则下一轮模型看不到自己刚说的话，追问「第二点呢」会失忆。
+      // 被更新的一轮顶掉时不要再写，避免旧回答插到新问题后面。
+      portState.messages.push(lastUser);
+      const callMessages = [
+        { role: 'system', content: getStaticSystemPrompt({ maxParallel }) },
+      ];
+      if (portState.summary) {
+        callMessages.push({
+          role: 'system',
+          content: `## 前情摘要（早期对话已压缩，仅供参考，如有冲突以最新上下文为准）\n${portState.summary}`,
+        });
+      }
+      callMessages.push(...portState.messages.slice(0, -1));
       callMessages.push({ role: 'user', content: preamble + selectionBlock });
       callMessages.push(lastUser);
 
@@ -39719,18 +41204,30 @@ chrome.runtime.onConnect.addListener((port) => {
       const chatTools = buildChatTools(agents, { maxParallel });
 
       // ---- 工具循环（与侧栏 sendMessage 同构）----
-      let turnDone = false;
       for (let round = 0; round < AGENT_MAX_ROUNDS; round++) {
-        if (signal.aborted) break;
+        if (!live() || signal.aborted) break;
+        roundText = '';
         // 接近工具调用上限：注入收尾提示（与侧栏一致；只进 callMessages 不进 portState 持久历史）
         if (round === AGENT_WRAP_HINT_ROUND) {
           callMessages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
         }
         const result = await streamChatWithTools(callMessages, chatTools, apiConfig,
-          (chunk) => { try { port.postMessage({ type: 'chunk', text: chunk }); } catch (_) {} },
+          (chunk) => {
+            roundText += chunk;
+            emit({ type: 'chunk', text: chunk });
+          },
           signal);
-        if (result.toolCalls.length === 0) break;
+        if (!live()) return;
         if (signal.aborted) break;
+        if (result.toolCalls.length === 0) {
+          const finalText = String(result.content || roundText || '').trim();
+          roundText = '';
+          if (finalText) {
+            portState.messages.push({ role: 'assistant', content: finalText });
+            savedFinal = true;
+          }
+          break;
+        }
 
         // 一轮工具调用：骨架在 chat-executor.processRoundToolCalls（与侧栏共用一份实现），
         // 这里只注入浮动窗的端口上报与写库后的缓存重读
@@ -39742,43 +41239,62 @@ chrome.runtime.onConnect.addListener((port) => {
           signal,
           minAcceptDelayMs: 600, // 与侧栏同节奏：状态行 520ms 内完成淡出，防快速切换残留
           hooks: {
-            start: (label, name) => { try { port.postMessage({ type: 'tool', status: 'start', label, tool: name }); } catch (_) {} },
-            argError: (label) => { try { port.postMessage({ type: 'tool', status: 'error', label }); } catch (_) {} },
-            done: (label) => { try { port.postMessage({ type: 'tool', status: 'done', label }); } catch (_) {} },
-            fail: (label) => { try { port.postMessage({ type: 'tool', status: 'error', label }); } catch (_) {} },
+            start: (label, name) => emit({ type: 'tool', status: 'start', label, tool: name }),
+            argError: (label) => emit({ type: 'tool', status: 'error', label }),
+            done: (label) => emit({ type: 'tool', status: 'done', label }),
+            fail: (label) => emit({ type: 'tool', status: 'error', label }),
             // 写库工具：统一兜底重读；重读后缓存已是最新，清脏位避免下轮重复读
             writeRefresh: async () => {
+              if (!live()) return;
               portState.entries = await getEntries(pid);
               portState.entriesDirty = false;
             },
           },
         });
+        // 工具轮的正文已经记在 assistant.tool_calls 上，不要再当成最终回答存一次
+        roundText = '';
+        if (!live()) return;
+        if (signal.aborted) break;
 
         // suggest_actions / ask_research_scope：把确认 UI 推给 content 侧渲染
         if (portState.pendingSuggestions) {
-          try { port.postMessage({ type: 'ui', suggestions: portState.pendingSuggestions }); } catch (_) {}
+          emit({ type: 'ui', suggestions: portState.pendingSuggestions });
           portState.pendingSuggestions = null;
         }
         if (portState.pendingScopeQuiz) {
-          try { port.postMessage({ type: 'ui', scopeQuiz: portState.pendingScopeQuiz }); } catch (_) {}
+          emit({ type: 'ui', scopeQuiz: portState.pendingScopeQuiz });
           portState.pendingScopeQuiz = null;
+          showedQuiz = true;
           turnDone = true;
           break;
         }
         if (portState.toolUndos.length > 0) {
-          try { port.postMessage({ type: 'ui', undo: portState.toolUndos.length }); } catch (_) {}
+          emit({ type: 'ui', undo: portState.toolUndos.length });
           portState.toolUndos = [];
         }
         turnDone = true;
       }
+      if (!live()) return;
       if (signal.aborted) {
-        try { port.postMessage({ type: 'done', messages: portState.messages, aborted: true }); } catch (_) {}
+        const partial = roundText.trim();
+        if (partial) portState.messages.push({ role: 'assistant', content: partial + '\n\n(已中断)' });
+        emit({ type: 'done', messages: portState.messages, aborted: true });
         closeAiTabs('chat').catch(() => {});
         return;
       }
+      if (!savedFinal && !showedQuiz) {
+        if (turnDone) {
+          portState.messages.push({ role: 'assistant', content: '已执行操作。' });
+        } else {
+          const reason = 'AI 未返回内容，请检查模型配置或稍后重试。';
+          portState.messages.push({ role: 'assistant', content: reason });
+          emit({ type: 'chunk', text: reason });
+        }
+      }
       // 让 tool 状态行停留一下再进入回复（与侧栏 600ms 最小停留同感）
       await new Promise((r) => setTimeout(r, 300));
-      try { port.postMessage({ type: 'done', messages: portState.messages }); } catch (_) {}
+      if (!live()) return;
+      emit({ type: 'done', messages: portState.messages });
       closeAiTabs('chat').catch(() => {});
 
       // 非阻塞后台压缩（与侧栏 scheduleBackgroundCompaction 同策略；阈值按模型窗口推导）
@@ -39786,11 +41302,17 @@ chrome.runtime.onConnect.addListener((port) => {
         compactSwHistory(portState, apiConfig).catch(() => {});
       }
     } catch (err) {
-      if (err.name === 'AbortError') {
+      if (!live()) return;
+      if (err.name === 'AbortError' || signal.aborted) {
+        const partial = roundText.trim();
+        if (partial) portState.messages.push({ role: 'assistant', content: partial + '\n\n(已中断)' });
+        emit({ type: 'done', messages: portState.messages, aborted: true });
         closeAiTabs('chat').catch(() => {});
         return;
       }
-      try { port.postMessage({ type: 'error', error: err.message }); } catch (_) {}
+      const partial = roundText.trim();
+      if (partial) portState.messages.push({ role: 'assistant', content: partial });
+      emit({ type: 'error', error: err.message, messages: portState.messages });
       closeAiTabs('chat').catch(() => {});
     }
   });
@@ -41004,7 +42526,8 @@ async function handleFeedItemsCollect({ itemIds, projectId, concurrency }) {
       }
 
       const bodyFromHtml = item.contentHtml ? htmlToText(item.contentHtml, { preserveNewlines: false }) : '';
-      const bodyFromSummary = item.summary || '';
+      // 证据要锚在原文上：翻译回填会就地改写 summary，原文在 originalSummary。
+      const bodyFromSummary = item.originalSummary || item.summary || '';
       let fullText = item.fullText || bodyFromHtml || bodyFromSummary || '';
       let title = item.title || '';
       let publishedAt = item.publishedAt

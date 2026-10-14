@@ -4,7 +4,7 @@ import assert from 'node:assert';
 import {
   parseScheduleFields, normalizeSchedule, normalizeWeekdays, normalizeTime,
   parseLocalDateTime, parseCron, cronNext, computeNextRunAt, formatCadence,
-  cadenceToEvery,
+  cadenceToEvery, heartbeatProjectId, taskBelongsToProject,
 } from '../src/lib/heartbeat.js';
 
 let passed = 0;
@@ -94,5 +94,10 @@ const capped = { schedule: { type: 'daily', time: '09:00', until: Date.now() + 6
 ok(computeNextRunAt(capped, Date.now()) === null, '超出 until 不再有下次');
 ok(formatCadence({ schedule: watch }).includes('至 '), '文案带截止');
 throws(() => parseScheduleFields({ time: '09:00', until: '2020-01-01' }), /已经过去/, '过去的 until 被拒');
+
+// —— 项目归属 ——
+ok(heartbeatProjectId({}) === 'default' && heartbeatProjectId({ projectId: 'p2' }) === 'p2', '缺省归 default');
+ok(taskBelongsToProject({ projectId: 'a' }, 'a') && !taskBelongsToProject({ projectId: 'a' }, 'b'), '按项目过滤');
+ok(taskBelongsToProject({}, 'default') && !taskBelongsToProject({}, 'other'), '旧任务无 projectId 算 default');
 
 console.log(`heartbeat-smoke: ${passed} ok`);

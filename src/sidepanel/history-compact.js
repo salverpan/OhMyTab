@@ -25,39 +25,9 @@
  */
 
 import { chatComplete } from '../lib/providers/index.js';
+import { estimateTokens, estimateMessagesTokens } from '../lib/token-estimate.js';
 
-/**
- * Rough token estimator. Chinese CJK chars ≈ 1 token; ASCII ≈ 4 chars/token.
- * Matches 智谱 GLM's stated ~1:1.6 ratio well enough for budgeting.
- */
-export function estimateTokens(text) {
-  if (!text) return 0;
-  if (Array.isArray(text)) {
-    text = text.map((p) => p?.text || (p?.type === 'image_url' ? '[image]' : '')).join('\n');
-  }
-  const s = String(text);
-  let cjk = 0;
-  let other = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0x3000 && c <= 0x9fff) cjk++;
-    else if (c >= 0xac00 && c <= 0xd7af) cjk++;
-    else if (c >= 0xff00 && c <= 0xffef) cjk++;
-    else other++;
-  }
-  return cjk + Math.ceil(other / 4);
-}
-
-export function estimateMessagesTokens(messages) {
-  let total = 0;
-  for (const m of messages) {
-    total += estimateTokens(m?.content || '');
-    // 工具调用参数（tool_calls JSON）也随请求重发，计入估算
-    if (m?.tool_calls) total += estimateTokens(JSON.stringify(m.tool_calls));
-    total += 4; // per-message overhead (role + delimiters)
-  }
-  return total;
-}
+export { estimateTokens, estimateMessagesTokens };
 
 /**
  * Pick a cut index so that:

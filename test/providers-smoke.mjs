@@ -8,7 +8,7 @@ import { chatStream, chatComplete } from '../src/lib/providers/index.js';
 import { resolveEndpoint as oaiEp } from '../src/lib/providers/openai-chat.js';
 import { resolveEndpoint as antEp, convertMessages as antConvert } from '../src/lib/providers/anthropic-messages.js';
 import { resolveBase as gemBase, convertMessages as gemConvert } from '../src/lib/providers/gemini.js';
-import { inferModelCaps, defaultWorkingContext, contextPresets, catalogSourceLabel, FALLBACK_CONTEXT_WINDOW, FALLBACK_WORKING_CONTEXT } from '../src/lib/model-limits.js';
+import { inferModelCaps, defaultWorkingContext, contextPresets, catalogSourceLabel, resolveChatMaxTokens, OUTPUT_TOKEN_REQUEST_CAP, OUTPUT_TOKEN_UNKNOWN_FALLBACK, OUTPUT_CONTEXT_SLACK, FALLBACK_CONTEXT_WINDOW, FALLBACK_WORKING_CONTEXT } from '../src/lib/model-limits.js';
 import { planEffortRetry, resetEffortProbeForTests, isReasoningParamError } from '../src/lib/effort-probe.js';
 
 let passed = 0;
@@ -47,13 +47,32 @@ ok(antEp('https://api.deepseek.com/anthropic') === 'https://api.deepseek.com/ant
 ok(antEp('https://api.anthropic.com/v1/messages') === 'https://api.anthropic.com/v1/messages', 'anthropic 完整端点原样');
 ok(gemBase('https://generativelanguage.googleapis.com/v1beta/') === 'https://generativelanguage.googleapis.com/v1beta', 'gemini base 归一');
 
+/* ---- 1b. 输出上限：满额、25.6 万封顶、扣掉已占用、未知 32k ---- */
+{
+  const unknown = resolveChatMaxTokens({ model: 'not-a-real-model-xyz' }, undefined, { usedTokens: 1000 });
+  ok(unknown === OUTPUT_TOKEN_UNKNOWN_FALLBACK, '未知模型 32k');
+  const capped = resolveChatMaxTokens(
+    { model: 'deepseek-v4-flash', baseUrl: 'https://api.deepseek.com/chat/completions', contextTokens: 1_000_000 },
+    undefined,
+    { usedTokens: 10_000 },
+  );
+  ok(capped === OUTPUT_TOKEN_REQUEST_CAP, '目录满额超过 25.6 万时封顶');
+  const room = resolveChatMaxTokens(
+    { model: 'deepseek-v4-flash', baseUrl: 'https://api.deepseek.com/chat/completions', contextTokens: 200_000 },
+    undefined,
+    { usedTokens: 150_000 },
+  );
+  ok(room === 200_000 - 150_000 - OUTPUT_CONTEXT_SLACK, '扣掉上下文已占用');
+  ok(resolveChatMaxTokens({ model: 'not-a-real-model-xyz' }, 500) === 500, '显式短上限原样保留');
+}
+
 /* ---- 2. openai 流式：跨 chunk 半行 + 工具参数分段 ---- */
 {
   const restore = withFetch((url, init) => {
     ok(url === 'https://api.deepseek.com/chat/completions', 'openai 流式请求地址');
     const body = JSON.parse(init.body);
     ok(body.stream === true && Array.isArray(body.tools) && body.tools.length > 0, 'openai 请求体带 stream+tools');
-    ok(body.max_tokens === 16384 && body.temperature === 0.7, 'openai 默认参数与收口前一致');
+    ok(body.max_tokens === OUTPUT_TOKEN_UNKNOWN_FALLBACK && body.temperature === 0.7, '未收录模型输出上限 32k');
     return sseResponse([
       'data: {"choices":[{"delta":{"content":"你"}}]}\n\ndata: {"choices":[{"delta":{"content":"好"}}]}\n\ndata: {"choi',
       'ces":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_w"}}]}}]}\n\n',

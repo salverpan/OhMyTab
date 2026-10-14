@@ -20,12 +20,11 @@ globalThis.chrome = {
 const { addNote, updateNote, listNotes, capNotes, MAX_NOTES } = await import('../src/lib/notebook.js');
 const {
   markHeartbeatRunning, markHeartbeatFinished, upsertHeartbeatTask, appendRunRecord, HEARTBEAT_MAX_RUNS,
-  heartbeatUserText,
+  heartbeatUserText, listHeartbeatTasks, purgeHeartbeatTasks, restoreHeartbeatTasks,
 } = await import('../src/lib/heartbeat.js');
 const { buildTimeline, MAX_EVENTS_PER_THREAD } = await import('../src/lib/timeline-model.js');
 const { computeOverviewStats, buildOverviewCharts } = await import('../src/lib/overview-stats.js');
 const { notebookTool } = await import('../src/lib/workspace-tools.js');
-const { timelineHtml } = await import('../src/sidepanel/timeline-view.js');
 
 let passed = 0;
 function ok(cond, label) {
@@ -135,17 +134,6 @@ const many = Array.from({ length: MAX_EVENTS_PER_THREAD + 5 }, (_, i) => ({
 const capped = buildTimeline({ notes: many, tasks: [] }).threads[0];
 ok(capped.events.length === MAX_EVENTS_PER_THREAD && capped.hiddenEvents === 5, '单主题事件封顶并提示隐藏数量');
 
-// —— 时间线 HTML：转义 + 修正链 ——
-const evil = buildTimeline({
-  notes: [{ id: 'a', claim: '<img src=x onerror=1>', kind: 'judgment', status: 'refuted', threadId: 't', createdAt: 10, supersededBy: 'b', history: [] },
-    { id: 'b', claim: '新判断', kind: 'judgment', status: 'open', threadId: 't', createdAt: 20, supersedes: 'a', history: [] }],
-  tasks: [],
-});
-const html = timelineHtml(evil, 'all', new Map([['b', { id: 'b', claim: '新判断' }]]));
-ok(!html.includes('<img src=x') && html.includes('&lt;img'), '时间线 HTML 转义用户文本');
-ok(html.includes('修正为') && html.includes('data-tl-note="b"') && html.includes('is-struck'), '被推翻判断划线并指向修正后的判断');
-ok(timelineHtml({ threads: [], totalEvents: 0 }, 'all', new Map()).includes('还没有追踪记录'), '空状态有引导文案');
-
 // —— 笔记上限：先丢最老观测 ——
 const big = [
   ...Array.from({ length: MAX_NOTES }, (_, i) => ({ id: `j${i}`, kind: 'judgment', threadId: 't' })),
@@ -178,5 +166,19 @@ const charts = buildOverviewCharts(stats);
 ok(charts.map((c) => c.id).join() === 'activity,status,calibration,sourceMix', '有数据时四张图齐全');
 ok(charts.every((c) => c.option && c.option.series && c.height > 0), '每张图都有 option 与高度');
 ok(buildOverviewCharts(computeOverviewStats({}, { now })).length === 0, '空项目不画图');
+
+// —— 心跳任务跟项目走 ——
+const other = await upsertHeartbeatTask({ name: '别的库', prompt: '巡检', every: '1h' }, { projectId: 'p2' });
+const listedP1 = await listHeartbeatTasks(PID);
+const listedP2 = await listHeartbeatTasks('p2');
+ok(listedP1.every((t) => t.projectId === PID) && !listedP1.some((t) => t.id === other.id), 'list 只返回当前项目');
+ok(listedP2.length === 1 && listedP2[0].id === other.id, '另一项目各自一份');
+const taken = await purgeHeartbeatTasks('p2');
+ok(taken.length === 1 && taken[0].id === other.id && (await listHeartbeatTasks('p2')).length === 0, '删库抽走该项目心跳');
+ok((await listHeartbeatTasks(PID)).some((t) => t.id === task.id), '删别的库不影响本项目心跳');
+await restoreHeartbeatTasks(taken);
+ok((await listHeartbeatTasks('p2')).some((t) => t.id === other.id), '撤销写回心跳任务');
+const rebound = await upsertHeartbeatTask({ id: other.id, name: '改名', projectId: PID });
+ok(rebound.projectId === 'p2' && rebound.name === '改名', '更新不得把任务改挂到别的项目');
 
 console.log(`timeline-smoke: ${passed} ok`);

@@ -3,6 +3,7 @@
  *
  * 一个库的内容散在四处，任何一处漏删都等于留孤儿（既占空间、又没有任何入口找回）：
  *   chrome.storage.local  entries_<pid> / notebook_<pid> / taglib_<pid> / chatSession_<pid>
+ *                         heartbeatTasks 里该项目的条目（全局数组，按 task.projectId 抽走）
  *   chrome.storage.sync   projConfig_<pid>
  *   IndexedDB citecat-docs      文档原件（key = 条目 id / entry.docId）
  *   IndexedDB citecat-artifacts 工作区材料（按 projectId 归属）
@@ -17,6 +18,7 @@ import { dumpArtifacts, deleteArtifactsByProject, putArtifact } from './artifact
 import { clearActivity } from './activity-log.js';
 import { clearTrace } from './trace-log.js';
 import { getAnnotationsForUrl, saveAnnotation, deleteAnnotation } from './annotations.js';
+import { listHeartbeatTasks, purgeHeartbeatTasks, restoreHeartbeatTasks } from './heartbeat.js';
 
 /** 撤销快照里最多保留多少原件字节（超过只恢复条目记录）。 */
 const MAX_UNDO_BYTES = 64 * 1024 * 1024;
@@ -68,8 +70,9 @@ export async function snapshotProject(pid) {
   }
 
   const artifacts = await dumpArtifacts({ projectId: id }).catch(() => []);
+  const heartbeatTasks = await listHeartbeatTasks(id).catch(() => []);
 
-  return { pid: id, local, sync, entries, docFiles, omittedBytes, annotations, artifacts };
+  return { pid: id, local, sync, entries, docFiles, omittedBytes, annotations, artifacts, heartbeatTasks };
 }
 
 /** 删除一个项目的全部内容，返回撤销快照。 */
@@ -96,6 +99,7 @@ export async function purgeProject(pid) {
   const artifacts = await deleteArtifactsByProject(id).catch(() => 0);
   await clearActivity(id);
   await clearTrace(id);
+  await purgeHeartbeatTasks(id).catch(() => []);
   return { ...snap, artifactCount: artifacts };
 }
 
@@ -108,6 +112,7 @@ export async function restoreProject(snap) {
   for (const g of snap.annotations || []) {
     for (const a of g.list) await saveAnnotation(g.url, a).catch(() => {});
   }
+  await restoreHeartbeatTasks(snap.heartbeatTasks).catch(() => {});
   for (const d of snap.artifacts || []) {
     await putArtifact({
       kind: d.kind || 'page',

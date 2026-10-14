@@ -21,10 +21,10 @@ import {
   reorderEntries, getEntries, getApiConfig, getSubagentLimits,
 } from './storage.js';
 import { deleteEntryCascade, restoreEntryCascade } from './entry-cascade.js';
-import { getVisionConfig, visionChat, OCR_PROMPT } from './vision-client.js';
+import { getVisionConfig, visionChat, visionOcrScreen } from './vision-client.js';
 import {
   listHeartbeatTasks, upsertHeartbeatTask, deleteHeartbeatTask, getHeartbeatTask,
-  formatCadence, cadenceToEvery, normalizeSchedule,
+  formatCadence, cadenceToEvery, normalizeSchedule, taskBelongsToProject,
 } from './heartbeat.js';
 import { getActiveSearchChannel, executeSearchChannel } from './search-channels.js';
 import { compactHistory, estimateMessagesTokens, estimateTokens } from '../sidepanel/history-compact.js';
@@ -45,7 +45,7 @@ import {
 } from './cdp.js';
 import { formatLoopResult, BROWSER_ACT_OPS } from './browser-loop.js';
 import { isExploreInteractAllowed } from './subagent-policy.js';
-import { commitRoundToolTranscript } from './tool-round-messages.js';
+import { appendViewportShots, commitRoundToolTranscript } from './tool-round-messages.js';
 import {
   listFeedsHandler, queryFeedItemsHandler, fetchFeedItemHandler, fetchFeedItemsHandler,
   refreshFeedsHandler,
@@ -64,7 +64,21 @@ import {
 } from './workspace-tools.js';
 import { planTool } from './plan.js';
 import { insightTool } from './insight.js';
+import { writeDocument } from './document-writer.js';
+import { putTrace, reportTraceNodes, newTraceId, CHAT_THREAD } from './trace-log.js';
 import { makeEditsCard, formatEditsForModel } from './doc-edits.js';
+
+/** 把引擎回带的 edits 挂到对话修改卡，并返回拼进工具结果的紧凑摘要。 */
+function publishDocEdits(ctx, args, r, tool) {
+  if (!r || typeof r !== 'object' || !r.ok || !Array.isArray(r.edits) || !r.edits.length) return '';
+  const docId = String(r.doc_id || (args && args.doc_id) || '');
+  const entry = (ctx.entries || []).find((e) => e && e.id === docId);
+  const name = r.doc_name || (entry && (entry.aiTitle || entry.originalTitle)) || '';
+  const card = makeEditsCard({ doc_id: docId, doc_name: name, tool: String(tool || ''), edits: r.edits });
+  if (!card) return '';
+  try { if (typeof ctx.onDocEdit === 'function') ctx.onDocEdit(card); } catch (_) {}
+  return formatEditsForModel(card);
+}
 import { validateTaskReport } from './task-report.js';
 
 export { calcRelevance, rankMemories };
@@ -114,7 +128,7 @@ export function isContextOverflowError(err) {
 export const WRITE_TOOLS = new Set([
   'delete_entry', 'update_entry', 'reorder_entries',
   'collect_content', 'confirm_collect', 'cancel_collect', 'create_document',
-  'collect_feed_items',
+  'collect_feed_items', 'compose_report', 'write_document',
 ]);
 
 /* 默认消息桥：panel 场景（发消息到 SW）。SW 场景用 ctx.bridge 覆盖为直调自身 handler。 */
@@ -315,8 +329,74 @@ function rememberLoopFingerprint(ctx, tabId, snap) {
   if (fp) ctx._pageLoop[tabId] = fp;
 }
 
+const VIEWPORT_SHOT_NOTE = '\n（已附当前视口截图，与本表同一画面。编号优先；截图中有而本表没有的控件再用 interact_page 的 click_at。）';
+
+function bytesToBase64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+/** 压到最长边 1280 的 JPEG。本模块会打进 SW 包，不能引用 document，只用 OffscreenCanvas。失败则退回原图。 */
+async function shrinkScreenshot(dataUrl, maxDim = 1280) {
+  try {
+    if (typeof OffscreenCanvas === 'undefined') return dataUrl;
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height);
+    if (typeof bitmap.close === 'function') bitmap.close();
+    const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.6 });
+    return `data:image/jpeg;base64,${bytesToBase64(new Uint8Array(await out.arrayBuffer()))}`;
+  } catch (_) {
+    return dataUrl;
+  }
+}
+
+/** 标签已在聚焦窗口的前台时截当前视口。不激活标签、不抢焦点。 */
+async function captureForegroundViewport(tab) {
+  if (!tab?.id) return null;
+  let fresh = tab;
+  try {
+    fresh = await chrome.tabs.get(tab.id);
+  } catch (_) {
+    return null;
+  }
+  if (!fresh?.active) return null;
+  try {
+    const [visible] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!visible || visible.id !== fresh.id) return null;
+  } catch (_) {
+    return null;
+  }
+  let dataUrl = '';
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab(fresh.windowId, { format: 'jpeg', quality: 60 });
+  } catch (_) {
+    return null;
+  }
+  if (!dataUrl || !dataUrl.startsWith('data:image') || dataUrl.length < 100) return null;
+  const shrunk = await shrinkScreenshot(dataUrl);
+  if (!shrunk || !shrunk.startsWith('data:image') || shrunk.length > 500000) return null;
+  return shrunk;
+}
+
+async function finishBrowserAct(ctx, tab, text) {
+  const shot = await captureForegroundViewport(tab);
+  if (!shot || !ctx) return text;
+  ctx._viewportShot = shot;
+  return text + VIEWPORT_SHOT_NOTE;
+}
+
 /** 全员默认页面循环（Main / general / browser）。不抢前台。 */
 export async function executeBrowserAct(args, ctx = {}) {
+  if (ctx) ctx._viewportShot = null;
   const op = String((args && args.op) || '').trim();
   if (!BROWSER_ACT_OPS.includes(op)) {
     return `browser_act 不支持 op=${op || '(空)'}。可用：${BROWSER_ACT_OPS.join(', ')}`;
@@ -352,12 +432,12 @@ export async function executeBrowserAct(args, ctx = {}) {
     }
     const snap = await sendLoopMessage(tab.id, { action: 'loop_observe' });
     rememberLoopFingerprint(ctx, tab.id, snap);
-    return formatLoopResult(snap, { acted: `navigate ${dest}` });
+    return finishBrowserAct(ctx, tab, formatLoopResult(snap, { acted: `navigate ${dest}` }));
   }
   if (op === 'observe') {
     const snap = await sendLoopMessage(tab.id, { action: 'loop_observe' });
     rememberLoopFingerprint(ctx, tab.id, snap);
-    return formatLoopResult(snap);
+    return finishBrowserAct(ctx, tab, formatLoopResult(snap));
   }
   const fingerprint = (ctx._pageLoop && ctx._pageLoop[tab.id]) || '';
   const resp = await sendLoopMessage(tab.id, {
@@ -372,7 +452,7 @@ export async function executeBrowserAct(args, ctx = {}) {
   const acted = op === 'type'
     ? `type [${args.index}]`
     : (op === 'select' || op === 'click' ? `${op} [${args.index}]` : op);
-  return formatLoopResult(resp, { acted });
+  return finishBrowserAct(ctx, tab, formatLoopResult(resp, { acted }));
 }
 
 /* 库中条目摘要（与侧栏 buildDynamicContext 同格式，保证两侧提示词一致） */
@@ -556,36 +636,38 @@ async function runMainWorldJS(tabId, code) {
   return { ok: true, value: result };
 }
 
-/* Shared Vision-LLM call: takes a data-URL image + text prompt, returns
-   { ok, content, scaleInfo } or { ok:false, error }. Handles image
-   downscaling (>1920px) via canvas (DOM 场景；SW 无 DOM 时跳过缩放)，
-   然后委托 vision-client.visionChat 完成 API 调用。 */
-async function callVisionModel(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 30000 } = {}) {
-  let imgDataUrl = imageDataUrl;
+/* 视口图超过 1920px 时缩小再送视觉模型。SW 无 DOM，跳过缩放。 */
+async function scaleVisionDataUrl(imageDataUrl) {
   const scaleInfo = { origW: 0, origH: 0, scaledW: 0, scaledH: 0 };
-  const doc = typeof document !== 'undefined' ? document : null; // SW 无 DOM，跳过缩放
-  if (doc && typeof Image !== 'undefined') {
-    try {
-      const img = new Image();
-      img.src = imageDataUrl;
-      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; setTimeout(rej, 3000); });
-      scaleInfo.origW = img.width; scaleInfo.origH = img.height;
-      scaleInfo.scaledW = img.width; scaleInfo.scaledH = img.height;
-      const maxDim = 1920;
-      if (img.width > maxDim || img.height > maxDim) {
-        const ratio = Math.min(maxDim / img.width, maxDim / img.height);
-        const canvas = doc.createElement('canvas');
-        canvas.width = Math.round(img.width * ratio);
-        canvas.height = Math.round(img.height * ratio);
-        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-        imgDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-        scaleInfo.scaledW = canvas.width; scaleInfo.scaledH = canvas.height;
-      }
-    } catch (_) {}
+  const doc = typeof document !== 'undefined' ? document : null;
+  if (!doc || typeof Image === 'undefined') return { dataUrl: imageDataUrl, scaleInfo };
+  try {
+    const img = new Image();
+    img.src = imageDataUrl;
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; setTimeout(rej, 3000); });
+    scaleInfo.origW = img.width; scaleInfo.origH = img.height;
+    scaleInfo.scaledW = img.width; scaleInfo.scaledH = img.height;
+    const maxDim = 1920;
+    if (img.width <= maxDim && img.height <= maxDim) return { dataUrl: imageDataUrl, scaleInfo };
+    const ratio = Math.min(maxDim / img.width, maxDim / img.height);
+    const canvas = doc.createElement('canvas');
+    canvas.width = Math.round(img.width * ratio);
+    canvas.height = Math.round(img.height * ratio);
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    scaleInfo.scaledW = canvas.width; scaleInfo.scaledH = canvas.height;
+    return { dataUrl: canvas.toDataURL('image/jpeg', 0.85), scaleInfo };
+  } catch (_) {
+    return { dataUrl: imageDataUrl, scaleInfo };
   }
-  const vr = await visionChat(imgDataUrl, prompt, { maxTokens, timeoutMs });
+}
+
+/* Shared Vision-LLM call: takes a data-URL image + text prompt, returns
+   { ok, content, scaleInfo } or { ok:false, error }. */
+async function callVisionModel(imageDataUrl, prompt, { maxTokens = 1000, timeoutMs = 30000 } = {}) {
+  const { dataUrl, scaleInfo } = await scaleVisionDataUrl(imageDataUrl);
+  const vr = await visionChat(dataUrl, prompt, { maxTokens, timeoutMs });
   if (!vr.ok) return vr;
-  return { ok: true, content: vr.content, scaleInfo };
+  return { ok: true, content: vr.content, finishReason: vr.finishReason || 'stop', scaleInfo };
 }
 
 /* Capture the currently visible viewport of a tab as JPEG. 先拉前台再截，20s 超时。 */
@@ -736,12 +818,21 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
       return { content: errContent, history: errContent, write: false };
     }
     const toolResult = await executeToolCall(tc.name, tc.arguments, ctx);
+    const image = ctx && typeof ctx._viewportShot === 'string' ? ctx._viewportShot : '';
+    if (ctx) ctx._viewportShot = null;
     hooks.done?.(label);
     logToolCall({ ctx, name: tc.name, args: tc.arguments, result: toolResult, durationMs: Date.now() - t0 });
     const elapsed = Date.now() - t0;
     if (elapsed < minAcceptDelayMs) await new Promise((r) => setTimeout(r, minAcceptDelayMs - elapsed));
-    return { content: toolResult, history: toolResult, write: WRITE_TOOLS.has(tc.name), name: tc.name };
+    return {
+      content: toolResult,
+      history: toolResult,
+      write: WRITE_TOOLS.has(tc.name),
+      name: tc.name,
+      image,
+    };
   } catch (err) {
+    if (ctx) ctx._viewportShot = null;
     console.warn('[Citecat] tool failed:', tc.name, err);
     const errContent = `Error: ${err.message}`;
     hooks.fail?.(label);
@@ -845,6 +936,60 @@ export async function processRoundToolCalls({
     }
   }
   commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs);
+  appendViewportShots(apiMessages, historyMessages, slots.map((slot) => slot && slot.image));
+}
+
+async function runDocumentWrite(args, ctx) {
+  let composed;
+  try {
+    composed = await writeDocument({
+      ...args,
+      brief: args.brief || args.question,
+      genre: args.genre || (args.question ? '文档' : ''),
+    }, {
+      apiConfig: ctx.apiConfig,
+      signal: ctx.subagentParentSignal || undefined,
+      ctx,
+      sessions: ctx.subagentSessions ? [...ctx.subagentSessions.values()] : [],
+    });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: `写文档失败：${err.message || String(err)}` });
+  }
+  if (!composed.ok) return JSON.stringify(composed);
+  const format = args.format === 'docx' ? 'docx' : 'md';
+  const saved = await executeToolCall('create_document', {
+    title: composed.title,
+    content: composed.markdown,
+    format,
+    summary: String(args.brief || args.question || composed.title).slice(0, 200),
+    tags: Array.isArray(args.tags) && args.tags.length ? args.tags : [String(args.genre || '文档')],
+  }, ctx);
+  if (!String(saved).startsWith('已创建文档')) {
+    return JSON.stringify({ ok: false, error: String(saved) });
+  }
+  try {
+    const pid = ctx.projectId || 'default';
+    const parentId = typeof ctx.getTraceTurnId === 'function' ? String(ctx.getTraceTurnId() || '') : '';
+    const threadId = (typeof ctx.getTraceThreadId === 'function' && ctx.getTraceThreadId()) || CHAT_THREAD;
+    for (const n of reportTraceNodes({
+      projectId: pid,
+      parentId,
+      threadId,
+      reportId: newTraceId('rp'),
+      title: composed.title,
+      question: String(args.brief || args.question || ''),
+      entryId: ctx.lastCreatedDocId || '',
+      outline: { title: composed.title, bluf: '', key_judgments: [] },
+      evidence: [],
+    })) putTrace(n);
+  } catch (_) { /* 追踪失败不影响文档本身 */ }
+  return JSON.stringify({
+    ok: true,
+    title: composed.title,
+    entry_id: ctx.lastCreatedDocId || '',
+    saved: '已保存到工作区「产出」。',
+    next: '只告诉用户文档已保存。不要在聊天里重写正文。',
+  });
 }
 
 export async function executeToolCall(name, args, ctx = {}) {
@@ -1078,7 +1223,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           try {
             const visionCfg = await getVisionConfig();
             if (!visionCfg.apiKey) {
-              return '当前渠道主模型不支持视觉，且未配置外挂 Vision。请换用带视觉的模型，或在设置页「视觉模型」里填一个兜底模型。';
+              return '当前渠道未配置 API Key，无法做视觉提取。请先在设置里配置接入渠道。';
             }
             const dims = await chrome.scripting.executeScript({
               target: { tabId: tab.id },
@@ -1099,7 +1244,8 @@ export async function executeToolCall(name, args, ctx = {}) {
               await new Promise((r) => setTimeout(r, 600)); // let render settle
               const dataUrl = await captureViewport(tab, 80);
               if (!dataUrl || dataUrl.length < 100) continue;
-              const vr = await callVisionModel(dataUrl, OCR_PROMPT, { maxTokens: 4000, timeoutMs: 45000 });
+              const { dataUrl: scaled } = await scaleVisionDataUrl(dataUrl);
+              const vr = await visionOcrScreen(scaled, { timeoutMs: 45000 });
               if (!vr.ok) { chunks.push(`[第${i + 1}屏提取失败: ${vr.error}]`); continue; }
               chunks.push(vr.content.trim());
             }
@@ -1911,7 +2057,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           capturedAt: ts,
           trustClass: 'derived',
         },
-        sourceTier: 'high',
+        sourceTier: '',
         tags: (args.tags || []).slice(0, 3),
         format: format,
         structuredData: args.structured_data || null,
@@ -1938,6 +2084,7 @@ export async function executeToolCall(name, args, ctx = {}) {
         }
       }
       await saveEntry(entry, ctx.projectId);
+      ctx.lastCreatedDocId = id;
       ctx.entries = await getEntries(ctx.projectId);
       ctx.onEntriesChanged && ctx.onEntriesChanged();
       notifyCollectionStatusChanged(ctx, { urls: [entry.url] });
@@ -1999,21 +2146,15 @@ export async function executeToolCall(name, args, ctx = {}) {
       // 缺失时直接返回可用工具清单，让模型看到错误即可自纠重试
       const editTool = args.tool || args.action || args.act || args.op;
       if (!editTool) {
-        return JSON.stringify({ ok: false, error: 'doc_edit 缺少必填参数 tool。可用：xlsx 为 set_range/set_bold/append_row/append_col/clear_range/switch_sheet；docx 与 .doc（会先转成 docx）为 replace_text/insert_text/set_bold/set_heading/add_list/add_table/set_cell（docx 文本修改默认修订痕迹，可传 track_changes=false 直接改）；txt 为 replace_text/insert_text；通用 undo/redo/export。请带 tool 重试' });
+        return JSON.stringify({ ok: false, error: 'doc_edit 缺少必填参数 tool。可用：xlsx 为 set_range/set_bold/append_row/append_col/clear_range/switch_sheet；docx 与 .doc（会先转成 docx）为 replace_text/insert_text/set_format/set_bold/set_heading/add_list/add_table/set_cell（默认直接写入；用户要求留痕时 replace_text/insert_text 传 track_changes=true）；txt 为 replace_text/insert_text；通用 undo/redo/export。请带 tool 重试' });
       }
       const r = await b.docEdit({ tool: String(editTool), args });
       // 改动痕迹：引擎在返回值里带了 {op, location, before, after}——挂到对话的修改卡，
       // 同时把紧凑摘要回喂模型当自证材料（原始 edits 不再进 JSON，避免重复占上下文）
       if (r && typeof r === 'object' && r.ok && Array.isArray(r.edits) && r.edits.length) {
-        const docId = String(r.doc_id || args.doc_id || '');
-        const entry = (ctx.entries || []).find((e) => e && e.id === docId);
-        const name = r.doc_name || (entry && (entry.aiTitle || entry.originalTitle)) || '';
-        const card = makeEditsCard({ doc_id: docId, doc_name: name, tool: String(editTool), edits: r.edits });
-        if (card) {
-          try { if (typeof ctx.onDocEdit === 'function') ctx.onDocEdit(card); } catch (_) {}
-          const { edits: _rawEdits, ...rest } = r;
-          return JSON.stringify(rest) + formatEditsForModel(card);
-        }
+        const note = publishDocEdits(ctx, args, r, editTool);
+        const { edits: _rawEdits, ...rest } = r;
+        return JSON.stringify(rest) + note;
       }
       return typeof r === 'string' ? r : JSON.stringify(r);
     }
@@ -2027,6 +2168,11 @@ export async function executeToolCall(name, args, ctx = {}) {
         return JSON.stringify({ ok: false, error: 'doc_review 缺少必填参数 tool。可用动作：list_revisions / accept(id|"all") / reject(id|"all")。提出修订走 doc_edit，无需点「编辑」。请带 tool 重试' });
       }
       const r = await b.docReview({ tool: String(reviewTool), args });
+      if (r && typeof r === 'object' && r.ok && Array.isArray(r.edits) && r.edits.length) {
+        const note = publishDocEdits(ctx, args, r, reviewTool);
+        const { edits: _rawEdits, ...rest } = r;
+        return JSON.stringify(rest) + note;
+      }
       return typeof r === 'string' ? r : JSON.stringify(r);
     }
     case 'manage_heartbeat': {
@@ -2056,12 +2202,16 @@ export async function executeToolCall(name, args, ctx = {}) {
           || (typeof ctx.getActiveHeartbeatTaskId === 'function' ? String(ctx.getActiveHeartbeatTaskId() || '') : '');
         if (!id) return JSON.stringify({ ok: false, error: 'complete 只能在心跳触发的那轮对话里用（或显式传 id）。' });
         const t = await getHeartbeatTask(id).catch(() => null);
-        if (!t) return JSON.stringify({ ok: false, error: `找不到任务 ${id}` });
+        if (!t || !taskBelongsToProject(t, pid)) return JSON.stringify({ ok: false, error: `找不到任务 ${id}` });
         await deleteHeartbeatTask(id);
         notify();
         return JSON.stringify({ ok: true, completed: id, name: t.name });
       }
       if (!args.id) return JSON.stringify({ ok: false, error: '需要 id（先 list）' });
+      const owned = await getHeartbeatTask(args.id).catch(() => null);
+      if (!owned || !taskBelongsToProject(owned, pid)) {
+        return JSON.stringify({ ok: false, error: `找不到任务 ${args.id}` });
+      }
       if (action === 'delete') {
         await deleteHeartbeatTask(args.id);
         notify();
@@ -2085,10 +2235,12 @@ export async function executeToolCall(name, args, ctx = {}) {
     }
     case 'submit_report': {
       if (!ctx.subagentKind) return JSON.stringify({ ok: false, error: 'submit_report 仅供 Sub 使用。' });
-      const checked = validateTaskReport(args);
+      const checked = validateTaskReport(args, { requireFindings: !ctx.subagentBudgetForced });
       if (checked.error) return JSON.stringify({ ok: false, error: checked.error });
       ctx.submittedReport = checked.report;
-      return JSON.stringify({ ok: true, accepted: true, claims: checked.report.claims.length });
+      return JSON.stringify({
+        ok: true, accepted: true, claims: checked.report.claims.length, findings: checked.report.findings.length,
+      });
     }
     case 'section_job': {
       if (!ctx.subagentKind) return JSON.stringify({ ok: false, error: 'section_job 仅供 Sub 使用。' });
@@ -2100,6 +2252,11 @@ export async function executeToolCall(name, args, ctx = {}) {
         return 'task 未就绪：子代理运行时没有加载。';
       }
       return runTaskToolImpl(args, ctx);
+    }
+    case 'write_document':
+    case 'compose_report': {
+      if (ctx.subagentKind) return JSON.stringify({ ok: false, error: 'write_document 仅供主代理使用。' });
+      return runDocumentWrite(args, ctx);
     }
     case 'plot_chart': {
       const built = buildPlotOption(args);

@@ -329,8 +329,8 @@ function bodyInsertPoint() {
 
 const editBuf = [];
 
-function recordEdit(op, location, before, after, note) {
-  editBuf.push({ op, location, before, after, note });
+function recordEdit(op, location, before, after, note, extra) {
+  editBuf.push({ op, location, before, after, note, ...(extra || {}) });
 }
 
 function attachEdits(r) {
@@ -638,6 +638,92 @@ function unwrap(wrapEl) {
   removeNode(wrapEl);
 }
 
+/** 从 comments.xml 把批注正文填回修订 w:id。引擎重载后内存表是空的，列表才能看到 note。 */
+async function hydrateRevisionNotes() {
+  if (!xmlDoc || !zip) return;
+  const file = zip.file('word/comments.xml');
+  if (!file) return;
+  let commentsXml;
+  try {
+    commentsXml = parseXml(await file.async('string'), 'comments.xml');
+  } catch (_) {
+    return;
+  }
+  const texts = new Map();
+  for (const c of Array.from(commentsXml.getElementsByTagNameNS(W, 'comment'))) {
+    const id = attr(c, 'id');
+    if (!id) continue;
+    let text = '';
+    for (const t of Array.from(c.getElementsByTagNameNS(W, 't'))) text += t.textContent || '';
+    texts.set(id, text);
+  }
+  const remember = (node, note, cid) => {
+    if (!node || !note) return;
+    if (node.localName !== 'ins' && node.localName !== 'del') return;
+    const wid = attr(node, 'id');
+    if (!wid) return;
+    revNoteMap.set(wid, note);
+    const n = parseInt(cid, 10);
+    if (Number.isFinite(n)) revCommentMap.set(wid, n);
+  };
+  for (const start of Array.from(xmlDoc.getElementsByTagNameNS(W, 'commentRangeStart'))) {
+    const note = texts.get(attr(start, 'id') || '');
+    if (!note) continue;
+    const cid = attr(start, 'id');
+    let cur = nextElementSiblingOf(start);
+    while (cur && !(cur.localName === 'commentRangeEnd' && attr(cur, 'id') === cid)) {
+      remember(cur, note, cid);
+      cur = nextElementSiblingOf(cur);
+    }
+    let prev = start.previousSibling;
+    while (prev) {
+      if (prev.nodeType === 1) {
+        if (prev.localName === 'del') remember(prev, note, cid);
+        break;
+      }
+      prev = prev.previousSibling;
+    }
+  }
+}
+
+/**
+ * 列表编号在本次结果里唯一。w:id 撞车时只让文档序的第一条沿用它，
+ * 其余另编号，accept/reject 因此不会一次打中两条。
+ */
+function assignListIds(items) {
+  const seen = new Map();
+  const kept = new Set();
+  for (const item of items) {
+    const wId = Number.isFinite(item.wId) && item.wId > 0 ? item.wId : 0;
+    const n = (seen.get(wId) || 0) + 1;
+    seen.set(wId, n);
+    if (n === 1 && wId > 0) kept.add(wId);
+  }
+  seen.clear();
+  let max = 0;
+  for (const id of kept) if (id > max) max = id;
+  const used = new Set(kept);
+  for (const item of items) {
+    const wId = Number.isFinite(item.wId) && item.wId > 0 ? item.wId : 0;
+    const n = (seen.get(wId) || 0) + 1;
+    seen.set(wId, n);
+    if (n === 1 && wId > 0) {
+      item.id = wId;
+      continue;
+    }
+    do { max += 1; } while (used.has(max));
+    used.add(max);
+    item.id = max;
+  }
+  return items;
+}
+
+function revisionListId(el) {
+  if (!el) return null;
+  const hit = scanRevisions().find((r) => r.delEl === el || r.insEl === el);
+  return hit ? hit.id : null;
+}
+
 /**
  * 文档序扫描修订列表；相邻的 del+ins（同作者，中间允许批注锚点）合并为
  * 一条 replace。返回条目含 DOM 元素引用，accept/reject 直接用。
@@ -657,9 +743,8 @@ function scanRevisions() {
     const delText = Array.from(node.getElementsByTagNameNS(W, 'delText')).map((d) => d.textContent).join('');
     const insText = insEl ? Array.from(insEl.getElementsByTagNameNS(W, 't')).map((t) => t.textContent).join('') : '';
     items.push({
-      // 稳定 id = 元素的 w:id（revSeq 单调分配、永不复用）。曾用 items.length+1
-      // 位置编号：accept/reject 后列表移位导致编号错位，reject(9) 命中错误对象
-      id: parseInt(attr(node, 'id'), 10) || items.length + 1,
+      // w:id 可能在 del 与 ins 上重复。列表 id 由 assignListIds 保证本次唯一。
+      wId: parseInt(attr(node, 'id'), 10),
       type: insEl ? 'replace' : 'delete',
       find: delText,
       replacement: insText,
@@ -674,7 +759,7 @@ function scanRevisions() {
     if (seen.has(node)) continue;
     const insText = Array.from(node.getElementsByTagNameNS(W, 't')).map((t) => t.textContent).join('');
     items.push({
-      id: parseInt(attr(node, 'id'), 10) || items.length + 1,
+      wId: parseInt(attr(node, 'id'), 10),
       type: 'insert',
       find: '',
       replacement: insText,
@@ -685,7 +770,7 @@ function scanRevisions() {
       insEl: node,
     });
   }
-  return items;
+  return assignListIds(items);
 }
 
 async function applyRevisionVerdict(item, accept) {
@@ -782,6 +867,7 @@ export async function initWordEditor(container, arrayBuffer) {
   redoStack = [];
   revCommentMap = new Map();
   revNoteMap = new Map();
+  await hydrateRevisionNotes();
 
   if (hasContainer && typeof document !== 'undefined') {
     selListener = () => { if (selectionCb) selectionCb(); };
@@ -881,6 +967,181 @@ export async function focusRevision(rid) {
 
 /* ---------- 工具执行入口 ---------- */
 
+const HIGHLIGHT_ALIAS = {
+  yellow: 'yellow', 黄: 'yellow', 黄色: 'yellow',
+  green: 'green', 绿: 'green', 绿色: 'green',
+  cyan: 'cyan', 青: 'cyan', 青色: 'cyan',
+  magenta: 'magenta', 品红: 'magenta',
+  blue: 'blue', 蓝: 'blue', 蓝色: 'blue',
+  red: 'red', 红: 'red', 红色: 'red',
+  darkblue: 'darkBlue', darkcyan: 'darkCyan', darkgreen: 'darkGreen',
+  darkmagenta: 'darkMagenta', darkred: 'darkRed', darkyellow: 'darkYellow',
+  darkgray: 'darkGray', gray: 'darkGray', grey: 'darkGray', 灰: 'darkGray', 灰色: 'darkGray',
+  lightgray: 'lightGray',
+  black: 'black', 黑: 'black', 黑色: 'black',
+  white: 'white', 白: 'white', 白色: 'white',
+};
+
+const ALIGN_ALIAS = {
+  left: 'left', 左: 'left', 左对齐: 'left',
+  center: 'center', 中: 'center', 居中: 'center',
+  right: 'right', 右: 'right', 右对齐: 'right',
+  justify: 'both', both: 'both', 两端: 'both', 两端对齐: 'both',
+};
+
+function hexColor(v) {
+  const s = String(v || '').trim().replace(/^#/, '');
+  if (/^[0-9A-Fa-f]{6}$/.test(s)) return s.toUpperCase();
+  if (/^[0-9A-Fa-f]{3}$/.test(s)) return s.split('').map((c) => c + c).join('').toUpperCase();
+  return '';
+}
+
+function asBool(v) {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (v === true || v === 1 || v === 'true') return true;
+  if (v === false || v === 0 || v === 'false') return false;
+  return null;
+}
+
+function ensureChild(parent, name) {
+  let n = childByName(parent, name);
+  if (!n) { n = el(name); parent.appendChild(n); }
+  return n;
+}
+
+function dropChild(parent, name) {
+  const n = childByName(parent, name);
+  if (n) removeNode(n);
+}
+
+function setFlag(rPr, tag, on) {
+  if (on) { if (!childByName(rPr, tag)) rPr.appendChild(el(tag)); }
+  else dropChild(rPr, tag);
+}
+
+/** 校验 set_format 参数。返回 {fmt} 或 {error}。空字段忽略，非法值拒绝，避免写进一半。 */
+function parseFormatArgs(args) {
+  const fmt = {};
+  const bools = ['bold', 'italic', 'underline', 'strike'];
+  for (const key of bools) {
+    if (args[key] === undefined) continue;
+    const b = asBool(args[key]);
+    if (b === null) return { error: `${key} 需要 true 或 false` };
+    fmt[key] = b;
+  }
+  if (args.font) fmt.font = String(args.font).trim().slice(0, 64);
+  if (args.size !== undefined && args.size !== '') {
+    const pt = Number(args.size);
+    if (!Number.isFinite(pt) || pt < 1 || pt > 72) return { error: 'size 是字号（磅），范围 1–72' };
+    fmt.size = pt;
+  }
+  if (args.color) {
+    const hex = hexColor(args.color);
+    if (!hex) return { error: 'color 需要 #RRGGBB' };
+    fmt.color = hex;
+  }
+  if (args.highlight) {
+    const raw = String(args.highlight).trim();
+    const named = HIGHLIGHT_ALIAS[raw] || HIGHLIGHT_ALIAS[raw.toLowerCase()];
+    const hex = hexColor(raw);
+    if (named) fmt.highlight = { kind: 'name', value: named };
+    else if (hex) fmt.highlight = { kind: 'hex', value: hex };
+    else return { error: 'highlight 用 Word 色名（yellow/red/blue…）或 #RRGGBB' };
+  }
+  if (args.align) {
+    const val = ALIGN_ALIAS[String(args.align).trim()] || ALIGN_ALIAS[String(args.align).trim().toLowerCase()];
+    if (!val) return { error: 'align 用 left / center / right / justify' };
+    fmt.align = val;
+  }
+  if (args.line_spacing !== undefined && args.line_spacing !== '') {
+    const mult = Number(args.line_spacing);
+    if (!Number.isFinite(mult) || mult < 0.5 || mult > 5) return { error: 'line_spacing 是倍数，如 1、1.5、2' };
+    fmt.line_spacing = mult;
+  }
+  for (const key of ['space_before', 'space_after', 'indent']) {
+    if (args[key] === undefined || args[key] === '') continue;
+    const pt = Number(args[key]);
+    if (!Number.isFinite(pt) || pt < 0 || pt > 400) return { error: `${key} 是磅，范围 0–400` };
+    fmt[key] = pt;
+  }
+  if (!Object.keys(fmt).length) return { error: 'set_format 至少指定一项格式（字体、字号、颜色、对齐、行距等）' };
+  return { fmt };
+}
+
+function formatNote(fmt) {
+  const bits = [];
+  if (fmt.font) bits.push(`字体 ${fmt.font}`);
+  if (fmt.size) bits.push(`${fmt.size}磅`);
+  if (fmt.bold === true) bits.push('加粗');
+  if (fmt.bold === false) bits.push('取消加粗');
+  if (fmt.italic === true) bits.push('斜体');
+  if (fmt.italic === false) bits.push('取消斜体');
+  if (fmt.underline === true) bits.push('下划线');
+  if (fmt.underline === false) bits.push('取消下划线');
+  if (fmt.strike === true) bits.push('删除线');
+  if (fmt.strike === false) bits.push('取消删除线');
+  if (fmt.color) bits.push(`颜色 #${fmt.color}`);
+  if (fmt.highlight) bits.push(fmt.highlight.kind === 'hex' ? `底色 #${fmt.highlight.value}` : `高亮 ${fmt.highlight.value}`);
+  if (fmt.align) bits.push(`对齐 ${fmt.align === 'both' ? '两端' : fmt.align}`);
+  if (fmt.line_spacing) bits.push(`行距 ${fmt.line_spacing}`);
+  if (fmt.space_before != null) bits.push(`段前 ${fmt.space_before}磅`);
+  if (fmt.space_after != null) bits.push(`段后 ${fmt.space_after}磅`);
+  if (fmt.indent != null) bits.push(`左缩进 ${fmt.indent}磅`);
+  return bits.join('，');
+}
+
+function applyRunFormat(run, fmt) {
+  let rPr = childByName(run, 'rPr');
+  if (!rPr) {
+    rPr = el('rPr');
+    run.insertBefore(rPr, run.firstChild);
+  }
+  if (fmt.bold !== undefined) { setFlag(rPr, 'b', fmt.bold); setFlag(rPr, 'bCs', fmt.bold); }
+  if (fmt.italic !== undefined) { setFlag(rPr, 'i', fmt.italic); setFlag(rPr, 'iCs', fmt.italic); }
+  if (fmt.strike !== undefined) setFlag(rPr, 'strike', fmt.strike);
+  if (fmt.underline !== undefined) {
+    if (fmt.underline) setAttr(ensureChild(rPr, 'u'), 'val', 'single');
+    else dropChild(rPr, 'u');
+  }
+  if (fmt.font) {
+    const fonts = ensureChild(rPr, 'rFonts');
+    for (const slot of ['ascii', 'hAnsi', 'eastAsia', 'cs']) setAttr(fonts, slot, fmt.font);
+  }
+  if (fmt.size) {
+    const half = String(Math.round(fmt.size * 2));
+    setAttr(ensureChild(rPr, 'sz'), 'val', half);
+    setAttr(ensureChild(rPr, 'szCs'), 'val', half);
+  }
+  if (fmt.color) setAttr(ensureChild(rPr, 'color'), 'val', fmt.color);
+  if (fmt.highlight) {
+    if (fmt.highlight.kind === 'name') {
+      dropChild(rPr, 'shd');
+      setAttr(ensureChild(rPr, 'highlight'), 'val', fmt.highlight.value);
+    } else {
+      dropChild(rPr, 'highlight');
+      const shd = ensureChild(rPr, 'shd');
+      setAttr(shd, 'val', 'clear');
+      setAttr(shd, 'fill', fmt.highlight.value);
+    }
+  }
+}
+
+function applyParaFormat(para, fmt) {
+  let pPr = directChildren(para, 'pPr')[0];
+  if (!pPr) { pPr = el('pPr'); para.insertBefore(pPr, para.firstChild); }
+  if (fmt.align) setAttr(ensureChild(pPr, 'jc'), 'val', fmt.align);
+  if (fmt.line_spacing != null || fmt.space_before != null || fmt.space_after != null) {
+    const sp = ensureChild(pPr, 'spacing');
+    if (fmt.line_spacing != null) {
+      setAttr(sp, 'line', String(Math.round(fmt.line_spacing * 240)));
+      setAttr(sp, 'lineRule', 'auto');
+    }
+    if (fmt.space_before != null) setAttr(sp, 'before', String(Math.round(fmt.space_before * 20)));
+    if (fmt.space_after != null) setAttr(sp, 'after', String(Math.round(fmt.space_after * 20)));
+  }
+  if (fmt.indent != null) setAttr(ensureChild(pPr, 'ind'), 'left', String(Math.round(fmt.indent * 20)));
+}
+
 export async function execWordTool(tool, args = {}) {
   editBuf.length = 0;
   return attachEdits(await execWordToolInner(tool, args));
@@ -893,6 +1154,11 @@ async function execWordToolInner(tool, args = {}) {
       case 'replace_text': {
         const find = String(args.find || '');
         if (!find) return { ok: false, error: '缺少 find 参数' };
+        const replacement = String(args.replace ?? '');
+        if (find === replacement) {
+          if (!locateRuns(find)) return { ok: false, error: `未找到文本: ${find}` };
+          return { ok: true, noop: true, summary: `「${find}」与替换文本相同，未修改` };
+        }
         const loc = locateRuns(find);
         if (!loc) return { ok: false, error: `未找到文本: ${find}` };
         const g1 = guardPendingRevision(loc);
@@ -900,7 +1166,6 @@ async function execWordToolInner(tool, args = {}) {
         pushUndo();
         const first = loc.runs[0];
         const where = paraLocation(first); // 必须在移除 run 之前取（移除后找不到宿主段落）
-        const replacement = String(args.replace ?? '');
         if (replacement) first.parentNode.insertBefore(makeRun(replacement, first), first);
         for (const r of loc.runs) removeNode(r);
         recordEdit('replace', where, find, replacement);
@@ -944,7 +1209,7 @@ async function execWordToolInner(tool, args = {}) {
             else if (!wantBold && existing) removeNode(existing);
           }
         }
-        recordEdit('format', paraLocation(loc.runs[0]), find, find, wantBold ? '加粗' : '取消加粗');
+        recordEdit('format', paraLocation(loc.runs[0]), find, '', wantBold ? '加粗' : '取消加粗');
         dirty = true;
         scheduleRender();
         return { ok: true, summary: `已${wantBold ? '加粗' : '取消加粗'}「${find}」` };
@@ -965,7 +1230,7 @@ async function execWordToolInner(tool, args = {}) {
         let pStyle = directChildren(pPr, 'pStyle')[0];
         if (!pStyle) { pStyle = el('pStyle'); pPr.insertBefore(pStyle, pPr.firstChild); }
         setAttr(pStyle, 'val', styleId);
-        recordEdit('format', paraLocation(loc.runs[0]), find, find, `设为标题 ${level}`);
+        recordEdit('format', paraLocation(loc.runs[0]), find, '', `设为标题 ${level}`);
         dirty = true;
         scheduleRender();
         return { ok: true, summary: `已将「${find}」所在段落设为标题 ${level}（样式 ${styleId}）` };
@@ -986,10 +1251,42 @@ async function execWordToolInner(tool, args = {}) {
         if (!numPr) { numPr = el('numPr'); pPr.insertBefore(numPr, pPr.firstChild); }
         const ilvl = el('ilvl'); setAttr(ilvl, 'val', '0'); numPr.appendChild(ilvl);
         const nid = el('numId'); setAttr(nid, 'val', String(numId)); numPr.appendChild(nid);
-        recordEdit('format', paraLocation(loc.runs[0]), find, find, args.ordered ? '转为有序列表' : '转为无序列表');
+        recordEdit('format', paraLocation(loc.runs[0]), find, '', args.ordered ? '转为有序列表' : '转为无序列表');
         dirty = true;
         scheduleRender();
         return { ok: true, summary: `已将「${find}」所在段落转为${args.ordered ? '有序' : '无序'}列表` };
+      }
+      case 'set_format': {
+        const find = String(args.find || '');
+        if (!find) return { ok: false, error: '缺少 find 参数' };
+        const parsed = parseFormatArgs(args);
+        if (parsed.error) return { ok: false, error: parsed.error };
+        const loc = locateRuns(find);
+        if (!loc) return { ok: false, error: `未找到文本: ${find}` };
+        const gFmt = guardPendingRevision(loc);
+        if (gFmt) return gFmt;
+        pushUndo();
+        const where = paraLocation(loc.runs[0]);
+        const fmt = parsed.fmt;
+        const runKeys = ['bold', 'italic', 'underline', 'strike', 'font', 'size', 'color', 'highlight'];
+        const paraKeys = ['align', 'line_spacing', 'space_before', 'space_after', 'indent'];
+        if (runKeys.some((k) => fmt[k] !== undefined)) {
+          for (const run of loc.runs) applyRunFormat(run, fmt);
+        }
+        if (paraKeys.some((k) => fmt[k] !== undefined)) {
+          const seen = new Set();
+          for (const run of loc.runs) {
+            const para = paragraphOfRun(run);
+            if (!para || seen.has(para)) continue;
+            seen.add(para);
+            applyParaFormat(para, fmt);
+          }
+        }
+        const note = formatNote(fmt);
+        recordEdit('format', where, find, '', note);
+        dirty = true;
+        scheduleRender();
+        return { ok: true, summary: `已直接设置「${find}」的格式：${note}` };
       }
       case 'add_table': {
         const rows = Math.max(1, parseInt(args.rows, 10) || 2);
@@ -1080,7 +1377,7 @@ async function execWordToolInner(tool, args = {}) {
         return { ok: true, summary: '已重做' };
       }
       default:
-        return { ok: false, error: `未知 Word 工具: ${tool}。可用：replace_text / insert_text / set_bold / set_heading / add_list / add_table / set_cell / undo / redo（export 由阅读器保存流程处理）` };
+        return { ok: false, error: `未知 Word 工具: ${tool}。可用：replace_text / insert_text / set_format / set_bold / set_heading / add_list / add_table / set_cell / undo / redo（export 由阅读器保存流程处理）` };
     }
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
@@ -1103,6 +1400,14 @@ async function execReviewToolInner(tool, args = {}) {
         const find = String(args.find || '');
         const replacement = String(args.replacement ?? '');
         if (!find) return { ok: false, error: '缺少 find 参数' };
+        if (find === replacement) {
+          if (!locateRuns(find)) return { ok: false, error: `未找到文本: ${find}` };
+          return { ok: true, noop: true, summary: `「${find}」与替换文本相同，未写入修订` };
+        }
+        const dup = scanRevisions().find((r) => r.type === 'replace' && r.find === find && r.replacement === replacement);
+        if (dup) {
+          return { ok: true, already_pending: true, summary: `已有相同待审修订 #${dup.id}，未重复添加`, revision: { id: dup.id } };
+        }
         const loc = locateRuns(find);
         if (!loc) return { ok: false, error: `未找到文本: ${find}` };
         const g5 = guardPendingRevision(loc);
@@ -1136,8 +1441,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty = true;
         scheduleRender();
-        const id = scanRevisions().length;
-        recordEdit('replace', where, find, replacement, note ? `修订留痕 · ${note}` : '修订留痕');
+        const id = revisionListId(insEl) || revisionListId(delEl);
+        recordEdit('replace', where, find, replacement, note ? `待审修订 · ${note}` : '待审修订', { tracked: true });
         return { ok: true, summary: `已提出修订 #${id}：把「${find}」改为「${replacement}」${note ? `（${note}）` : ''}，Word 原生修订痕迹`, revision: { id } };
       }
       case 'suggest_insert': {
@@ -1164,8 +1469,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty = true;
         scheduleRender();
-        const id = scanRevisions().length;
-        recordEdit('insert', '文末', '', text, note ? `修订留痕 · ${note}` : '修订留痕');
+        const id = revisionListId(lastIns);
+        recordEdit('insert', '文末', '', text, note ? `待审修订 · ${note}` : '待审修订', { tracked: true });
         return { ok: true, summary: `已在文档末尾插入修订 #${id}：${text.slice(0, 40)}${text.length > 40 ? '…' : ''}${note ? `（${note}）` : ''}`, revision: { id } };
       }
       case 'suggest_delete': {
@@ -1198,8 +1503,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty = true;
         scheduleRender();
-        const id = scanRevisions().length;
-        recordEdit('delete', where, find, '', note ? `修订留痕 · ${note}` : '修订留痕');
+        const id = revisionListId(delEl);
+        recordEdit('delete', where, find, '', note ? `待审修订 · ${note}` : '待审修订', { tracked: true });
         return { ok: true, summary: `已提出删除修订 #${id}：「${find}」${note ? `（${note}）` : ''}`, revision: { id } };
       }
       case 'list_revisions': {
@@ -1231,7 +1536,8 @@ async function execReviewToolInner(tool, args = {}) {
         }
         dirty = true;
         scheduleRender();
-        recordEdit('review', '', '', '', `已${tool === 'accept' ? '接受' : '拒绝'} ${done} 条修订，剩余 ${scanRevisions().length} 条`);
+        const left = scanRevisions().length;
+        recordEdit('review', '', '', '', `已${tool === 'accept' ? '接受' : '拒绝'} ${done} 条修订，剩余 ${left} 条`, { pending: left > 0 });
         return {
           ok: true,
           summary: `已${tool === 'accept' ? '接受' : '拒绝'} ${done} 条修订，剩余 ${scanRevisions().length} 条待处理`,

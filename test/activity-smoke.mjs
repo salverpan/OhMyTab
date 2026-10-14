@@ -128,6 +128,6 @@ const evil = buildActivityStream([ev({ ts: t0, actor: 'sub', actorName: '<img on
 const html = activityHtml(evil, 'all');
 ok(!html.includes('<script>') && !html.includes('<img onerror') && html.includes('&lt;script&gt;'), '活动流渲染转义 HTML');
 ok(activityHtml(all, 'all').includes('×3'), '折叠计数渲染');
-ok(activityHtml({ items: [], matched: 0, hidden: 0 }, 'all').includes('还没有操作记录'), '空状态');
+ok(!activityHtml({ items: [], matched: 0, hidden: 0 }, 'all').includes('还没有操作记录'), '全量空状态不写引导');
 
 console.log(`activity smoke passed: ${passed} assertions`);

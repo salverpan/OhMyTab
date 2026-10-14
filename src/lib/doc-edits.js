@@ -95,15 +95,26 @@ export function formatEditsForModel(card) {
   const lines = list.slice(0, 8).map((e) => {
     const loc = e.location ? `（${e.location}）` : '';
     if (e.op === 'review') return `- ${e.note || '修订已处理'}`;
-    if (e.op === 'format') return `- ${loc}${e.note || '格式'}「${clip(e.before, MODEL_EDIT_CHARS)}」`;
-    if (e.op === 'insert') return `- ${loc}新增：「${clip(e.after, MODEL_EDIT_CHARS)}」`;
-    if (e.op === 'delete') return `- ${loc}删除：「${clip(e.before, MODEL_EDIT_CHARS)}」`;
-    return `- ${loc}「${clip(e.before, MODEL_EDIT_CHARS)}」→「${clip(e.after, MODEL_EDIT_CHARS)}」`;
+    const mark = e.tracked ? '待审修订 ' : '';
+    if (e.op === 'format') return `- ${loc}${mark}${e.note || '格式'}「${clip(e.before, MODEL_EDIT_CHARS)}」`;
+    if (e.op === 'insert') return `- ${loc}${mark}新增：「${clip(e.after, MODEL_EDIT_CHARS)}」`;
+    if (e.op === 'delete') return `- ${loc}${mark}删除：「${clip(e.before, MODEL_EDIT_CHARS)}」`;
+    return `- ${loc}${mark}「${clip(e.before, MODEL_EDIT_CHARS)}」→「${clip(e.after, MODEL_EDIT_CHARS)}」`;
   });
   const extra = list.length > 8 ? `\n…另有 ${list.length - 8} 处（对话里的修改卡可看全）` : '';
   const who = card.doc_name || card.doc_id || '文档';
   return `\n本次改动痕迹已挂到对话里（${who} · ${list.length} 处）：\n${lines.join('\n')}${extra}\n` +
     '（这是你自己刚做的改动：向用户汇报时说清改了哪几处、改成什么，不要只说「已完成」；也不必复述全部痕迹。）';
+}
+
+/** 卡上是否还有未接受的 Word 修订。直接写入的改动不算。 */
+function cardPending(edits) {
+  let pending = false;
+  for (const e of edits || []) {
+    if (e && e.tracked) pending = true;
+    if (e && e.op === 'review') pending = e.pending === true;
+  }
+  return pending;
 }
 
 function esc(s) {
@@ -141,14 +152,19 @@ export function docEditsCardHtml(card, prefix = 'chat') {
   const shown = card.edits.slice(0, CARD_MAX_ITEMS);
   const more = total > shown.length ? `<div class="${prefix}-diff-more">…另有 ${total - shown.length} 处未展开</div>` : '';
   const name = card.doc_name || card.doc_id || '文档';
+  const pending = cardPending(card.edits);
+  const tag = pending ? '待审修订' : '已写入';
+  const foot = pending
+    ? '文档里仍有修订痕迹，可在阅读器或 Word 里逐条接受或拒绝'
+    : '已直接写入文档';
   return `<details class="${prefix}-diff" data-diff-doc="${esc(card.id)}" open>` +
     `<summary class="${prefix}-diff-head">` +
       `<span class="${prefix}-diff-file">${esc(name)}</span>` +
       `<span class="${prefix}-diff-count">${total} 处修改</span>` +
-      `<span class="${prefix}-diff-tag">修订留痕</span>` +
+      `<span class="${prefix}-diff-tag">${tag}</span>` +
     `</summary>` +
     `<div class="${prefix}-diff-body">${shown.map((e) => editBlockHtml(e, prefix)).join('')}${more}</div>` +
-    `<div class="${prefix}-diff-foot">修订未定稿：在 Word / 阅读器里逐条接受或拒绝（doc_review list_revisions）</div>` +
+    `<div class="${prefix}-diff-foot">${foot}</div>` +
   `</details>`;
 }
 

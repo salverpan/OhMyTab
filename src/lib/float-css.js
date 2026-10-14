@@ -121,6 +121,7 @@ export const FLOAT_UI_CSS = `
   /* ---- 浮动 AI 聊天窗（元素/划词提问） ---- */
   .chat-win {
     position: fixed; z-index: 2147483646;
+    box-sizing: border-box;
     width: 380px; max-height: 420px;
     display: none; flex-direction: column;
     background: #ffffff;
@@ -140,6 +141,9 @@ export const FLOAT_UI_CSS = `
     animation: chatWinIn 280ms cubic-bezier(0.34,1.25,0.64,1) both;
   }
   .chat-win.cw-min { max-height: 40px; }
+  .chat-win.cw-rz-ew, .chat-win.cw-rz-ew * { cursor: ew-resize !important; }
+  .chat-win.cw-rz-ns, .chat-win.cw-rz-ns * { cursor: ns-resize !important; }
+  .chat-win.cw-rz-nwse, .chat-win.cw-rz-nwse * { cursor: nwse-resize !important; }
   .chat-win.cw-min .cw-body, .chat-win.cw-min .cw-input { display: none; }
   @keyframes chatWinIn {
     from { opacity: 0; transform: translateY(10px) scale(0.96); filter: blur(12px) saturate(1.3); }

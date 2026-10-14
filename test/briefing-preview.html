@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>任务追踪 · 随对话生长</title>
+  <style>
+    :root {
+      --ink: #18181b;
+      --body-color: #52525b;
+      --muted: #6b6b73;
+      --muted-soft: #92929b;
+      --hairline: rgba(0, 0, 0, 0.08);
+      --canvas: #ffffff;
+      --page-bg: #f7f7f8;
+      --surface-soft: #f4f4f5;
+      --primary: #4e75df;
+      --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font-body);
+      background: #e8e8ec;
+      color: var(--ink);
+      padding: 24px 24px 48px;
+    }
+    h1 { font-size: 20px; font-weight: 650; margin: 0 0 6px; }
+    .lead { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 0 0 18px; max-width: 760px; }
+    .stage-bar {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; align-items: center;
+    }
+    .stage-bar button {
+      border: 1px solid var(--hairline); background: #fff; border-radius: 999px;
+      padding: 6px 12px; font-size: 12px; cursor: pointer; color: var(--body-color);
+    }
+    .stage-bar button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+    .stage-bar .clock { font-size: 12px; color: var(--muted); margin-left: 4px; }
+    .stage { display: flex; gap: 28px; align-items: flex-start; flex-wrap: wrap; }
+    .chrome {
+      width: 380px; background: var(--page-bg); border: 1px solid var(--hairline);
+      border-radius: 16px; box-shadow: 0 12px 40px rgba(16,24,40,.1); overflow: hidden; flex: 0 0 auto;
+    }
+    .chrome-bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 12px; background: var(--canvas);
+      border-bottom: 1px solid var(--hairline); font-size: 12px; font-weight: 650;
+    }
+    .tabs { display: flex; gap: 0; padding: 8px 10px 0; background: var(--canvas); border-bottom: 1px solid var(--hairline); }
+    .tabs span { padding: 5px 10px; font-size: 12px; color: var(--muted); }
+    .tabs span.on { color: var(--ink); font-weight: 650; background: var(--page-bg); border-radius: 8px 8px 0 0; }
+    .pane { padding: 12px; max-height: 760px; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
+
+    /* 时间流 */
+    .flow { background: var(--canvas); border: 1px solid var(--hairline); border-radius: 12px; padding: 10px 10px 8px; }
+    .flow-k { font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
+    .tree { list-style: none; margin: 0; padding: 0 0 0 10px; }
+    .tree ul { list-style: none; margin: 0; padding: 0 0 0 16px; border-left: 1px solid var(--hairline); }
+    .node {
+      position: relative; display: none;
+      grid-template-columns: 9px 1fr; column-gap: 8px;
+      padding: 5px 0; font-size: 12px; line-height: 1.35;
+    }
+    .node.show { display: grid; }
+    .node > .dot { grid-column: 1; grid-row: 1; }
+    .node > div { grid-column: 2; grid-row: 1; }
+    .node > ul { grid-column: 2; grid-row: 2; }
+    .node::before {
+      content: ''; position: absolute; left: -16px; top: 12px; width: 10px; height: 1px; background: var(--hairline);
+    }
+    .tree > .node::before { display: none; }
+    .dot {
+      width: 9px; height: 9px; border-radius: 50%; margin-top: 4px;
+      background: #d4d4d8; box-shadow: 0 0 0 3px #fff;
+    }
+    .node.is-run .dot { background: #4e75df; animation: pulse 1.2s ease-in-out infinite; }
+    .node.is-ok .dot { background: #16a34a; }
+    .node.is-warn .dot { background: #f59e0b; }
+    .node.is-bad .dot { background: #dc2626; }
+    .node.is-you .dot { background: var(--ink); }
+    .node.is-dim { opacity: .45; }
+    .node b { font-weight: 650; display: block; }
+    .node .meta { color: var(--muted); font-size: 10.5px; }
+    .chip {
+      display: inline-block; margin-top: 2px; padding: 0 6px; border-radius: 8px;
+      font-size: 10px; line-height: 16px; background: var(--surface-soft); color: var(--muted);
+    }
+    .chip.is-run { background: rgba(78,117,223,.12); color: #3658b8; }
+    .chip.is-ok { background: rgba(22,163,74,.12); color: #15803d; }
+    .chip.is-warn { background: rgba(245,158,11,.12); color: #b45309; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(78,117,223,.18); } }
+
+    /* 简报：排版，不是仪表盘 */
+    .tb-root { display: flex; flex-direction: column; gap: 14px; font-size: 12.5px; }
+    .tb-k {
+      font-size: 10px; font-weight: 600; color: var(--muted-soft);
+      letter-spacing: .12em; text-transform: uppercase;
+    }
+    .tb-question { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .tb-empty {
+      padding: 18px 4px; color: var(--muted); line-height: 1.65; font-size: 12.5px;
+    }
+    .tb-bluf { padding: 0 0 14px; border-bottom: 1px solid var(--hairline); }
+    .tb-bluf .tb-k { margin-bottom: 8px; }
+    .tb-bluf-t { font-size: 16px; font-weight: 560; line-height: 1.4; letter-spacing: -0.02em; }
+
+    .jlist { list-style: none; margin: 0; padding: 0; }
+    .j {
+      padding: 14px 0;
+      border-bottom: 1px solid var(--hairline);
+    }
+    .j:last-child { border-bottom: 0; }
+    .j-top {
+      display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+      margin-bottom: 6px;
+    }
+    .j-n { font-size: 10px; color: var(--muted-soft); letter-spacing: .08em; font-variant-numeric: tabular-nums; }
+    .j-stance { font-size: 10.5px; color: var(--muted); letter-spacing: .04em; }
+    .j.is-mixed .j-stance { color: #8a6a1a; }
+    .j.is-no .j-stance { color: #8a5a4a; }
+    .j-t { font-size: 14px; font-weight: 600; line-height: 1.4; letter-spacing: -0.015em; margin: 0; }
+    .j.is-no .j-t { color: var(--body-color); font-weight: 550; }
+    .j-why { margin: 5px 0 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .j-trio {
+      display: flex;
+      align-items: flex-end;
+      gap: 18px;
+      margin-top: 12px;
+      font-variant-numeric: tabular-nums;
+      width: max-content;
+    }
+    .j-trio span {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .j-trio small {
+      font-size: 10px; letter-spacing: .1em; font-weight: 400; line-height: 1; color: var(--ink);
+    }
+    .j-trio b {
+      font-size: 22px; font-weight: 650; line-height: 1; letter-spacing: -0.03em;
+    }
+    .j-trio .is-for b { color: #15803d; }
+    .j-trio .is-against b { color: #b91c1c; }
+    .j-trio .is-open b { color: #b45309; }
+
+    .tb-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+    .tb-row { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; line-height: 1.45; }
+    .tb-row i {
+      flex: 0 0 3.2em; font-style: normal; font-size: 10px; letter-spacing: .06em;
+      color: var(--muted-soft);
+    }
+    .tb-act {
+      margin-left: auto; padding: 0; border: 0; background: none;
+      color: var(--ink); font-size: 11px; text-decoration: underline;
+      text-underline-offset: 2px; cursor: pointer;
+    }
+    .ghost { display: none; }
+
+    .notes { max-width: 400px; display: flex; flex-direction: column; gap: 12px; padding-top: 4px; }
+    .note { font-size: 13px; line-height: 1.5; color: var(--body-color); }
+    .note b { color: var(--ink); display: block; margin-bottom: 2px; }
+  </style>
+</head>
+<body>
+  <h1>任务追踪 · 随对话生长</h1>
+  <p class="lead">上半是 <strong>ChatFlow</strong>，下半是<strong>此刻</strong>能拍的板。点下面四个时刻，看节点怎么长、结论怎么从空变成能用。</p>
+  <div class="stage-bar">
+    <button type="button" data-t="0" class="on">1 · 刚提问</button>
+    <button type="button" data-t="1">2 · 派出调研</button>
+    <button type="button" data-t="2">3 · 证据回来</button>
+    <button type="button" data-t="3">4 · 写成研报 + 你又追问</button>
+    <span class="clock" id="clock">14:02</span>
+  </div>
+
+  <div class="stage">
+    <div class="chrome">
+      <div class="chrome-bar">工作区 · 稀土永磁</div>
+      <div class="tabs"><span>来源</span><span>笔记</span><span class="on">任务追踪</span><span>活动</span></div>
+      <div class="pane">
+        <section class="flow">
+          <div class="flow-k">ChatFlow</div>
+          <ul class="tree">
+            <li class="node is-you show" data-from="0">
+              <i class="dot"></i>
+              <div><b>你 · 14:02</b>稀土替代：无稀土电机进展到什么程度？<span class="chip">提问</span></div>
+            </li>
+            <li class="node is-run" data-from="1" data-done="2" id="n-main">
+              <i class="dot"></i>
+              <div><b>主代理</b>拆成定点 / 技术两条去查
+                <span class="chip is-run" data-live="1">派出中</span>
+                <span class="chip is-ok ghost" data-live="2">已收回</span>
+              </div>
+              <ul>
+                <li class="node is-run" data-from="1" data-done="2" id="n-a">
+                  <i class="dot"></i>
+                  <div><b>子代理 · 车企定点</b>
+                    <span class="meta" data-live="1">BMW / 比亚迪 / 定点清单</span>
+                    <span class="chip is-run" data-live="1">进行中 2m</span>
+                    <span class="chip is-ok ghost" data-live="2">完成 · 3 条判断</span>
+                  </div>
+                  <ul>
+                    <li class="node is-ok" data-from="2"><i class="dot"></i><div>铁氧体先上 A0，不是全面替代 <span class="meta">支撑 5</span></div></li>
+                    <li class="node is-warn" data-from="2"><i class="dot"></i><div>成本叙事被放大 <span class="meta">有反对</span></div></li>
+                  </ul>
+                </li>
+                <li class="node is-run" data-from="1" data-done="2" id="n-b">
+                  <i class="dot"></i>
+                  <div><b>子代理 · 技术路线</b>
+                    <span class="chip is-run" data-live="1">进行中</span>
+                    <span class="chip is-ok ghost" data-live="2">完成 · 2 条判断</span>
+                  </div>
+                  <ul>
+                    <li class="node is-bad" data-from="2"><i class="dot"></i><div>2026 全面替代拐点 <span class="meta">反对 6</span></div></li>
+                    <li class="node is-warn" data-from="2"><i class="dot"></i><div>高温退磁衰减幅度 <span class="meta">未查清</span></div></li>
+                  </ul>
+                </li>
+              </ul>
+            </li>
+            <li class="node is-ok" data-from="3">
+              <i class="dot"></i>
+              <div><b>研报 · 14:26</b>结论写入工作区
+                <span class="chip is-ok">已产出</span>
+              </div>
+            </li>
+            <li class="node is-you" data-from="3">
+              <i class="dot"></i>
+              <div><b>你 · 14:31</b>供应链制裁这块再查深一点<span class="chip">追问</span></div>
+            </li>
+            <li class="node is-run" data-from="3">
+              <i class="dot"></i>
+              <div><b>子代理 · 供应链</b>七家整车厂定点清单
+                <span class="chip is-run">进行中</span>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <article class="tb-root" id="brief">
+          <!-- filled by script -->
+        </article>
+      </div>
+    </div>
+
+    <div class="notes">
+      <div class="note"><b>左对齐，不拉满</b>「支撑 / 反对 / 未核」黑色、不加粗。数字用绿 / 红 / 黄认身份，越小越透明。</div>
+    </div>
+  </div>
+
+<script>
+function trio(pass, fail, open) {
+  const items = [
+    { n: pass, label: '支撑', cls: 'is-for' },
+    { n: fail, label: '反对', cls: 'is-against' },
+    { n: open, label: '未核', cls: 'is-open' },
+  ];
+  const max = Math.max(pass, fail, open, 1);
+  return `<div class="j-trio">${items.map((it) => {
+    const t = it.n / max;
+    const op = (0.28 + t * 0.72).toFixed(2);
+    return `<span class="${it.cls}"><small>${it.label}</small><b style="opacity:${op}">${it.n}</b></span>`;
+  }).join('')}</div>`;
+}
+
+function briefs() {
+  return [
+  ``,
+  `<div class="tb-question">稀土替代：无稀土电机的技术替代，进展到什么程度？</div>`,
+  `<div class="tb-question">稀土替代：无稀土电机的技术替代，进展到什么程度？</div>
+   <div class="tb-k">一线判断</div>
+   <ol class="jlist">
+     <li class="j">
+       <div class="j-top"><span class="j-n">01</span><span class="j-stance">待核验</span></div>
+       <p class="j-t">铁氧体 + 同步磁阻在 A0 车上会先落地</p>
+       ${trio(2, 0, 6)}
+     </li>
+     <li class="j is-mixed">
+       <div class="j-top"><span class="j-n">02</span><span class="j-stance">有争议</span></div>
+       <p class="j-t">成本优势成立，制裁叙事被放大</p>
+       ${trio(1, 2, 3)}
+     </li>
+   </ol>
+   <div class="tb-k">还不知道</div>
+   <ul class="tb-list"><li class="tb-row"><i>缺口</i>高温退磁衰减幅度</li></ul>`,
+  `<div class="tb-question">稀土替代：无稀土电机的技术替代，进展到什么程度？</div>
+   <section class="tb-bluf">
+     <div class="tb-k">结论</div>
+     <div class="tb-bluf-t">铁氧体已进入车企定点前夜，能量密度仍落后约 30%。2026 年只会在 A0 级车上小规模上车，谈不上全面替代。</div>
+   </section>
+   <div class="tb-k">核心判断</div>
+   <ol class="jlist">
+     <li class="j">
+       <div class="j-top"><span class="j-n">01</span><span class="j-stance">很可能成立</span></div>
+       <p class="j-t">铁氧体先上 A0，不是全面替代</p>
+       <p class="j-why">多家车企 2025–2026 定点都指向入门车型，高功率车仍用稀土。</p>
+       ${trio(8, 1, 2)}
+     </li>
+     <li class="j is-mixed">
+       <div class="j-top"><span class="j-n">02</span><span class="j-stance">有争议</span></div>
+       <p class="j-t">成本优势成立，制裁叙事被放大</p>
+       <p class="j-why">成本差能对上公开报价；制裁导致「全面替代」的推演缺一手证据。</p>
+       ${trio(4, 3, 3)}
+     </li>
+     <li class="j is-no">
+       <div class="j-top"><span class="j-n">03</span><span class="j-stance">不成立</span></div>
+       <p class="j-t">2026 年出现无稀土全面替代拐点</p>
+       <p class="j-why">产能、能量密度和定点清单都对不上「拐点」这个词。</p>
+       ${trio(1, 6, 2)}
+     </li>
+   </ol>
+   <div class="tb-k">还不知道</div>
+   <ul class="tb-list">
+     <li class="tb-row"><i>在查</i>七家整车厂定点清单</li>
+     <li class="tb-row"><i>缺口</i>高温退磁衰减幅度 <button class="tb-act" type="button">派去查</button></li>
+   </ul>`
+  ];
+}
+const clocks = ['14:02', '14:04', '14:18', '14:31'];
+
+function apply(t) {
+  document.getElementById('clock').textContent = clocks[t];
+  document.querySelectorAll('.stage-bar button').forEach((b) => b.classList.toggle('on', Number(b.dataset.t) === t));
+  document.querySelectorAll('.node').forEach((n) => {
+    const from = Number(n.dataset.from || 0);
+    n.classList.toggle('show', t >= from);
+  });
+  document.querySelectorAll('[data-live]').forEach((el) => {
+    const live = Number(el.dataset.live);
+    const hide = el.classList.contains('ghost') ? t < live : t !== live && !(el.classList.contains('ghost') === false && t >= live);
+  });
+  document.querySelectorAll('#n-main, #n-a, #n-b').forEach((n) => {
+    const done = Number(n.dataset.done);
+    n.classList.toggle('is-run', t >= 1 && t < done);
+    n.classList.toggle('is-ok', t >= done);
+  });
+  document.querySelectorAll('[data-live]').forEach((el) => {
+    const live = Number(el.dataset.live);
+    if (el.classList.contains('ghost')) el.style.display = t >= live ? 'inline-block' : 'none';
+    else el.style.display = t === live ? 'inline-block' : 'none';
+  });
+  document.getElementById('brief').innerHTML = briefs()[t];
+}
+document.querySelectorAll('.stage-bar button').forEach((b) => b.addEventListener('click', () => apply(Number(b.dataset.t))));
+apply(3);
+requestAnimationFrame(() => {
+  const el = document.querySelector('.tb-k');
+  const pane = document.querySelector('.pane');
+  const brief = document.getElementById('brief');
+  if (pane && brief) pane.scrollTop = brief.offsetTop - 8;
+});
+</script>
+</body>
+</html>

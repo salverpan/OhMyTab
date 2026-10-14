@@ -245,7 +245,9 @@ const CHAT_TOOLS = [
       description:
         '页面自动化紧循环：观察当前视口控件表并执行一步。每次调用结束后自动返回新表，不必再 number_elements。\n' +
         'op=observe 只观察。click/type/select 必须使用上一次表里的编号（select 用 3:2 这种「元素:选项」）。\n' +
-        '不要发明 CSS、坐标或 JS。点不动/表为空/反爬时再改用 interact_page（cdp_click / vision_find / exec_js_main / capture_network）。\n' +
+        '目标标签已在前台时，编号表后会附上同一视口截图（只在本轮请求里，不写入历史）。后台标签只有表，不要为了截图去 switch。\n' +
+        '点选优先用编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。\n' +
+        '不要发明 CSS 或 JS。点不动/表为空/反爬时再改用 interact_page（cdp_click / vision_find / exec_js_main / capture_network）。\n' +
         '能后台操作就传 tab_id，不要 switch 用户正在看的标签。',
       parameters: {
         type: 'object',
@@ -1102,9 +1104,10 @@ const CHAT_TOOLS = [
         '**无需打开阅读器、无需点「编辑」**；用户正在看的阅读器会自动刷新。' +
         '阅读器是 chrome-extension 内页，禁止 interact_page、禁止让用户去点编辑按钮。' +
         '目标用 doc_id（库内条目 id）；缺省=当前阅读器打开的那份。' +
-        '**docx 文本修改默认以 Word 原生修订痕迹呈现**（track_changes=true：删除线+插入标记+批注，' +
-        'Word/WPS 打开可逐条接受/拒绝，保存也保留痕迹；note 参数写批注理由）。用户明确要求"直接改/不用留痕"时传 track_changes=false。' +
-        '格式类操作（set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改。' +
+        '**docx 修改默认直接写入文档**，对话里会挂一张修改卡（已写入）。' +
+        '只有用户明确要求留痕、修订、给别人审时，replace_text / insert_text 才传 track_changes=true' +
+        '（Word 原生删除线+插入标记+批注；note 写修改理由）。' +
+        '格式类操作（set_format/set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改。' +
         'xlsx 公式以文本写入（如 "=SUM(A1:A3)"），Excel/WPS 打开后计算；无头路径不求值。' +
         '定位用 find 精确匹配，找不到如实报错，绝不模糊替换。**find 以含插入痕迹的当前可见文本为准**；' +
         '目标文本若处于待审修订（插入/删除痕迹）内，引擎会返回明确错误（不产生嵌套痕迹），先 list_revisions + accept/reject 处理该修订再编辑。' +
@@ -1117,8 +1120,9 @@ const CHAT_TOOLS = [
         '上传的 .xls 入库时已转成 xlsx，按 xlsx 编辑。' +
         'txt —— replace_text(find, replace)：替换第一处原文；insert_text(text)：文末插入。无修订痕迹。' +
         'doc —— 用 docx 的 replace_text/insert_text 等；引擎会先把 .doc 转成 docx（同一条目，正文保留）再改。' +
-        'docx —— replace_text(find, replace, note?)：把第一处匹配文本改为 replace（默认修订痕迹）；insert_text(text, note?)：文档末尾插入段落（默认修订痕迹）；' +
-        'set_bold(find)/set_heading(find, level)/add_list(find, ordered?)：定位文本并套格式（直接修改）；' +
+        'docx —— replace_text(find, replace, note?)：把第一处匹配文本改为 replace（默认直接写入）；insert_text(text, note?)：文档末尾插入段落（默认直接写入）；' +
+        'set_format(find, font?, size?, bold?, italic?, underline?, strike?, color?, highlight?, align?, line_spacing?, space_before?, space_after?, indent?)：给找到的文字和所在段落设格式（直接写入，未传的项保持原样）；' +
+        'set_bold(find)/set_heading(find, level)/add_list(find, ordered?)：定位文本并套格式（直接修改，set_format 的特例）；' +
         'add_table(rows, cols, header?)：末尾插入表格；set_cell(row, col, value)：写表格单元格（0 起）。' +
         '通用 —— undo/redo：撤销/重做；export：保存并触发下载。' +
         'sheet 缺省时用当前活动工作表。',
@@ -1127,12 +1131,12 @@ const CHAT_TOOLS = [
         properties: {
           tool: {
             type: 'string',
-            enum: ['set_range', 'set_bold', 'append_row', 'append_col', 'clear_range', 'switch_sheet', 'replace_text', 'insert_text', 'set_heading', 'add_list', 'add_table', 'set_cell', 'undo', 'redo', 'export'],
+            enum: ['set_range', 'set_bold', 'append_row', 'append_col', 'clear_range', 'switch_sheet', 'replace_text', 'insert_text', 'set_format', 'set_heading', 'add_list', 'add_table', 'set_cell', 'undo', 'redo', 'export'],
             description: '要执行的编辑操作。',
           },
           doc_id: { type: 'string', description: '目标文档 id（库内条目 id）。缺省=当前阅读器打开的文档。docx / xlsx / txt 无需阅读器、无需点「编辑」即可直接改。.doc 编辑时会转成 docx。' },
-          track_changes: { type: 'boolean', description: 'docx 文本修改是否带 Word 原生修订痕迹（默认 true）。用户要求"直接改/不用留痕/直接替换"时传 false。' },
-          note: { type: 'string', description: '（docx 修订模式）批注理由：为什么这么改，让用户不看原文也能决定接受与否。' },
+          track_changes: { type: 'boolean', description: 'docx 的 replace_text/insert_text 是否写成 Word 修订痕迹。默认 false（直接写入）。用户要求留痕、修订、给别人审时才传 true。' },
+          note: { type: 'string', description: 'track_changes=true 时的批注理由：为什么这么改。直接写入时不必传。' },
           sheet: { type: 'string', description: '（xlsx）工作表名，缺省用当前活动工作表。' },
           range: { type: 'string', description: '（xlsx）单元格区域，如 "A1"、"B2:C5"。' },
           values: { type: 'array', items: { type: 'array' }, description: '（xlsx set_range）二维数组，外层行、内层列。' },
@@ -1140,6 +1144,18 @@ const CHAT_TOOLS = [
           find: { type: 'string', description: '（docx）要定位的文本。' },
           replace: { type: 'string', description: '（docx replace_text）替换成的文本。' },
           text: { type: 'string', description: '（docx insert_text）要插入的文本，支持多行。' },
+          font: { type: 'string', description: '（docx set_format）字体名，如「微软雅黑」「Times New Roman」。中英文都用这一族。' },
+          size: { type: 'number', description: '（docx set_format）字号，单位磅，1–72。' },
+          italic: { type: 'boolean', description: '（docx set_format）true 斜体 / false 取消。' },
+          underline: { type: 'boolean', description: '（docx set_format）true 下划线 / false 取消。' },
+          strike: { type: 'boolean', description: '（docx set_format）true 删除线 / false 取消。' },
+          color: { type: 'string', description: '（docx set_format）文字颜色，#RRGGBB。' },
+          highlight: { type: 'string', description: '（docx set_format）高亮。Word 色名 yellow/green/cyan/blue/red/magenta 或 #RRGGBB 底色。' },
+          align: { type: 'string', enum: ['left', 'center', 'right', 'justify'], description: '（docx set_format）所在段落的对齐。' },
+          line_spacing: { type: 'number', description: '（docx set_format）行距倍数，如 1、1.15、1.5、2。' },
+          space_before: { type: 'number', description: '（docx set_format）段前间距，磅。' },
+          space_after: { type: 'number', description: '（docx set_format）段后间距，磅。' },
+          indent: { type: 'number', description: '（docx set_format）左缩进，磅。' },
           level: { type: 'number', description: '（docx set_heading）标题级别 1-6，默认 2。' },
           ordered: { type: 'boolean', description: '（docx add_list）true 有序列表 / false 无序。' },
           rows: { type: 'number', description: '（docx add_table）行数。' },
@@ -1159,7 +1175,7 @@ const CHAT_TOOLS = [
       name: 'doc_review',
       description:
         '审阅修订管理（docx）：列出 / 接受 / 拒绝文档里的 AI 修订（Word 原生痕迹）。' +
-        '**提出修订不再用本工具**：改文本用 doc_edit（track_changes 默认 true 即产生修订痕迹）。' +
+        '**提出修订不再用本工具**：普通修改用 doc_edit（默认直接写入）。用户要求留痕时，doc_edit 的 replace_text/insert_text 传 track_changes=true。' +
         'SW 引擎执行，**无需阅读器、无需点「编辑」**。传 doc_id（库内条目 id）。' +
         '动作：list_revisions 查看全部修订及编号；accept(id | "all") / reject(id | "all") 接受/拒绝修订。' +
         '纪律：接受/拒绝只在用户明确指示时调用；保存文件保留修订痕迹，Word 中仍可逐条审阅。' +
@@ -1190,7 +1206,7 @@ const CHAT_TOOLS = [
         '① 每天定点 time="09:00"；② 每周定点 time + weekdays=[1,3,5]；③ 一次性 at="2026-09-15T09:00"（跑完自动停用）；' +
         '④ 固定间隔 every="30m"/"3h"/"1d"（最短 5 分钟）；⑤ 以上都表达不了时才用 cron="0 9 * * 1-5"（分 时 日 月 周）。' +
         'list 查看（返回 schedule 原文）；update 可改 name/prompt 与时间字段；pause/resume/delete 要 id。' +
-        '每个扩展最多 20 条，任务按当前项目隔离。侧栏关闭时任务会排队，打开侧栏后执行。',
+        '每个项目最多 20 条，任务跟当前项目走（list/改删只碰本项目；删项目时一并清掉）。侧栏关闭时任务会排队，打开侧栏后执行。',
       parameters: {
         type: 'object',
         properties: {
@@ -1242,7 +1258,7 @@ const CHAT_TOOLS = [
         '不要用：一次 search_web 摘要就能答；只读用户当前页；改一个已勾选条目。\n' +
         '必须用：两路及以上独立检索/读多源全文；会刷爆主对话的调研；页面自动化支线。用户不必 @。\n' +
         '同一条消息可并行多个 task（最多 {{SUBAGENT_MAX_PARALLEL}}）；覆盖不全可再补一波，只补缺口不要重做。也可同时 read_current_page。派出去后不要自己再做同一件事。\n' +
-        '新任务 prompt 必须详细：目标、约束、要交回的字段。task_id 续传同一子会话。Check 发现内容错误时可用 revision=true 退回一次；第二次失败由你裁决。\n' +
+        '阅读任务的 prompt 写明要覆盖的要点。explore 交回 covered 与 unresolved，不交判断。缺口还会改变做法时只补派缺口。覆盖够了调用 write_document。task_id 续传同一子会话。\n' +
         'background=true 仅侧栏（立刻返回，完成后回注）；浮动窗会忽略并前台等待。不要轮询后台任务。',
       parameters: {
         type: 'object',
@@ -1253,7 +1269,7 @@ const CHAT_TOOLS = [
           },
           prompt: {
             type: 'string',
-            description: '给子代理的完整任务书。新任务必填；续传时可补充指令。必须写清要交回的信息格式。',
+            description: '给子代理的完整任务书。阅读任务写明体裁和要覆盖的要点，要求交回原文段落。不要只写「查一下 X」。',
           },
           subagent_type: {
             type: 'string',
@@ -1273,6 +1289,81 @@ const CHAT_TOOLS = [
           },
         },
         required: ['subagent_type'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_document',
+      description:
+        '按用户要的体裁，用本会话 explore 交回的原文段落写成文档并保存到「产出」。'
+        + '运行时在干净上下文里写一稿，再对照原文改一稿。数字和专名只能来自段落。'
+        + '返回 need_reading 时文档未保存，只为列出的要点再派 explore，然后再次调用。'
+        + '成功后只告诉用户已保存。不要用：用户已经给了全文的表格或文案（用 create_document）；还没有 passages 时先派阅读。',
+      parameters: {
+        type: 'object',
+        properties: {
+          genre: { type: 'string', description: '体裁，如策划方案、纪要、研报、对比、档案。决定章节，不套固定研报结构。' },
+          audience: { type: 'string', description: '读者是谁。' },
+          brief: { type: 'string', description: '这份文档要写什么、怎样算好、范围口径。写作阶段看不到对话，这里要写全。' },
+          must_cover: { type: 'array', items: { type: 'string' }, description: '必须覆盖的要点。' },
+          title: { type: 'string', description: '文档标题。留空从正文取。' },
+          task_ids: { type: 'array', items: { type: 'string' }, description: '只用这些子任务的段落。会话里有无关旧任务时必须传。' },
+          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md。用户要 Word 时 docx。' },
+          tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
+        },
+        required: ['genre', 'brief'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'compose_report',
+      description:
+        '与 write_document 相同，保留给旧调用。新任务请调用 write_document。',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '报告标题。留空由骨架生成。' },
+          question: {
+            type: 'string',
+            description: '报告要回答的核心问题，用用户的话并带上范围确认后的口径（对象、时间窗、地域）。',
+          },
+          brief: {
+            type: 'string',
+            description: '调研简报：用户关心的角度、用途、排除项、范围确认卡的答案。写作阶段看不到对话，这里要写全。',
+          },
+          audience: { type: 'string', description: '读者是谁（如“投研团队”“产品负责人”），决定措辞深浅。' },
+          hypotheses: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '派任务前提出的待检验假设；报告会逐条给出支持 / 削弱 / 无法判断。',
+          },
+          analyst_notes: {
+            type: 'string',
+            description: '你自己读页或对话中得到、但没进核验的观察。只作背景，不会被当成事实写进正文。',
+          },
+          task_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '只用这些子任务的证据。本会话里有不相关的旧任务时必须传；缺省用本会话全部子任务。',
+          },
+          notebook_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '额外纳入的笔记本条目 id（verified 的当事实用，open 的只进不确定性）。',
+          },
+          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md；用户要 Word 时 docx。' },
+          length: {
+            type: 'string',
+            enum: ['brief', 'standard', 'deep'],
+            description: 'brief≈1200–2000 字；standard≈2500–5000 字（默认）；deep≈5000–9000 字（用户要深度/完整报告时）。',
+          },
+          tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
+        },
+        required: ['question'],
       },
     },
   },
@@ -1353,6 +1444,8 @@ const TOOL_LABELS = {
   record_insight: 'Recording insight',
   plan: 'Planning',
   task: 'Delegating',
+  write_document: 'Writing document',
+  compose_report: 'Writing document',
 };
 
 /* ============ 工具参数校验（不合法不执行，错误回喂模型自纠重试） ============

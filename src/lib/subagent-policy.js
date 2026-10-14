@@ -5,7 +5,7 @@
 
 export const PARENT_ONLY_TOOLS = new Set([
   'task', 'clear_context', 'suggest_actions', 'ask_research_scope', 'manage_heartbeat', 'auto_compact',
-  'save_memory', 'notebook', 'plot_chart', 'plan', 'record_insight',
+  'save_memory', 'notebook', 'plot_chart', 'plan', 'record_insight', 'compose_report', 'write_document',
 ]);
 // call_api 不是父级专属：explore 可 GET；save/delete/写入在执行器里再拦。
 

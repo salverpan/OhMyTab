@@ -357,41 +357,6 @@
           </div>
 
           <details class="settings-fold">
-            <summary>视觉模型</summary>
-            <div class="fold-body">
-              <div class="form-group">
-                <label for="visionApiKey">API Key</label>
-                <input type="password" id="visionApiKey" placeholder="免费注册后获取">
-              </div>
-              <div class="form-group">
-                <label for="visionBaseUrl">Base URL</label>
-                <input type="text" id="visionBaseUrl" placeholder="https://open.bigmodel.cn/api/paas/v4/chat/completions">
-              </div>
-              <div class="form-group">
-                <label for="visionModel">模型</label>
-                <input type="text" id="visionModel" placeholder="glm-4v-flash">
-              </div>
-              <div class="form-group">
-                <label for="visionMaxTokens">max_tokens 上限</label>
-                <input type="number" id="visionMaxTokens" placeholder="1024" min="128" max="32768">
-              </div>
-              <div class="form-group">
-                <label for="visionProtocol">协议</label>
-                <select id="visionProtocol">
-                  <option value="openai">OpenAI 兼容</option>
-                  <option value="anthropic">Anthropic Messages</option>
-                  <option value="gemini">Google Gemini 原生</option>
-                </select>
-              </div>
-              <div class="form-actions">
-                <button id="saveVisionConfigBtn" class="btn btn-primary btn-sm">保存</button>
-                <button id="testVisionBtn" class="btn btn-sm">测试连接</button>
-                <span id="visionStatus" class="status-msg"></span>
-              </div>
-            </div>
-          </details>
-
-          <details class="settings-fold">
             <summary>外部 API</summary>
             <div class="fold-body">
               <p style="font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 12px">保存后会出现在对话上下文里，提醒 AI 有这条渠道可调。免费、无需 Key 的也可以保存（鉴权选「无」）。有密钥的只留在本机，调用时自动注入。</p>
@@ -677,6 +642,24 @@
                 <label for="sgMaxTabs">子代理最多打开网页个数</label>
                 <input type="number" id="sgMaxTabs" min="1" max="20" step="1" placeholder="6">
               </div>
+              <div class="form-group">
+                <label for="sgBudgetTokens">单个子代理 token 预算（0 = 不限）</label>
+                <input type="number" id="sgBudgetTokens" min="0" max="50000000" step="100000" placeholder="2000000">
+              </div>
+              <div class="form-group">
+                <label for="sgBudgetMinutes">单个子代理耗时预算（分钟，0 = 不限）</label>
+                <input type="number" id="sgBudgetMinutes" min="0" max="240" step="1" placeholder="20">
+              </div>
+              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
+                预算用完时子代理不会被丢弃，而是被要求立即提交已核实的结论和未查完的缺口。
+              </p>
+              <div class="form-group">
+                <label for="sgCheckChannel">核验审查模型</label>
+                <select id="sgCheckChannel"></select>
+              </div>
+              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
+                建议选一个和子代理不同家的模型：同一模型审自己的报告，容易把过度推断判成“有依据”。
+              </p>
               <div class="form-actions" style="margin-bottom:14px">
                 <button type="button" id="sgLimitsSaveBtn" class="btn btn-primary btn-sm">保存限额</button>
                 <span id="sgLimitsStatus" class="status-msg"></span>

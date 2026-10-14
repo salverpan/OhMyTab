@@ -6,9 +6,12 @@
  *  - 流式走 :streamGenerateContent?alt=sse，每条 data 是一个完整 GenerateContentResponse
  *  - 鉴权 x-goog-api-key 头（也支持 ?key= 参数，这里统一用头） */
 
-import { ApiError, readSseLines, parseSseData, contentToText, parseDataImageUrl, safeJsonParse } from './util.js';
+import { ApiError, readSseLines, parseSseData, contentToText, parseDataImageUrl, safeJsonParse, normalizeFinishReason } from './util.js';
 import { finalizeToolCalls } from './openai-chat.js';
 import { applyGeminiThinking } from './reasoning.js';
+import { resolveChatMaxTokens } from '../model-limits.js';
+import { estimateRequestTokens } from '../token-estimate.js';
+import { isViewportShotMessage } from '../tool-round-messages.js';
 
 const DEFAULT_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
@@ -101,7 +104,12 @@ export function convertMessages(messages) {
     flush();
     if (m.role === 'user') {
       const parts = toParts(m.content);
-      if (parts.length > 0) contents.push({ role: 'user', parts });
+      const prev = contents[contents.length - 1];
+      if (isViewportShotMessage(m) && prev?.role === 'user' && parts.length) {
+        prev.parts.push(...parts);
+      } else if (parts.length > 0) {
+        contents.push({ role: 'user', parts });
+      }
     } else if (m.role === 'assistant') {
       const parts = toParts(m.content);
       for (const tc of m.tool_calls || []) {
@@ -133,7 +141,10 @@ function buildBody(cfg, messages, tools, opts = {}) {
   const { systemInstruction, contents } = convertMessages(messages);
   const generationConfig = {};
   if (opts.temperature != null) generationConfig.temperature = opts.temperature;
-  if (opts.maxTokens != null) generationConfig.maxOutputTokens = opts.maxTokens;
+  const cap = resolveChatMaxTokens(cfg, opts.maxTokens, {
+    usedTokens: estimateRequestTokens(messages, tools),
+  });
+  if (cap != null) generationConfig.maxOutputTokens = cap;
   applyGeminiThinking(generationConfig, cfg);
 
   const body = { contents };
@@ -193,6 +204,7 @@ export async function chatComplete(cfg, messages, opts = {}) {
     content: content.trim(),
     toolCalls: finalizeToolCalls(tcList),
     usage: normalizeUsage(data.usageMetadata),
+    finishReason: normalizeFinishReason(data.candidates?.[0]?.finishReason),
   };
 }
 

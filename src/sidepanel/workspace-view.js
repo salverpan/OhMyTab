@@ -366,10 +366,29 @@ export function createWorkspaceView(opts) {
     renderPreview();
   }
 
+  function openOutput(entryId) {
+    const row = (allCache.outputs || []).find((r) => r.id === entryId);
+    if (!row) {
+      opts.showToast?.('这份产出已不存在', true);
+      return;
+    }
+    selectedKey = row.key;
+    lastSelectedKey = row.key;
+    if (collapsed.outputs) {
+      collapsed.outputs = false;
+      persistCollapsed();
+    }
+    renderTree();
+    renderPreview();
+  }
+
   const timeline = createTimelineView({
     getProjectId: () => opts.getProjectId(),
+    getProjectName: () => opts.getProjectName?.() || '',
     getNotes: () => (allCache.notes || []).map((r) => r.note).filter(Boolean),
     onOpenNote: openNote,
+    onOpenOutput: openOutput,
+    onDraftChat: (text) => opts.onDraftChat?.(text),
   });
 
   async function renderPreview() {

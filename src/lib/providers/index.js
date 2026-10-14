@@ -4,7 +4,7 @@
  * 规范消息格式（内部统一形状，适配器负责与各家线缆格式互转）：
  *   { role: 'system'|'user'|'assistant'|'tool',
  *     content: string
- *            | [ {type:'text', text} | {type:'image_url', image_url:{url}} ],  // 图片仅 vision 路径用
+ *            | [ {type:'text', text} | {type:'image_url', image_url:{url}} ],  // 用户附件、前台视口截图、vision 旁路
  *     tool_calls?: [ {id, type:'function', function:{name, arguments:JSON字符串}} ],
  *     tool_call_id?: string }
  *

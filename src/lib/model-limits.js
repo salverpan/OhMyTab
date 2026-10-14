@@ -160,6 +160,40 @@ export function inferModelCaps(modelId, cfg) {
   return decorateEffort(familyFallback(modelId), modelId, hint);
 }
 
+/** 单次请求最多向厂商要这么多输出。目录把输出标成整窗（26 万、100 万）时不再照单全要。 */
+export const OUTPUT_TOKEN_REQUEST_CAP = 256_000;
+/** 未收录模型的输出上限。不省略字段，避免 DeepSeek 非思考模式自己落到 8K。 */
+export const OUTPUT_TOKEN_UNKNOWN_FALLBACK = 32_000;
+/** 从窗口里留出的余量，盖住估算误差和协议开销。 */
+export const OUTPUT_CONTEXT_SLACK = 1024;
+const OUTPUT_TOKEN_FLOOR = 256;
+
+function requestContextWindow(cfg, caps) {
+  const working = Number(cfg?.contextTokens);
+  const workingOk = Number.isFinite(working) && working >= 16_000 && working <= 2_000_000
+    ? Math.floor(working) : null;
+  const physical = caps.source === 'fallback' ? null : Number(caps.contextWindow);
+  const physicalOk = Number.isFinite(physical) && physical >= 16_000 ? Math.floor(physical) : null;
+  if (workingOk && physicalOk) return Math.min(workingOk, physicalOk);
+  return workingOk || physicalOk || 128_000;
+}
+
+/** 对话输出上限。调用方给了正数（识图、摘要、连通测试）则原样使用。
+ * 否则取 min(模型满额或 3.2 万, 25.6 万, 窗口减去已占用)。 */
+export function resolveChatMaxTokens(cfg, explicit, { usedTokens = 0 } = {}) {
+  const given = explicit != null && explicit !== '' ? Number(explicit) : Number(cfg?.maxTokens);
+  if (Number.isFinite(given) && given > 0) return Math.floor(given);
+  const caps = inferModelCaps(cfg?.model, cfg);
+  const modelOut = caps.source === 'fallback'
+    ? OUTPUT_TOKEN_UNKNOWN_FALLBACK
+    : (Number(caps.maxOutput) > 0 ? Math.floor(Number(caps.maxOutput)) : OUTPUT_TOKEN_UNKNOWN_FALLBACK);
+  let cap = Math.min(modelOut, OUTPUT_TOKEN_REQUEST_CAP);
+  const used = Math.max(0, Math.floor(Number(usedTokens) || 0));
+  const room = requestContextWindow(cfg, caps) - used - OUTPUT_CONTEXT_SLACK;
+  cap = Math.min(cap, Math.max(OUTPUT_TOKEN_FLOOR, room));
+  return Math.max(OUTPUT_TOKEN_FLOOR, cap);
+}
+
 export function catalogSourceLabel(source) {
   if (source === 'api') return '厂商接口';
   if (source === 'catalog' || source === 'snapshot' || source === 'cache') return 'models.dev';

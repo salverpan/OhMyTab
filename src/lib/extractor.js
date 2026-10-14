@@ -5,7 +5,7 @@ import {
   extractPublishedDateFromDoc, extractByScoredBlocks, normalizePublishedDate,
 } from './extract-common.js';
 import { htmlToText } from './html-utils.js';
-import { visionChat, OCR_PROMPT, getVisionConfig } from './vision-client.js';
+import { visionOcrScreen, getVisionConfig } from './vision-client.js';
 import { debuggerAttach, debuggerDetach, debuggerSend } from './cdp.js';
 
 // 发往页面 Runtime.evaluate 的片段里全局名拆写（SW 包校验器禁字面 window./document.）；
@@ -33,7 +33,7 @@ async function visionOcrViaCdp(tabId, maxChunks = 20) {
       await new Promise((r) => setTimeout(r, 600));
       const shot = await debuggerSend(tabId, 'Page.captureScreenshot', { format: 'jpeg', quality: 80 });
       if (!shot?.data) continue;
-      const vr = await visionChat('data:image/jpeg;base64,' + shot.data, OCR_PROMPT, { maxTokens: 4000, timeoutMs: 45000 });
+      const vr = await visionOcrScreen('data:image/jpeg;base64,' + shot.data, { timeoutMs: 45000 });
       if (vr.ok && vr.content.trim()) chunks.push(vr.content.trim());
     }
     await debuggerSend(tabId, 'Runtime.evaluate', { expression: `${PAGE_WIN}.scrollTo(0,${m.sy || 0})` }).catch(() => {});
@@ -306,7 +306,7 @@ export async function fetchViaTab(url, options = {}) {
           } catch (_) { /* network capture failed -> fall through to vision */ }
 
           // 3) Vision OCR tier: last resort for font obfuscation / canvas /
-          //    image-rendered text. Only when a Vision model is configured.
+          //    image-rendered text. Uses the current channel model.
           if (scrollResp?.garbled) {
             try {
               const vcfg = await getVisionConfig();

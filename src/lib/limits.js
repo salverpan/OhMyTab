@@ -74,7 +74,9 @@ export function clampSubagentMaxTabs(raw) {
   return clampInt(raw, SUBAGENT_MAX_TABS_MIN, SUBAGENT_MAX_TABS_MAX, SUBAGENT_MAX_TABS);
 }
 
-/** 同一轮 Sub 可并行的无状态章节作业；只读已落库正文，不占浏览器标签。 */
+/** 同一轮 Sub 可并行的无状态章节作业；只读已落库正文，不占浏览器标签。
+ * MAX_CHARS 是单次送入模型的分页尺寸，不是文件总长上限：更长的正文由
+ * section_job 返回的 content_next_offset 续拉。 */
 export const SECTION_WORKER_MAX_PARALLEL = 4;
 export const SECTION_WORKER_MAX_CHARS = 20000;
 export const SECTION_WORKER_MAX_ROUNDS = 3;

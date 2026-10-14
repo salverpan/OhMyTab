@@ -8,8 +8,8 @@
  *   - 阅读器退化为渲染器 + 修订面板：SW 每次编辑后广播 DOC_UPDATED{docId}，
  *     正在看该文档的阅读器页重渲染（renderChanges 显示修订痕迹）。
  *   - 每次成功编辑即持久化写回 IDB：SW 被杀 / 切换文档后从 IDB 重建引擎不丢改动。
- *   - docx 文本修改默认走原生修订痕迹（w:ins/w:del + 批注，doc_edit 的
- *     track_changes 默认 true），用户明确要求"直接改"才裸改。
+ *   - docx 文本修改默认直接写入。track_changes=true 才走原生修订痕迹
+ *     （w:ins/w:del + 批注），留给用户明确要求留痕、给别人审的时候。
  *   - 首次编辑某文档时附带 doc_digest（字符数/段落数/开头片段），模型据此
  *     知道自己在改什么（read-before-write 的轻量等价；find 定位失败即硬错，
  *     不会盲改）。
@@ -109,9 +109,9 @@ export async function updateEntryFullText(docId) {
 
 /**
  * AI doc_edit 的 docx 执行入口。
- * track_changes 默认 true：replace_text/insert_text 走原生修订痕迹
- * （w:ins/w:del + 批注 note）；显式 false 才裸改。格式类操作
- * （set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改（无修订语义）。
+ * track_changes 默认 false：replace_text/insert_text 直接写入。
+ * 显式 true 才走原生修订痕迹（w:ins/w:del + 批注 note）。
+ * 格式类操作（set_format/set_bold/set_heading/add_list/add_table/set_cell）恒为直接修改。
  */
 export async function editWordDoc(docId, tool, args = {}) {
   return withDocLock(docId, async () => {
@@ -121,7 +121,7 @@ export async function editWordDoc(docId, tool, args = {}) {
       return { ok: false, error: err.message || String(err) };
     }
     let r;
-    const track = args.track_changes !== false;
+    const track = args.track_changes === true || args.track_changes === 'true';
     if (tool === 'replace_text' && track) {
       const find = String(args.find || '');
       r = await word.execReviewTool('suggest_replace', {
@@ -137,9 +137,10 @@ export async function editWordDoc(docId, tool, args = {}) {
     } else {
       r = await word.execWordTool(tool, args);
     }
-    if (r && r.ok) {
+    if (r && r.ok && !r.noop && !r.already_pending) {
       // execWordTool/execReviewTool 改动即 ok；undo 空栈等也算 ok 但无字节变化，
-      // persistAndNotify 幂等（重新导出写回同样内容），无副作用
+      // persistAndNotify 幂等（重新导出写回同样内容），无副作用。
+      // 相同文本、已有相同待审修订不写盘。
       await persistAndNotify(docId, r);
     }
     if (r && r.ok && !digestSent.has(docId)) {
@@ -168,6 +169,7 @@ export async function reviewWordDoc(docId, tool, args = {}) {
     if (r && r.ok && (tool === 'accept' || tool === 'reject')) {
       await persistAndNotify(docId, r);
     }
+    if (r && typeof r === 'object') r.doc_id = docId;
     return r;
   });
 }

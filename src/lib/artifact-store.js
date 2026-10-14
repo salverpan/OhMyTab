@@ -364,10 +364,16 @@ export async function readSection(docId, sel = {}) {
     if (!Array.isArray(offs) || !offs.length) return { error: `doc ${docId} 没有页偏移（非 PDF 或未记录）。改用 offset 或 chunk。` };
     const hit = offs.find((o) => Number(o.page) === p);
     if (!hit) return { error: `页码 ${p} 超范围（1-${offs.length}）。` };
-    const text = full.slice(hit.start, hit.end).slice(0, maxChars);
+    const pageText = full.slice(hit.start, hit.end);
+    const text = pageText.slice(0, maxChars);
+    const next = hit.start + text.length;
+    const hasMore = next < hit.end;
     return {
       doc_id: doc.docId, title: doc.title, url: doc.url, anchor: `${doc.docId}#p${p}`,
-      text, chars: text.length, page: p, pages: doc.pages || offs.length, provenance,
+      text, chars: text.length, page: p, pages: doc.pages || offs.length,
+      offset: hit.start, total: full.length,
+      has_more: hasMore, next_offset: hasMore ? next : null,
+      provenance,
     };
   }
 

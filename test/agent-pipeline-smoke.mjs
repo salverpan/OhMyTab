@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { SUBMIT_REPORT_TOOL, validateTaskReport, reportForMain } from '../src/lib/task-report.js';
-import { SECTION_JOB_TOOL, runSectionJob } from '../src/lib/section-worker.js';
+import { SECTION_JOB_TOOL, runSectionJob, sectionJobCursor } from '../src/lib/section-worker.js';
 import { SUBMIT_VERDICTS_TOOL } from '../src/lib/check/entailment.js';
 import { deriveClaimVerdict, verificationForMain } from '../src/lib/check/index.js';
 import { findQuoteInText, normalizeQuoteText } from '../src/lib/check/quote-match.js';
@@ -33,6 +33,11 @@ ok(reportForMain(checked.report).claims[0].sources[0] === 'doc_1#c2', 'Main 只�
 ok(SUBMIT_REPORT_TOOL.function.name === 'submit_report', 'Sub 强制 submit_report');
 ok(SUBMIT_VERDICTS_TOOL.function.name === 'submit_verdicts', 'Check 使用窄 verdict 工具');
 ok(SECTION_JOB_TOOL.function.name === 'section_job', 'Nested 暴露 section_job');
+ok(SECTION_JOB_TOOL.function.description.includes('content_next_offset'), 'section_job 说明续拉');
+const more = sectionJobCursor({ chars: 20000, offset: 0, total: 50000, has_more: true, next_offset: 20000 });
+ok(more.content_has_more === true && more.content_next_offset === 20000, '未读完时给出续拉偏移');
+const done = sectionJobCursor({ chars: 1200, offset: 20000, total: 21200, has_more: false, next_offset: null });
+ok(done.content_has_more === false && done.content_next_offset == null, '读完时不再给偏移');
 ok(SUBMIT_REPORT_TOOL.function.parameters.required.includes('claims'), 'OpenAI 工具 schema 完整');
 ok(toAnthropicTools([SUBMIT_REPORT_TOOL])[0].input_schema.required.includes('claims'), 'Anthropic 工具 schema 完整');
 ok(toFunctionDeclarations([SUBMIT_REPORT_TOOL])[0].parameters.required.includes('claims'), 'Gemini 工具 schema 完整');
@@ -73,6 +78,16 @@ const runtimeVerification = {
 };
 const mainVerification = verificationForMain(runtimeVerification);
 ok(mainVerification.check_run_id === 'chk_runtime' && mainVerification.checker === 'citecat-check-v1', '核验元数据由运行时封装');
+ok(!mainVerification.claims && mainVerification.failures.length === 0, '通过项不重复交给主代理');
+const failedVerification = verificationForMain({
+  ...runtimeVerification,
+  contentFailure: true,
+  claims: [
+    ...runtimeVerification.claims,
+    { id: 'c2', claim: '停产', verdict: 'overclaim', reason: '原文只说暂停', evidence: [{ status: 'citation-pass', evidence: { doc_id: 'doc_9', anchor: 'c1' } }] },
+  ],
+});
+ok(failedVerification.failures.length === 1 && failedVerification.failures[0].id === 'c2', '只把未通过项交给主代理');
 ok(!JSON.stringify(validRaw).includes('check_run_id'), 'Sub report 不含核验身份字段');
 
 ok(usageTotalTokens({ prompt_tokens: 10, completion_tokens: 5 }) === 15, 'usage 无 total 时按 prompt+completion');

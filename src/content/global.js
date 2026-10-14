@@ -21,6 +21,7 @@ import {
   insertAnnotationNoteBlock, removeAnnotationNoteBlock,
 } from '../lib/doc-marks.js';
 import { FLOAT_UI_CSS } from '../lib/float-css.js';
+import { bindChatResize, isChatResizeEdge } from '../lib/chat-win-resize.js';
 import { THEME_KEY, loadThemeMode, normalizeThemeMode, resolveTheme } from '../lib/theme.js';
 // thinking-orbs / react-dom 含 `'animation' in div.style`，XML/RSS 页 style 为 undefined 会直接抛。
 // 改为打开浮动聊天时再动态 import（build 侧 inlineDynamicImports，仍打成单文件）。
@@ -3382,66 +3383,118 @@ let chatContext = null; // { label, text, system } —— 随时可被新的划�
 let chatBusy = false;
 let liveScopeQuiz = null;
 let chatStreamText = '';
+// 最近一次选区手势。划词不要被之前的检视多选抢走，反过来也一样。
+let chatAskMode = ''; // 'text' | 'element' | 'multi'
+let selPointer = null;
+let selPointerAt = 0;
+INSPECT.selRectIndex = 0;
+
+function textChatContext() {
+  if (!INSPECT.lastTextRange) return null;
+  let raw = '';
+  try { raw = INSPECT.lastTextRange.toString(); } catch (_) { return null; }
+  const text = raw.trim().slice(0, 4000);
+  if (!text) return null;
+  return {
+    kind: 'text',
+    label: '选中文本',
+    text,
+    title: document.title,
+    url: location.href,
+    extra: '',
+    system: '### 当前选区（页面划选/元素，本次提问的对象）\n选区类型：选中文本\n' + text,
+  };
+}
+
+function multiChatContext() {
+  const els = (INSPECT.multiEls || []).filter((el) => el && el.isConnected);
+  if (!els.length) return null;
+  const parts = els.map((el, i) => {
+    const inner = (el.innerText || el.textContent || '').trim().slice(0, 800);
+    let html = '';
+    try { html = el.outerHTML.slice(0, 500); } catch (_) {}
+    return `元素 ${i + 1}：标签 ${el.tagName.toLowerCase()}\n结构：${html}\n内容：\n"""\n${inner}\n"""`;
+  });
+  const text = parts.join('\n\n').slice(0, 6000);
+  if (!text) return null;
+  return {
+    kind: 'multi',
+    label: `已选 ${els.length} 个元素`,
+    text,
+    title: document.title,
+    url: location.href,
+    extra: '',
+    system:
+      '### 当前选区（页面划选/元素，本次提问的对象）\n选区类型：多个页面元素（Ctrl 多选）\n' + text,
+  };
+}
+
+function elementChatContext() {
+  const el = INSPECT.lastSelectedEl;
+  if (!el || !el.isConnected) return null;
+  const inner = (el.innerText || el.textContent || '').trim().slice(0, 3000);
+  let html = '';
+  try { html = el.outerHTML.slice(0, 1500); } catch (_) {}
+  const cls = (typeof el.className === 'string' && el.className.trim())
+    ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.')
+    : '';
+  const base =
+    '### 当前选区（页面划选/元素，本次提问的对象）\n选区类型：页面元素\n' +
+    `标签：${el.tagName.toLowerCase()}\n结构：${html}\n内容：\n"""\n${inner}\n"""\n页面标题：${document.title}\n页面地址：${location.href}`;
+  return {
+    kind: 'element',
+    label: el.tagName.toLowerCase() + cls,
+    text: inner,
+    title: document.title,
+    url: location.href,
+    extra: chatChartData
+      ? `\n\n该元素内图表的真实数据（已从图表实例读取）：\n"""\n${chatChartData}\n"""`
+      : '',
+    system: base + (chatChartData
+      ? `\n\n该元素内图表的真实数据（已从图表实例读取）：\n"""\n${chatChartData}\n"""`
+      : ''),
+  };
+}
 
 function buildChatContext() {
-  // 多选集合：全部元素汇总注入（优先级最高）
-  if (INSPECT.multiEls && INSPECT.multiEls.length > 0) {
-    const parts = INSPECT.multiEls.filter((el) => el && el.isConnected).map((el, i) => {
-      const inner = (el.innerText || el.textContent || '').trim().slice(0, 800);
-      let html = '';
-      try { html = el.outerHTML.slice(0, 500); } catch (_) {}
-      return `元素 ${i + 1}：标签 ${el.tagName.toLowerCase()}\n结构：${html}\n内容：\n"""\n${inner}\n"""`;
-    });
-    const text = parts.join('\n\n').slice(0, 6000);
-    return {
-      kind: 'multi',
-      label: `已选 ${INSPECT.multiEls.length} 个元素`,
-      text,
-      title: document.title,
-      url: location.href,
-      extra: '',
-      system:
-        '### 当前选区（页面划选/元素，本次提问的对象）\n选区类型：多个页面元素（Ctrl 多选）\n' + text,
-    };
-  }
-  if (INSPECT.barMode === 'text' && INSPECT.lastTextRange) {
-    const text = INSPECT.lastTextRange.toString().trim().slice(0, 4000);
-    return {
-      kind: 'text',
-      label: '选中文本',
-      text,
-      title: document.title,
-      url: location.href,
-      // 选区上下文块：展示给用户（元素数据视图）并原样注入 AI 动态前言
-      system: '### 当前选区（页面划选/元素，本次提问的对象）\n选区类型：选中文本\n' + text,
-    };
-  }
-  if (INSPECT.lastSelectedEl) {
-    const el = INSPECT.lastSelectedEl;
-    const inner = (el.innerText || el.textContent || '').trim().slice(0, 3000);
-    let html = '';
-    try { html = el.outerHTML.slice(0, 1500); } catch (_) {}
-    const cls = (typeof el.className === 'string' && el.className.trim())
-      ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.')
-      : '';
-    const base =
-      '### 当前选区（页面划选/元素，本次提问的对象）\n选区类型：页面元素\n' +
-      `标签：${el.tagName.toLowerCase()}\n结构：${html}\n内容：\n"""\n${inner}\n"""\n页面标题：${document.title}\n页面地址：${location.href}`;
-    return {
-      kind: 'element',
-      label: el.tagName.toLowerCase() + cls,
-      text: inner,
-      title: document.title,
-      url: location.href,
-      extra: chatChartData
-        ? `\n\n该元素内图表的真实数据（已从图表实例读取）：\n"""\n${chatChartData}\n"""`
-        : '',
-      system: base + (chatChartData
-        ? `\n\n该元素内图表的真实数据（已从图表实例读取）：\n"""\n${chatChartData}\n"""`
-        : ''),
-    };
+  const order = chatAskMode === 'text'
+    ? [textChatContext, elementChatContext, multiChatContext]
+    : chatAskMode === 'element'
+      ? [elementChatContext, textChatContext, multiChatContext]
+      : chatAskMode === 'multi'
+        ? [multiChatContext, elementChatContext, textChatContext]
+        : [textChatContext, multiChatContext, elementChatContext];
+  for (const read of order) {
+    const ctx = read();
+    if (ctx) return ctx;
   }
   return null;
+}
+
+/** 多行选区取离松开鼠标最近的那一行，工具条才跟得上划词终点 */
+function pickSelectionRect(range, pointer, index) {
+  let list = [];
+  try {
+    list = [...range.getClientRects()].filter((r) => r.width > 1 || r.height > 1);
+  } catch (_) {
+    return { rect: null, index: 0 };
+  }
+  if (!list.length) {
+    try { return { rect: range.getBoundingClientRect(), index: 0 }; }
+    catch (_) { return { rect: null, index: 0 }; }
+  }
+  if (Number.isInteger(index) && list[index]) return { rect: list[index], index };
+  if (!pointer) return { rect: list[list.length - 1], index: list.length - 1 };
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i];
+    const cx = Math.max(r.left, Math.min(pointer.x, r.right));
+    const cy = Math.max(r.top, Math.min(pointer.y, r.bottom));
+    const d = (cx - pointer.x) ** 2 + (cy - pointer.y) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return { rect: list[best], index: best };
 }
 
 /** 选区/元素变化时刷新引用上下文；聊天窗打开时同步渲染 */
@@ -3597,10 +3650,22 @@ async function openChatWindow() {
   }
 
   let rect = null;
-  if (INSPECT.multiEls.length > 0) rect = multiUnionRect();
-  else if (INSPECT.lastTextRange) rect = INSPECT.lastTextRange.getBoundingClientRect();
-  else if (INSPECT.lastSelectedEl) rect = INSPECT.lastSelectedEl.getBoundingClientRect();
-  if (!rect) return;
+  if (chatAskMode === 'text' && INSPECT.lastTextRange) {
+    rect = pickSelectionRect(INSPECT.lastTextRange, null, INSPECT.selRectIndex).rect;
+  } else if (chatAskMode === 'multi' && INSPECT.multiEls.length > 0) {
+    rect = multiUnionRect();
+  } else if (chatAskMode === 'element' && INSPECT.lastSelectedEl) {
+    rect = INSPECT.lastSelectedEl.getBoundingClientRect();
+  } else if (INSPECT.lastTextRange) {
+    rect = pickSelectionRect(INSPECT.lastTextRange, null, INSPECT.selRectIndex).rect;
+  } else if (INSPECT.multiEls.length > 0) {
+    rect = multiUnionRect();
+  } else if (INSPECT.lastSelectedEl) {
+    rect = INSPECT.lastSelectedEl.getBoundingClientRect();
+  }
+  if (!rect) {
+    rect = { left: 16, top: 72, bottom: 96, width: 24 };
+  }
   const w = 380, h = 420;
   let left = Math.min(Math.max(8, rect.left), window.innerWidth - w - 8);
   let top = rect.bottom + 10;
@@ -3637,11 +3702,22 @@ async function openChatWindow() {
 function handleChatPortMessage(m) {
   if (m.type === 'chunk') appendAiChunk(m.text);
   else if (m.type === 'done') {
-    finishAiChunk();
+    if (m.aborted && chatStreamText && !/\(已中断\)\s*$/.test(chatStreamText)) {
+      chatStreamText += '\n\n(已中断)';
+    }
+    try { finishAiChunk(); }
+    catch (err) {
+      console.warn('[Citecat] finish float chat failed', err);
+      chatBusy = false;
+      updateSendBtn();
+    }
     // SW 维护的权威历史（含 assistant + tool 消息）回传覆盖本地，保证跨轮一致
     if (Array.isArray(m.messages)) chatHistory = m.messages;
   }
-  else if (m.type === 'error') failAiChunk(m.error);
+  else if (m.type === 'error') {
+    failAiChunk(m.error);
+    if (Array.isArray(m.messages)) chatHistory = m.messages;
+  }
   else if (m.type === 'tool') handleToolEvent(m.status, m.label, m.tool);
   else if (m.type === 'subagent') handleSubagentEvent(m.card);
   else if (m.type === 'ui') {
@@ -3679,7 +3755,8 @@ function dragChatWin(e) {
   const sx = e.clientX, sy = e.clientY;
   const il = win.offsetLeft, it = win.offsetTop;
   const onMove = (ev) => {
-    win.style.left = Math.min(Math.max(8, il + ev.clientX - sx), window.innerWidth - 392) + 'px';
+    const maxL = Math.max(8, window.innerWidth - win.offsetWidth - 8);
+    win.style.left = Math.min(Math.max(8, il + ev.clientX - sx), maxL) + 'px';
     win.style.top = Math.min(Math.max(8, it + ev.clientY - sy), window.innerHeight - 60) + 'px';
   };
   const onUp = () => {
@@ -3689,51 +3766,6 @@ function dragChatWin(e) {
   document.addEventListener('mousemove', onMove);
   document.addEventListener('mouseup', onUp);
   e.preventDefault();
-}
-
-/** 边框拖拽调整大小：鼠标移到右/下/右下边缘出现 resize 光标，按住拖动即改 */
-function bindChatResize(win) {
-  const EDGE = 6;
-  let dragging = false;
-  let startX = 0, startY = 0, startW = 0, startH = 0;
-  win.addEventListener('mousemove', (e) => {
-    if (dragging) return;
-    const r = win.getBoundingClientRect();
-    const onRight = e.clientX >= r.right - EDGE;
-    const onBottom = e.clientY >= r.bottom - EDGE;
-    win.style.cursor = onRight && onBottom ? 'nwse-resize' : (onRight ? 'ew-resize' : (onBottom ? 'ns-resize' : ''));
-  });
-  win.addEventListener('mouseleave', () => { if (!dragging) win.style.cursor = ''; });
-  win.addEventListener('mousedown', (e) => {
-    if (e.button !== 0 || dragging) return;
-    // 交互元素（按钮/输入框/滚动条区域）不触发
-    if (e.target.closest('.cw-btn, .cw-send, input, button, a')) return;
-    const r = win.getBoundingClientRect();
-    const onRight = e.clientX >= r.right - EDGE;
-    const onBottom = e.clientY >= r.bottom - EDGE;
-    if (!onRight && !onBottom) return;
-    e.preventDefault();
-    dragging = true;
-    win._resized = true;
-    win.style.maxHeight = 'none';
-    // 解除消息区 300px 上限：否则容器变高时只有输入栏下移、对话区不放大
-    const bodyEl = win.querySelector('.cw-body');
-    if (bodyEl) bodyEl.style.maxHeight = 'none';
-    startX = e.clientX; startY = e.clientY;
-    startW = win.offsetWidth; startH = win.offsetHeight;
-    const onMove = (ev) => {
-      if (onRight) win.style.width = Math.max(280, Math.min(window.innerWidth - 16, startW + (ev.clientX - startX))) + 'px';
-      if (onBottom) win.style.height = Math.max(300, Math.min(window.innerHeight - 16, startH + (ev.clientY - startY))) + 'px';
-    };
-    const onUp = () => {
-      dragging = false;
-      win.style.cursor = '';
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  });
 }
 
 /** 发送 ↔ 停止按钮切换（chatBusy 时点击发送 = 中止本次回答） */
@@ -3781,7 +3813,12 @@ function sendChatMessage() {
   const body = win.querySelector('.cw-body');
   const u = document.createElement('div');
   u.className = 'cw-msg user';
-  u.innerHTML = '<div class="cw-msg-label">你</div><p>' + String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</p>';
+  const uLabel = document.createElement('div');
+  uLabel.className = 'cw-msg-label';
+  uLabel.textContent = '你';
+  const uText = document.createElement('p');
+  uText.textContent = text;
+  u.append(uLabel, uText);
   body.appendChild(u);
   const ai = document.createElement('div');
   ai.className = 'cw-msg ai';
@@ -3797,13 +3834,7 @@ function sendChatMessage() {
   chatBusy = true;
   chatStreamText = '';
   updateSendBtn();
-  // 无响应看门狗：SW 无任何回传（chunk/tool/done/error）超时则解锁，避免按钮卡死
-  clearChatWatchdog();
-  chatWatchdogTimer = setTimeout(() => {
-    if (!chatBusy) return;
-    chatWatchdogTimer = 0;
-    failAiChunk('AI 长时间无响应，请重试');
-  }, CHAT_WATCHDOG_MS);
+  armChatWatchdog();
   // 不再本地拼 system：SW 侧注入完整静态提示词 + 动态前言；这里只附选区上下文
   chatPort.postMessage({
     type: 'CHAT',
@@ -3823,7 +3854,7 @@ let chatOrbApi = null; // { createElement, createRoot, ThinkingOrb }
 let chatOrbApiPromise = null;
 let chatOrbState = 'working';
 let chatWatchdogTimer = 0;
-const CHAT_WATCHDOG_MS = 60000; // SW 无任何事件回传的最大等待
+const CHAT_WATCHDOG_MS = 120000; // 静默超过这个时间先提示，再静默一轮才判定卡死
 
 function loadChatOrbApi() {
   if (!chatOrbApiPromise) {
@@ -3876,8 +3907,9 @@ function setChatOrbState(state) {
 
 /* orb 右侧的 shimmer 文字（Thinking / 工具状态 label / 工具错误） */
 function setChatThinkingText(text, isError) {
-  const win = INSPECT.chatWin;
-  const el = win && win.querySelector('.cw-thinking-text');
+  const stream = INSPECT.chatStreamEl;
+  const root = (stream && stream.closest('.cw-msg.ai')) || INSPECT.chatWin;
+  const el = root && root.querySelector('.cw-thinking-text');
   if (!el) return;
   el.textContent = text;
   el.classList.toggle('error', !!isError);
@@ -3894,16 +3926,29 @@ function clearChatWatchdog() {
   if (chatWatchdogTimer) { clearTimeout(chatWatchdogTimer); chatWatchdogTimer = 0; }
 }
 
+/** 推理模型首 token 经常超过 1 分钟。先改提示，再静默一轮才拆掉本轮，避免误杀正在思考的回答。 */
+function armChatWatchdog() {
+  clearChatWatchdog();
+  const kick = (quiet) => {
+    chatWatchdogTimer = setTimeout(() => {
+      chatWatchdogTimer = 0;
+      if (!chatBusy) return;
+      if (!quiet) {
+        setChatThinkingText('仍在等待…');
+        kick(true);
+        return;
+      }
+      failAiChunk('AI 长时间无响应，请重试');
+    }, CHAT_WATCHDOG_MS);
+  };
+  kick(false);
+}
+
 function handleSubagentEvent(card) {
   const win = INSPECT.chatWin;
   const body = win && win.querySelector('.cw-body');
   if (!body || !card) return;
-  clearChatWatchdog();
-  chatWatchdogTimer = setTimeout(() => {
-    if (!chatBusy) return;
-    chatWatchdogTimer = 0;
-    failAiChunk('AI 长时间无响应，请重试');
-  }, CHAT_WATCHDOG_MS);
+  armChatWatchdog();
   const ai = body.querySelector('.cw-msg.ai:last-of-type');
   if (ai) upsertSubagentCardEl(ai, card, 'cw');
   body.scrollTop = body.scrollHeight;
@@ -3913,13 +3958,7 @@ function handleToolEvent(status, label, toolName) {
   const win = INSPECT.chatWin;
   const body = win && win.querySelector('.cw-body');
   if (!body) return;
-  // 工具事件也算 SW 活跃：重置看门狗
-  clearChatWatchdog();
-  chatWatchdogTimer = setTimeout(() => {
-    if (!chatBusy) return;
-    chatWatchdogTimer = 0;
-    failAiChunk('AI 长时间无响应，请重试');
-  }, CHAT_WATCHDOG_MS);
+  armChatWatchdog();
   if (status === 'start') {
     // 工具状态显示在 orb 右侧的 shimmer 文字行（与 orb 同行走位）
     setChatThinkingText(`${label}…`);
@@ -4003,12 +4042,7 @@ function appendFloatChart(chart) {
   const win = INSPECT.chatWin;
   const body = win && win.querySelector('.cw-body');
   if (!body || !chart) return;
-  clearChatWatchdog();
-  chatWatchdogTimer = setTimeout(() => {
-    if (!chatBusy) return;
-    chatWatchdogTimer = 0;
-    failAiChunk('AI 长时间无响应，请重试');
-  }, CHAT_WATCHDOG_MS);
+  armChatWatchdog();
   const ai = body.querySelector('.cw-msg.ai:last-of-type');
   if (!ai) return;
   let stack = ai.querySelector('.chat-live-charts');
@@ -4061,6 +4095,10 @@ function resetChatBody() {
   liveScopeQuiz = null;
   const win = INSPECT.chatWin;
   if (!win) return;
+  // 先卸 React root，再 innerHTML 拆掉 orb 容器，否则 removeChild 抛 NotFoundError
+  unmountChatOrb();
+  INSPECT.chatStreamEl = null;
+  chatStreamText = '';
   const body = win.querySelector('.cw-body');
   disposeChatCharts(body);
   body.innerHTML =
@@ -4075,7 +4113,7 @@ function appendAiChunk(t) {
     setChatOrbState('working');
     setChatThinkingText('');
   }
-  clearChatWatchdog();
+  armChatWatchdog();
   chatStreamText += t;
   el.textContent = chatStreamText;
   const ai = el.closest('.cw-msg.ai');
@@ -4084,19 +4122,23 @@ function appendAiChunk(t) {
   if (body) body.scrollTop = body.scrollHeight;
 }
 
-function removeThinkingRow() {
-  const win = INSPECT.chatWin;
-  const row = win && win.querySelector('.cw-thinking-row');
+function removeThinkingRow(fromEl) {
+  const root = (fromEl && fromEl.closest && fromEl.closest('.cw-msg.ai'))
+    || (INSPECT.chatWin && INSPECT.chatWin.querySelector('.cw-msg.ai:last-of-type'));
+  const row = root && root.querySelector('.cw-thinking-row');
   if (row) row.remove();
 }
 
 function finishAiChunk() {
-  if (chatStreamEl) chatStreamEl.textContent = chatStreamText;
-  removeThinkingRow();
+  const el = INSPECT.chatStreamEl;
+  if (el) el.textContent = chatStreamText;
+  // 先卸 React root 再移除 .cw-thinking-row（里面是 orb 容器），否则 removeChild 抛 NotFoundError，
+  // chatBusy 永远停在 true，发送按钮卡在停止。
   unmountChatOrb();
+  removeThinkingRow(el);
   clearChatWatchdog();
   // 不在这里 push assistant：SW 的 done 会回传权威历史（含工具消息），
-  // openChatWindow 的 done 分支用 m.messages 覆盖 chatHistory。
+  // done 分支用 m.messages 覆盖 chatHistory。
   chatBusy = false;
   INSPECT.chatStreamEl = null;
   updateSendBtn();
@@ -4110,10 +4152,10 @@ function failAiChunk(err) {
     e.textContent = '出错了：' + (err || '未知错误');
     el.parentElement.appendChild(e);
   }
-  removeThinkingRow();
   unmountChatOrb();
+  removeThinkingRow(el);
   clearChatWatchdog();
-  // 出错路径无 SW 回传历史，本地补一条保证连续性
+  // 出错路径若 SW 没带回历史，本地补一条保证连续性；带回时由调用方覆盖
   if (chatStreamText) chatHistory.push({ role: 'assistant', content: chatStreamText });
   chatBusy = false;
   INSPECT.chatStreamEl = null;
@@ -4158,8 +4200,12 @@ function initInspectUI(host, shadow, btn) {
   bar.addEventListener('click', (e) => {
     const act = e.target.closest('.sel-btn')?.dataset.act;
     if (!act) return;
+    if (act === 'ask') {
+      chatAskMode = INSPECT.barMode === 'text' ? 'text' : 'element';
+      openChatWindow();
+      return;
+    }
     hideSelectionBar();
-    if (act === 'ask') { openChatWindow(); return; }
     if (act === 'collect') {
       if (INSPECT.barMode === 'text') collectTextSnippet();
       else collectElementSnippet();
@@ -4230,8 +4276,9 @@ function initInspectUI(host, shadow, btn) {
     if (!act) return;
     if (act === 'clear') { clearMultiSelect(); return; }
     if (act === 'ask') {
+      chatAskMode = 'multi';
       hideMultiBar();
-      openChatWindow(); // buildChatContext 多元素分支注入全部选中元素
+      openChatWindow();
       return;
     }
     if (act !== 'collect') return;
@@ -4282,13 +4329,15 @@ function initInspectUI(host, shadow, btn) {
     '</div>';
   chatWin.querySelector('.cw-head').addEventListener('mousedown', (e) => {
     if (e.target.closest('.cw-btn')) return;
+    if (isChatResizeEdge(chatWin, e)) return;
     dragChatWin(e);
   });
   chatWin.querySelector('[data-act="min"]').addEventListener('click', () => {
     const min = chatWin.classList.toggle('cw-min');
-    // 纯 CSS class 控制最小化（.cw-min { max-height:40px } + 隐藏 body/input）
-    // 清除 resize 时设的 inline maxHeight，避免覆盖 CSS class 规则导致恢复后打不开
-    chatWin.style.maxHeight = '';
+    // 最小化用 40px 压过拖边框时写下的 max-height:none；恢复时把拖出来的高度还回去
+    if (min) chatWin.style.maxHeight = '40px';
+    else if (chatWin._resized) chatWin.style.maxHeight = 'none';
+    else chatWin.style.maxHeight = '';
     if (!min) {
       // 恢复时确保 body/input 可见（防御性：万一 inline display 残留）
       const body = chatWin.querySelector('.cw-body');
@@ -4303,7 +4352,11 @@ function initInspectUI(host, shadow, btn) {
     else sendChatMessage();
   });
   chatWin.querySelector('.cw-input input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') sendChatMessage();
+    // 中文输入法选词的 Enter 不是发送
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+      e.preventDefault();
+      sendChatMessage();
+    }
   });
   bindChatResize(chatWin);
   chatWin.querySelector('.cw-ctx-toggle').addEventListener('click', (e) => {
@@ -4342,6 +4395,13 @@ function initInspectUI(host, shadow, btn) {
 
   // ---- 划词工具条（文本选择：selectionchange 驱动，鼠标/键盘选区都覆盖）----
   document.addEventListener('selectionchange', onTextSelectChange);
+  document.addEventListener('mouseup', (e) => {
+    if (e.button !== 0) return;
+    selPointer = { x: e.clientX, y: e.clientY };
+    selPointerAt = Date.now();
+  }, true);
+  document.addEventListener('scroll', repositionSelectionBar, true);
+  window.addEventListener('resize', repositionSelectionBar);
   // 标注（mark）点击
   document.addEventListener('click', onMarkClick, true);
 }
@@ -4368,13 +4428,32 @@ function tryShowSelectionBar() {
     return;
   }
   const range = sel.getRangeAt(0);
-  const rect = range.getBoundingClientRect();
-  if (rect.width === 0 && rect.height === 0) return;
+  const pointer = (Date.now() - selPointerAt < 1500) ? selPointer : null;
+  const picked = pickSelectionRect(range, pointer);
+  if (!picked.rect || (picked.rect.width === 0 && picked.rect.height === 0)) return;
   INSPECT.barMode = 'text';
+  chatAskMode = 'text';
+  INSPECT.selRectIndex = picked.index;
   INSPECT.lastTextRange = range.cloneRange();
   INSPECT.lastSelectedEl = null;
-  showSelectionBarAtRect(rect);
+  showSelectionBarAtRect(picked.rect);
   updateChatContext(); // 聊天窗打开时：随时划新内容，引用同步更新
+}
+
+function repositionSelectionBar(e) {
+  const t = e && e.target;
+  const host = document.getElementById('tsc-float-container');
+  if (host && t && (t === host || host.contains(t))) return;
+  const bar = INSPECT.barEl;
+  if (!bar || bar.style.display === 'none') return;
+  if (INSPECT.barMode === 'text' && INSPECT.lastTextRange) {
+    const picked = pickSelectionRect(INSPECT.lastTextRange, null, INSPECT.selRectIndex);
+    if (!picked.rect || (picked.rect.width === 0 && picked.rect.height === 0)) return;
+    showSelectionBarAtRect(picked.rect);
+    return;
+  }
+  const el = INSPECT.lastSelectedEl;
+  if (el && el.isConnected) showSelectionBarAtRect(el.getBoundingClientRect());
 }
 
 function onMarkClick(e) {
@@ -4778,6 +4857,7 @@ function toggleMultiSelect(el) {
     renderMultiFrames();
     showMultiBar();
   }
+  chatAskMode = 'multi';
   updateChatContext(); // 聊天窗打开时引用同步（多元素汇总）
 }
 
@@ -4840,6 +4920,7 @@ function multiUnionRect() {
 function showSelectionBar(el) {
   if (!el || !INSPECT.barEl) return;
   INSPECT.barMode = 'element';
+  chatAskMode = 'element';
   INSPECT.lastSelectedEl = el;
   INSPECT.lastTextRange = null;
   showSelectionBarAtRect(el.getBoundingClientRect());
@@ -4867,15 +4948,16 @@ function showMiniToast(msg) {
 
 function showSelectionBarAtRect(rect) {
   const bar = INSPECT.barEl;
-  if (!bar) return;
-  const barW = 128;
+  if (!bar || !rect) return;
+  bar.style.display = 'flex';
+  const barW = bar.offsetWidth || 128;
+  const barH = bar.offsetHeight || 40;
   let left = rect.left + rect.width / 2 - barW / 2;
   left = Math.max(8, Math.min(left, window.innerWidth - barW - 8));
-  let top = rect.top - 46;
-  if (top < 8) top = rect.bottom + 10; // 上方放不下 → 翻到下方
+  let top = rect.top - barH - 8;
+  if (top < 8) top = rect.bottom + 8;
   bar.style.left = left + 'px';
   bar.style.top = top + 'px';
-  bar.style.display = 'flex';
 }
 async function createTextAnnotation(kind) {
   const range = INSPECT.lastTextRange;

@@ -343,14 +343,52 @@ async function writeAll(tasks) {
   await ensureHeartbeatAlarm(tasks);
 }
 
+/** 缺省 / 旧数据一律归 default，避免切项目时漏网或串库。 */
+export function heartbeatProjectId(task) {
+  return String((task && task.projectId) || 'default');
+}
+
+export function taskBelongsToProject(task, projectId) {
+  if (!projectId) return true;
+  return heartbeatProjectId(task) === String(projectId);
+}
+
 export async function listHeartbeatTasks(projectId) {
   const all = await readAll();
   if (!projectId) return all;
-  return all.filter((t) => t.projectId === projectId);
+  return all.filter((t) => taskBelongsToProject(t, projectId));
 }
 
 export async function getHeartbeatTask(id) {
   return (await readAll()).find((t) => t.id === id) || null;
+}
+
+/** 删库时抽走该项目的心跳任务；撤销用 restoreHeartbeatTasks 写回。 */
+export async function purgeHeartbeatTasks(projectId) {
+  const pid = String(projectId || 'default');
+  const all = await readAll();
+  const keep = [];
+  const removed = [];
+  for (const t of all) {
+    if (taskBelongsToProject(t, pid)) removed.push(t);
+    else keep.push(t);
+  }
+  if (removed.length) await writeAll(keep);
+  return removed;
+}
+
+export async function restoreHeartbeatTasks(tasks) {
+  if (!tasks || !tasks.length) return;
+  const all = await readAll();
+  const ids = new Set(all.map((t) => t.id));
+  let changed = false;
+  for (const t of tasks) {
+    if (!t || !t.id || ids.has(t.id)) continue;
+    all.push(t);
+    ids.add(t.id);
+    changed = true;
+  }
+  if (changed) await writeAll(all);
 }
 
 export async function upsertHeartbeatTask(fields, { projectId, createdBy = 'user' } = {}) {
@@ -359,7 +397,8 @@ export async function upsertHeartbeatTask(fields, { projectId, createdBy = 'user
   if (fields.id) {
     const idx = all.findIndex((t) => t.id === fields.id);
     if (idx < 0) throw new Error('找不到该心跳任务');
-    const next = { ...all[idx], ...fields, updatedAt: now };
+    const { projectId: _ignorePid, ...patch } = fields;
+    const next = { ...all[idx], ...patch, updatedAt: now, projectId: heartbeatProjectId(all[idx]) };
     for (const k of SCHEDULE_FIELD_KEYS) delete next[k]; // 原始字段不落库，只留 schedule
     if (applyCadence(next, fields) && next.enabled !== false) {
       next.nextRunAt = null; // 改了周期就重排，不继承旧时刻
@@ -370,12 +409,14 @@ export async function upsertHeartbeatTask(fields, { projectId, createdBy = 'user
     await writeAll(all);
     return next;
   }
-  if (all.length >= HEARTBEAT_MAX_TASKS) {
-    throw new Error(`心跳任务最多 ${HEARTBEAT_MAX_TASKS} 条，请先删掉不用的`);
+  const pid = String(projectId || 'default');
+  const mine = all.filter((t) => taskBelongsToProject(t, pid));
+  if (mine.length >= HEARTBEAT_MAX_TASKS) {
+    throw new Error(`该项目心跳任务最多 ${HEARTBEAT_MAX_TASKS} 条，请先删掉不用的`);
   }
   const task = {
     id: 'hb_' + now.toString(36) + Math.random().toString(36).slice(2, 6),
-    projectId: projectId || 'default',
+    projectId: pid,
     name: String(fields.name || '').trim() || '未命名任务',
     prompt: String(fields.prompt || '').trim(),
     enabled: fields.enabled !== false,
@@ -434,7 +475,7 @@ export async function dueHeartbeatTasks(now = Date.now()) {
 
 export async function queuedHeartbeatTasks(projectId) {
   const all = await readAll();
-  return all.filter((t) => t.queued && (!projectId || t.projectId === projectId));
+  return all.filter((t) => t.queued && taskBelongsToProject(t, projectId));
 }
 
 export async function markHeartbeatQueued(ids) {

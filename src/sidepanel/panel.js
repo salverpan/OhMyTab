@@ -11,12 +11,12 @@ import { PROVIDER_PRESETS } from '../lib/providers/presets.js';
 import { inferModelCaps, formatContextLabel, contextPresets, EFFORT_LEVELS, probeModelMeta, refreshModelCatalog, catalogSourceLabel, defaultWorkingContext, resolveEffortId } from '../lib/model-limits.js';
 import { peekEffortProbe, clearEffortProbe } from '../lib/effort-probe.js';
 import { AGENT_MAX_ROUNDS, AGENT_WRAP_HINT_ROUND } from '../lib/limits.js';
-import { testVisionConnection, scheduleVisionProbe, getVisionProbeStatus, recordVisionProbe, isImageUnsupportedError } from '../lib/vision-client.js';
+import { isImageUnsupportedError } from '../lib/vision-client.js';
 import {
   listHeartbeatTasks, upsertHeartbeatTask, deleteHeartbeatTask, heartbeatPresets,
   formatCadence, heartbeatUserText, queuedHeartbeatTasks, dueHeartbeatTasks,
   markHeartbeatRunning, markHeartbeatFinished, queuedOrDueCount, ensureHeartbeatAlarm,
-  parseEvery, normalizeSchedule, WEEKDAY_LABEL,
+  parseEvery, normalizeSchedule, WEEKDAY_LABEL, taskBelongsToProject,
 } from '../lib/heartbeat.js';
 import { buildChatTools } from '../lib/tools.js';
 import { parseDocxSample, detectStructure, buildTemplate, ROLE_LABELS, aiDetectStructure } from '../lib/template-parser.js';
@@ -36,6 +36,7 @@ import { listNotes, clearNotes, revalidateNotes } from '../lib/notebook.js';
 import { logActivity } from '../lib/activity-log.js';
 import { putTrace, newTraceId, CHAT_THREAD } from '../lib/trace-log.js';
 import { getPlan, clearPlan, planCardHtml, upsertPlanCardEl } from '../lib/plan.js';
+import { listInsights } from '../lib/insight.js';
 import { docEditsListHtml, upsertDocEditsCardEl, mergeEditsIntoList } from '../lib/doc-edits.js';
 import { deleteArtifactsByProject, deleteArtifactsMatching } from '../lib/artifact-store.js';
 import { inferEntryType } from '../lib/source-model.js';
@@ -533,6 +534,7 @@ async function initWorkspaceUi() {
     },
     onExportOriginalEntries: (items) => exportOriginalEntries(items),
     onClearTrunk: (trunk) => clearWorkspaceTrunk(trunk),
+    onDraftChat: (text) => draftChatMessage(text),
     showToast,
     onLibraryWidth: (w) => {
       paneSplitDragging = true;
@@ -1235,6 +1237,7 @@ async function buildDynamicContext(userText, run = null) {
     agentCatalog: formatAgentCatalog(agents),
     mentionedAgents,
     notebookNotes: await listNotes(pid),
+    insights: await listInsights(pid),
     plan: await getPlan(pid),
     apiCatalog: formatApiCatalog(await loadConnectors()),
   });
@@ -1655,7 +1658,7 @@ function traceTurn(run, started) {
       parentId: turn.id,
       threadId: turn.threadId,
       kind: 'agent',
-      title: '主代理回复',
+      title: reply.split('\n').find((l) => l.trim()) || '主代理回复',
       text: reply,
       ts: Date.now(),
       status: aborted ? 'aborted' : 'ok',
@@ -2083,6 +2086,12 @@ function formatNextRun(ts) {
   return sameDay ? `下次 ${hh}:${mm}` : `下次 ${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
 }
 
+function syncHeartbeatUi() {
+  heartbeatEditingId = null;
+  renderHeartbeatList();
+  refreshHeartbeatBadge();
+}
+
 async function refreshHeartbeatBadge() {
   if (!cmdHeartbeatBtn) return;
   const n = await queuedOrDueCount(currentProject);
@@ -2311,7 +2320,7 @@ async function drainRun(run) {
     return;
   }
   const queued = await queuedHeartbeatTasks(run.pid);
-  const due = (await dueHeartbeatTasks()).filter((t) => t.projectId === run.pid);
+  const due = (await dueHeartbeatTasks()).filter((t) => taskBelongsToProject(t, run.pid));
   const dueNow = queued[0] || due[0];
   if (!dueNow) {
     if (viewing(run)) refreshHeartbeatBadge();
@@ -2497,10 +2506,6 @@ async function sendChatMessage(text, opts = {}) {
     await closeHeartbeatTurn(false, '未配置 API', run);
     return;
   }
-  if (turnAttachments.some((a) => a.kind === 'image') && viewing(run)) {
-    kickVisionProbe(config);
-  }
-
   const apiCfg = {
     apiKey: config.apiKey,
     baseUrl: config.baseUrl,
@@ -2636,9 +2641,6 @@ async function sendChatMessage(text, opts = {}) {
       if (result.usage) {
         finalUsage = result.usage;
         turnUsageSum += usageTotalTokens(result.usage);
-      }
-      if (turnAttachments.some((a) => a.kind === 'image')) {
-        recordVisionProbe(apiCfg.model, 'ok').catch(() => {});
       }
 
       // No tool calls - model is done
@@ -2784,7 +2786,6 @@ async function sendChatMessage(text, opts = {}) {
       run.pendingUserText = '';
       run.liveTurnText = '';
       if (viewing(run) && isImageUnsupportedError(err) && turnAttachments.some((a) => a.kind === 'image')) {
-        recordVisionProbe(apiCfg.model, 'no').catch(() => {});
         showToast('当前模型不支持图片', true);
       }
       run.history.push({ role: 'assistant', content: msg });
@@ -3180,7 +3181,6 @@ cmdInput.addEventListener('keydown', (e) => {
 });
 
 init();
-applyUiScale();
 bootColorScheme();
 
 /* ---------------------------------------------------------------
@@ -3188,14 +3188,15 @@ bootColorScheme();
    --------------------------------------------------------------- */
 
 const UI_SCALE_KEY = 'uiScale';
+const UI_SCALE_LOCAL_KEY = 'citecatUiScale';
+const UI_SCALE_STEPS = ['0.25', '0.3', '0.4', '0.5', '0.6', '0.7', '0.8', '0.85', '0.9', '0.95', '1', '1.05', '1.1', '1.15', '1.2', '1.3', '1.4', '1.5'];
 
-async function getStoredUiScale() {
-  try {
-    const { [UI_SCALE_KEY]: v } = await chrome.storage.local.get(UI_SCALE_KEY);
-    return v || 'auto';
-  } catch (_) {
-    return 'auto';
-  }
+function normalizeUiScaleMode(v) {
+  if (v === 'auto') return 'auto';
+  const n = parseFloat(v);
+  if (!Number.isFinite(n) || n <= 0) return 'auto';
+  const hit = UI_SCALE_STEPS.find((s) => Math.abs(parseFloat(s) - n) < 0.001);
+  return hit || 'auto';
 }
 
 function autoUiScale() {
@@ -3209,11 +3210,98 @@ function autoUiScale() {
   return 1.0;
 }
 
-async function applyUiScale() {
-  const stored = await getStoredUiScale();
-  const scale = (stored === 'auto') ? autoUiScale() : (parseFloat(stored) || 1);
-  document.documentElement.style.setProperty('--ui-scale', String(scale));
+function resolveUiScale(mode) {
+  if (mode === 'auto') return autoUiScale();
+  const n = parseFloat(mode);
+  return Number.isFinite(n) && n > 0 ? n : 1;
 }
+
+function writeUiScaleLocal(mode) {
+  try { localStorage.setItem(UI_SCALE_LOCAL_KEY, mode); } catch (_) {}
+}
+
+async function getStoredUiScale() {
+  try {
+    const r = await chrome.storage.local.get(UI_SCALE_KEY);
+    if (r && r[UI_SCALE_KEY] != null && r[UI_SCALE_KEY] !== '') return normalizeUiScaleMode(r[UI_SCALE_KEY]);
+  } catch (_) {}
+  try {
+    const local = localStorage.getItem(UI_SCALE_LOCAL_KEY);
+    if (local) return normalizeUiScaleMode(local);
+  } catch (_) {}
+  return 'auto';
+}
+
+function syncUiScaleSelect(mode) {
+  const scaleEl = document.getElementById('uiScaleSelect');
+  if (scaleEl && scaleEl.value !== mode) scaleEl.value = mode;
+}
+
+let uiScaleToastTimer = 0;
+function flashUiScale(text) {
+  let el = document.getElementById('uiScaleToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'uiScaleToast';
+    el.className = 'ui-scale-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(uiScaleToastTimer);
+  uiScaleToastTimer = setTimeout(() => el.classList.remove('show'), 700);
+}
+
+async function setUiScale(mode, { toast = false } = {}) {
+  const stored = normalizeUiScaleMode(mode);
+  writeUiScaleLocal(stored);
+  try { await chrome.storage.local.set({ [UI_SCALE_KEY]: stored }); } catch (_) {}
+  const scale = resolveUiScale(stored);
+  document.documentElement.style.setProperty('--ui-scale', String(scale));
+  syncUiScaleSelect(stored);
+  if (toast) flashUiScale(stored === 'auto' ? '自动' : `${Math.round(scale * 100)}%`);
+}
+
+async function applyUiScale() {
+  const mode = await getStoredUiScale();
+  writeUiScaleLocal(mode);
+  document.documentElement.style.setProperty('--ui-scale', String(resolveUiScale(mode)));
+  syncUiScaleSelect(mode);
+}
+
+function stepUiScale(current, dir) {
+  const n = Number(current);
+  if (dir > 0) {
+    return UI_SCALE_STEPS.find((s) => parseFloat(s) > n + 0.001) || UI_SCALE_STEPS[UI_SCALE_STEPS.length - 1];
+  }
+  let prev = UI_SCALE_STEPS[0];
+  for (const s of UI_SCALE_STEPS) {
+    if (parseFloat(s) < n - 0.001) prev = s;
+  }
+  return prev;
+}
+
+function bindUiScaleKeys() {
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    let action = null;
+    if (e.key === '0' || e.code === 'Digit0' || e.code === 'Numpad0') action = 'reset';
+    else if (e.key === '+' || e.key === '=' || e.code === 'Equal' || e.code === 'NumpadAdd') action = 'in';
+    else if (e.key === '-' || e.key === '_' || e.code === 'Minus' || e.code === 'NumpadSubtract') action = 'out';
+    if (!action) return;
+    if (action === 'reset' && e.shiftKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (action === 'reset') {
+      setUiScale('1', { toast: true });
+      return;
+    }
+    setUiScale(stepUiScale(getUiZoom(), action === 'in' ? 1 : -1), { toast: true });
+  }, true);
+}
+
+applyUiScale();
+bindUiScaleKeys();
 
 let colorSchemeMode = 'auto';
 
@@ -3460,9 +3548,7 @@ async function init() {
       });
     }
   } catch (err) { console.warn('[Citecat] channel init failed:', err); }
-  try {
-    kickVisionProbe(await getProjectConfig(currentProject));
-  } catch (_) {}
+  chrome.storage.local.remove(['visionConfig', 'visionProbeCache', 'visionProbeCacheVer']).catch(() => {});
   entries = await getEntries(currentProject);
   await loadChatSession(); // 恢复当前项目的对话（关面板/SW 重启不丢）
   adoptVisible(ensureRun(currentProject));
@@ -4211,6 +4297,17 @@ function goToChatPanel() {
   switchPanel(0);
 }
 
+/** 决策板“派去调研 / 去回答”：只预填输入框，由用户改完再发。 */
+function draftChatMessage(text) {
+  if (!cmdInput || !text) return;
+  goToChatPanel();
+  cmdInput.value = String(text);
+  autoResizeInput();
+  updateSendButton();
+  cmdInput.focus();
+  cmdInput.setSelectionRange(cmdInput.value.length, cmdInput.value.length);
+}
+
 function resetChatRuntimeState() {
   chatQueue = [];
   if (chatMessagesEl) chatMessagesEl.querySelectorAll('.chat-msg.queued').forEach((el) => el.remove());
@@ -4275,6 +4372,7 @@ async function applyProjectNow(id) {
     await restoreLibCollapsed();
     await loadChatSession(id);
     if (workspaceApi) await workspaceApi.projectChanged();
+    syncHeartbeatUi();
     render();
     renderProjects();
     updateSendButton();
@@ -4321,7 +4419,7 @@ function renderProjects() {
     });
   });
 
-  // Delete：删项目 = 级联删除（来源/产出 / 原件 / 工作区证据 / 笔记 / 标签 / 配置 / 会话 / 标注），
+  // Delete：删项目 = 级联删除（来源/产出 / 原件 / 工作区证据 / 笔记 / 标签 / 配置 / 会话 / 标注 / 心跳任务），
   // 保留 AI 记忆与订阅；不弹二次确认，与条目删除同款撤销（4 秒）。
   list.querySelectorAll('.library-del-btn').forEach((btn) => {
     btn.addEventListener('click', async (e) => {
@@ -4352,6 +4450,7 @@ function renderProjects() {
         await restoreLibCollapsed();
         await loadChatSession(); // 回到 default：恢复 default 的会话（若有）
         if (workspaceApi) await workspaceApi.projectChanged();
+        syncHeartbeatUi();
         renderChat();
         render();
       }
@@ -4374,6 +4473,7 @@ function renderProjects() {
           renderChat();
         }
         entries = await getEntries(currentProject);
+        syncHeartbeatUi();
         render();
         renderProjects();
         notifyCollectionStatusChanged({ refreshAll: true });
@@ -4483,18 +4583,6 @@ async function initSettings() {
   const refreshIntervalEl = document.getElementById('feedRefreshInterval');
   if (refreshIntervalEl) refreshIntervalEl.value = prefs.intervalMin || 30;
 
-  const visionCfg = await chrome.storage.local.get('visionConfig').then((r) => r.visionConfig || {});
-  const vKeyEl = document.getElementById('visionApiKey');
-  const vUrlEl = document.getElementById('visionBaseUrl');
-  const vModelEl = document.getElementById('visionModel');
-  const vMaxEl = document.getElementById('visionMaxTokens');
-  const vProtoEl = document.getElementById('visionProtocol');
-  if (vKeyEl) vKeyEl.value = visionCfg.apiKey || '';
-  if (vUrlEl) vUrlEl.value = visionCfg.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
-  if (vModelEl) vModelEl.value = visionCfg.model || 'glm-4v-flash';
-  if (vMaxEl) vMaxEl.value = visionCfg.maxTokens || 1024;
-  if (vProtoEl) vProtoEl.value = visionCfg.protocol || 'openai';
-
   await renderApiConnectors();
   const chips = document.getElementById('apiPresetChips');
   if (chips && !chips.dataset.ready) {
@@ -4520,15 +4608,14 @@ async function initSettings() {
 
   const scaleEl = document.getElementById('uiScaleSelect');
   if (scaleEl) {
-    const stored = await getStoredUiScale();
-    scaleEl.value = stored;
-    scaleEl.addEventListener('change', async () => {
-      const val = scaleEl.value;
-      await chrome.storage.local.set({ [UI_SCALE_KEY]: val });
-      const scale = (val === 'auto') ? autoUiScale() : (parseFloat(val) || 1);
-      document.documentElement.style.setProperty('--ui-scale', String(scale));
-      showSettingsStatus('uiScaleStatus', '已应用', 'success');
-    });
+    scaleEl.value = await getStoredUiScale();
+    if (!scaleEl.dataset.bound) {
+      scaleEl.dataset.bound = '1';
+      scaleEl.addEventListener('change', async () => {
+        await setUiScale(scaleEl.value);
+        showSettingsStatus('uiScaleStatus', '已应用', 'success');
+      });
+    }
   }
 
   // Preserve pending sample state across panel switches
@@ -4788,14 +4875,11 @@ async function submitChannelForm({ asNew }) {
   await saveAiChannels(channels);
   closeChannelEditor();
   renderChannelManager();
-  kickVisionProbe(saved);
 }
 
 async function switchChannel(id) {
   await setActiveChannelId(id);
   await renderChannelManager(); // 重绘渠道列表行选中态与头部切换器（内含 refreshChatChannelSwitcher）
-  const channels = await getAiChannels();
-  kickVisionProbe(channels.find((c) => c.id === id));
 }
 
 let editingApiConnectorId = null;
@@ -5139,17 +5223,6 @@ async function renderChannelManager() {
 /** 聊天头部的快速切换下拉（无需进设置页就能换渠道） */
 /* ---- 聊天头部渠道切换：模型名触发按钮 + 弹出菜单（发丝边框 + 聚焦虚化入场）---- */
 
-/** 后台静默探测当前渠道是否能看图；不 await，失败不影响 UI */
-function kickVisionProbe(cfg) {
-  if (!cfg || !cfg.model || !cfg.apiKey) return;
-  void scheduleVisionProbe({
-    apiKey: cfg.apiKey,
-    baseUrl: cfg.baseUrl,
-    model: cfg.model,
-    protocol: cfg.protocol || 'openai',
-  });
-}
-
 function hostOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
@@ -5247,12 +5320,6 @@ async function handoffChannel(picked) {
         protocol: picked.protocol || 'openai', contextTokens: win,
       }, { force: true });
     }
-  }
-  kickVisionProbe(picked);
-  const hasImage = chatHistory.some((m) => Array.isArray(m.content) && m.content.some((p) => p && p.type === 'image_url'));
-  const probed = picked ? await getVisionProbeStatus(picked.model || '') : '';
-  if (hasImage && probed === 'no') {
-    showToast('当前模型可能无法看图', true);
   }
   await saveChatSession();
   renderChat();
@@ -6127,42 +6194,6 @@ function bindSettingsEvents() {
   });
 
   bindSearchChannelEvents();
-
-  // Vision config
-  const readVisionForm = () => ({
-    apiKey: document.getElementById('visionApiKey').value.trim(),
-    baseUrl: document.getElementById('visionBaseUrl').value.trim(),
-    model: document.getElementById('visionModel').value.trim(),
-    protocol: document.getElementById('visionProtocol')?.value || 'openai',
-    maxTokens: Math.max(128, Math.min(32768, parseInt(document.getElementById('visionMaxTokens').value, 10) || 1024)),
-  });
-  const saveVisionBtn = document.getElementById('saveVisionConfigBtn');
-  if (saveVisionBtn) {
-    saveVisionBtn.addEventListener('click', async () => {
-      await chrome.storage.local.set({ visionConfig: readVisionForm() });
-      showSettingsStatus('visionStatus', '已保存', 'success');
-    });
-  }
-  const testVisionBtn = document.getElementById('testVisionBtn');
-  if (testVisionBtn) {
-    testVisionBtn.addEventListener('click', async () => {
-      const cfg = readVisionForm();
-      if (!cfg.apiKey) {
-        showSettingsStatus('visionStatus', '请先填写 API Key', 'error');
-        return;
-      }
-      testVisionBtn.disabled = true;
-      testVisionBtn.textContent = '测试中...';
-      const result = await testVisionConnection(cfg);
-      if (result.ok) {
-        showSettingsStatus('visionStatus', 'Vision 连接成功！', 'success');
-      } else {
-        showSettingsStatus('visionStatus', `失败: ${(result.error || '').slice(0, 120)}`, 'error');
-      }
-      testVisionBtn.disabled = false;
-      testVisionBtn.textContent = '测试连接';
-    });
-  }
 
   document.getElementById('addApiConnectorBtn')?.addEventListener('click', () => {
     openApiEditor(null);

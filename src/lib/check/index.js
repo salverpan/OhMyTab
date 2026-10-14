@@ -121,8 +121,36 @@ export async function runCheckPipeline(report, {
   };
 }
 
+const PASS_VERDICTS = new Set(['entailment-pass', 'cross-source-pass']);
+
+function failureForMain(c) {
+  return {
+    id: c.id,
+    claim: c.claim,
+    ...(c.attribution ? { attribution: c.attribution } : {}),
+    modality: c.modality || 'reported',
+    verdict: c.verdict,
+    independent_sources: Number(c.independentSources) || 0,
+    reason: c.reason,
+    sources: (c.evidence || [])
+      .filter((e) => e.status === 'citation-pass')
+      .map((e) => `${e.evidence.doc_id}#${e.evidence.anchor}`),
+    failure_evidence: (c.evidence || [])
+      .filter((e) => e.status !== 'citation-pass')
+      .map((e) => ({
+        source: `${e.evidence?.doc_id || ''}#${e.evidence?.anchor || ''}`,
+        reason: e.reason,
+        excerpt: e.excerpt || '',
+      })),
+  };
+}
+
+/** 主代理只看未通过项。通过的主张在 report.findings 里，完整核验留在子会话。 */
 export function verificationForMain(verification) {
   if (!verification) return null;
+  const failures = (verification.claims || [])
+    .filter((c) => !PASS_VERDICTS.has(c.verdict))
+    .map(failureForMain);
   return {
     check_run_id: verification.checkRunId,
     checker: verification.checkerVersion,
@@ -133,24 +161,9 @@ export function verificationForMain(verification) {
     counts: verification.counts,
     content_failure: verification.contentFailure,
     infrastructure_failure: verification.infrastructureFailure,
-    claims: verification.claims.map((c) => ({
-      id: c.id,
-      claim: c.claim,
-      ...(c.attribution ? { attribution: c.attribution } : {}),
-      modality: c.modality || 'reported',
-      verdict: c.verdict,
-      independent_sources: Number(c.independentSources) || 0,
-      reason: c.reason,
-      sources: c.evidence
-        .filter((e) => e.status === 'citation-pass')
-        .map((e) => `${e.evidence.doc_id}#${e.evidence.anchor}`),
-      failure_evidence: c.evidence
-        .filter((e) => e.status !== 'citation-pass')
-        .map((e) => ({
-          source: `${e.evidence?.doc_id || ''}#${e.evidence?.anchor || ''}`,
-          reason: e.reason,
-          excerpt: e.excerpt || '',
-        })),
-    })),
+    note: failures.length
+      ? 'failures 是未通过核验的主张，不要写成事实。其余主张已通过，写在 report.findings 的 supporting / contradicting 里。'
+      : '没有未通过项。report.findings 下的事实已通过核验，可以引用，仍须保留 modality。',
+    failures,
   };
 }

@@ -6,10 +6,15 @@
  *
  *   turn（用户输入 / 心跳运行 / 子代理回报）
  *     ├─ agent     主代理本回合的回复
- *     └─ subagent  派出的子代理
- *          ├─ claim       断言（status = 核验 verdict，text = 理由）
- *          ├─ unresolved  未解决项
- *          └─ action      执行的操作
+ *     ├─ subagent  派出的子代理
+ *     │    ├─ finding     子代理对任务书问题的判断（meta.support / counter = claim 节点 id）
+ *     │    ├─ claim       断言（status = 核验 verdict，text = 理由）
+ *     │    ├─ unresolved  未解决项
+ *     │    └─ action      执行的操作
+ *     └─ report    compose_report 产出的研报（text = BLUF，refs.entryId = 产出条目）
+ *          ├─ kj          核心判断（meta.support / counter = evidence 节点 id）
+ *          ├─ evidence    判断引用的证据快照（status = 核验 verdict）
+ *          └─ unresolved  不确定性（subtype=uncertainty）/ 信息缺口（subtype=gap）
  *
  * 判断 / 观测不在这里存：它们的权威数据在笔记本（supersedes 链、history），读图时合并。
  *
@@ -25,7 +30,10 @@ const CHANNEL = 'citecat-trace';
 export const TRACE_MAX_PER_PROJECT = 3000;
 const TRIM_EVERY = 40;
 
-export const TRACE_KINDS = ['turn', 'agent', 'subagent', 'claim', 'unresolved', 'action', 'insight'];
+export const TRACE_KINDS = [
+  'turn', 'agent', 'subagent', 'claim', 'unresolved', 'action', 'insight',
+  'finding', 'report', 'kj', 'evidence',
+];
 export const CHAT_THREAD = 'chat';
 
 const TITLE_MAX = 160;
@@ -35,6 +43,7 @@ const META_CONFIDENCE = ['high', 'medium', 'low'];
 const META_TREND = ['up', 'down', 'flat'];
 const META_TRIGGER = ['user', 'refuted', 'failure', 'new-info', 'other'];
 const META_MODALITY = ['confirmed', 'claimed', 'reported', 'denied', 'assessed', 'speculative'];
+const MAX_LINKS = 40;
 
 /**
  * insight 节点的结构化附加字段（主代理上报的决策要素）。只保留白名单标量，
@@ -58,6 +67,13 @@ function normalizeMeta(m) {
   if (x.attribution) out.attribution = clip(x.attribution, 80);
   if (x.eventTime) out.eventTime = clip(x.eventTime, 40);
   if (Number(x.sources) > 0) out.sources = Math.min(99, Math.floor(Number(x.sources)));
+  if (x.likelihood) out.likelihood = clip(x.likelihood, 12);
+  if (x.question) out.question = clip(x.question, 300);
+  for (const k of ['support', 'counter']) {
+    if (!Array.isArray(x[k])) continue;
+    const ids = x[k].map((v) => clip(v, 160)).filter(Boolean).slice(0, MAX_LINKS);
+    if (ids.length) out[k] = ids;
+  }
   return out;
 }
 
@@ -79,7 +95,7 @@ export function normalizeTraceNode(n) {
   const kind = TRACE_KINDS.includes(x.kind) ? x.kind : 'action';
   const refsIn = x.refs && typeof x.refs === 'object' ? x.refs : {};
   const refs = {};
-  for (const k of ['taskId', 'checkRunId', 'docId', 'noteId']) {
+  for (const k of ['taskId', 'checkRunId', 'docId', 'noteId', 'entryId']) {
     if (refsIn[k]) refs[k] = clip(refsIn[k], 80);
   }
   return {
@@ -332,6 +348,19 @@ export function subagentReportNodes({ projectId, parentId, threadId, report, ver
   const mk = (kind, fields) => normalizeTraceNode({
     projectId, parentId, threadId, kind, ts: base + (i++), ...fields,
   });
+  const claimNodeId = (cid) => `${parentId}:${cid}`;
+  (report.findings || []).forEach((f, idx) => {
+    nodes.push(mk('finding', {
+      id: `${parentId}:f${idx + 1}`,
+      subtype: f.confidence || '',
+      title: f.question,
+      text: f.answer,
+      meta: {
+        support: (f.supporting || []).map(claimNodeId),
+        counter: (f.contradicting || []).map(claimNodeId),
+      },
+    }));
+  });
   for (const c of report.claims || []) {
     const v = verdictById.get(c.id);
     nodes.push(mk('claim', {
@@ -352,5 +381,77 @@ export function subagentReportNodes({ projectId, parentId, threadId, report, ver
   for (const a of report.actions || []) {
     nodes.push(mk('action', { id: `${parentId}:a${i}`, title: a.description, refs: a.result_ref ? { docId: a.result_ref } : {} }));
   }
+  return nodes;
+}
+
+/**
+ * compose_report 的论证结构 -> report / kj / evidence / unresolved 节点。纯函数。
+ * evidence 是判断所引证据的快照（不指回子代理的 claim 节点：同一主张可能来自多个子任务，已在证据池里合并）。
+ * @param {object} input
+ * @param {object} input.outline  validateOutline 之后的骨架
+ * @param {Array}  input.evidence 证据池条目（report-writer buildEvidencePool().items）
+ */
+export function reportTraceNodes({
+  projectId, parentId = '', threadId, ts, reportId, title, question, entryId = '', outline, evidence = [],
+}) {
+  if (!outline || !reportId) return [];
+  const base = Number(ts) > 0 ? Number(ts) : Date.now();
+  let i = 0;
+  const mk = (kind, fields) => normalizeTraceNode({
+    projectId, threadId, kind, ts: base + (i++), parentId: reportId, ...fields,
+  });
+  const evId = (e) => `${reportId}:${e}`;
+  const used = new Set();
+  const judgments = outline.key_judgments || [];
+  for (const k of judgments) for (const e of [...(k.basis || []), ...(k.counter || [])]) used.add(e);
+  for (const u of outline.uncertainties || []) for (const e of u.basis || []) used.add(e);
+  const items = evidence.filter((item) => used.has(item.id));
+  const nodes = [normalizeTraceNode({
+    id: reportId,
+    projectId,
+    parentId,
+    threadId,
+    kind: 'report',
+    ts: base + (i++),
+    title: title || outline.title,
+    text: outline.bluf,
+    status: 'ok',
+    refs: entryId ? { entryId } : {},
+    meta: { question, sources: items.length },
+  })];
+  judgments.forEach((k, idx) => {
+    nodes.push(mk('kj', {
+      id: `${reportId}:K${idx + 1}`,
+      subtype: k.confidence || '',
+      title: k.judgment,
+      text: k.reasoning,
+      meta: { likelihood: k.likelihood, support: (k.basis || []).map(evId), counter: (k.counter || []).map(evId) },
+    }));
+  });
+  for (const item of items) {
+    const src = (item.sources || []).find((s) => s.quote) || (item.sources || [])[0] || {};
+    nodes.push(mk('evidence', {
+      id: evId(item.id),
+      subtype: item.confidence || '',
+      title: item.claim,
+      text: src.quote || '',
+      status: item.verdict,
+      refs: src.doc_id ? { docId: src.doc_id } : {},
+      meta: {
+        modality: item.modality,
+        attribution: item.attribution,
+        eventTime: item.eventTime,
+        sources: item.independentSources,
+      },
+    }));
+  }
+  (outline.uncertainties || []).forEach((u, idx) => {
+    nodes.push(mk('unresolved', {
+      id: `${reportId}:u${idx + 1}`, subtype: 'uncertainty', title: u.issue, meta: { support: (u.basis || []).map(evId) },
+    }));
+  });
+  (outline.gaps || []).forEach((g, idx) => {
+    nodes.push(mk('unresolved', { id: `${reportId}:g${idx + 1}`, subtype: 'gap', title: g }));
+  });
   return nodes;
 }

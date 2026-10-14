@@ -317,3 +317,163 @@ export function isGraphEmpty(graph) {
 export function shortTitle(node, max = 56) {
   return clip(node.title, max);
 }
+
+const PASSED_VERDICT = new Set(['cross-source-pass', 'entailment-pass', 'citation-pass', 'notebook-verified']);
+const FAILED_VERDICT = new Set(['citation-fail', 'overclaim', 'source-conflict']);
+
+function tallyVerdicts(claims) {
+  const t = { pass: 0, fail: 0, unverified: 0, total: claims.length };
+  for (const c of claims) {
+    if (PASSED_VERDICT.has(c.status)) t.pass += 1;
+    else if (FAILED_VERDICT.has(c.status)) t.fail += 1;
+    else t.unverified += 1;
+  }
+  return t;
+}
+
+function kidsOf(byParent, id) {
+  return byParent.get(id) || [];
+}
+
+/**
+ * 过程时间线：回合分级 + 断言按 finding 聚合。断言不再平铺成图节点。
+ */
+export function buildProcessTimeline({
+  nodes = [], notes = [], tasks = [], projectName = '', now = Date.now(),
+} = {}) {
+  const taskById = new Map((tasks || []).map((t) => [t.id, t]));
+  const trace = (Array.isArray(nodes) ? nodes : []).filter((n) => n && n.id);
+  const byId = new Map(trace.map((n) => [n.id, n]));
+  const byParent = new Map();
+  for (const n of trace) {
+    const p = n.parentId && byId.has(n.parentId) ? n.parentId : '';
+    const key = p || `thread:${n.threadId || CHAT_THREAD_ID}`;
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(n);
+  }
+  for (const arr of byParent.values()) arr.sort((a, b) => ms(a.ts) - ms(b.ts) || a.id.localeCompare(b.id));
+
+  const noteList = (Array.isArray(notes) ? notes : []).filter((n) => n && n.id);
+  const turnsByThread = new Map();
+  for (const n of trace) {
+    if (n.kind !== 'turn') continue;
+    const tid = n.threadId || CHAT_THREAD_ID;
+    if (!turnsByThread.has(tid)) turnsByThread.set(tid, []);
+    turnsByThread.get(tid).push(n);
+  }
+
+  const notesByTurn = new Map();
+  for (const note of noteList) {
+    const tid = note.threadId || CHAT_THREAD_ID;
+    const turn = pickTurnForNote(turnsByThread.get(tid) || [], ms(note.createdAt));
+    const key = turn ? turn.id : `thread:${tid}`;
+    if (!notesByTurn.has(key)) notesByTurn.set(key, []);
+    notesByTurn.get(key).push(noteToNode(note, now));
+  }
+
+  function packClaims(subId) {
+    const kids = kidsOf(byParent, subId);
+    const findings = kids.filter((n) => n.kind === 'finding');
+    const claims = kids.filter((n) => n.kind === 'claim');
+    const unresolved = kids.filter((n) => n.kind === 'unresolved');
+    const actions = kids.filter((n) => n.kind === 'action');
+    const linked = new Set();
+    const groups = findings.map((f) => {
+      const support = (f.meta?.support || []).map((id) => byId.get(id)).filter((c) => c && c.kind === 'claim');
+      const counter = (f.meta?.counter || []).map((id) => byId.get(id)).filter((c) => c && c.kind === 'claim');
+      for (const c of [...support, ...counter]) linked.add(c.id);
+      return {
+        id: f.id,
+        question: f.title,
+        answer: f.text,
+        confidence: f.subtype,
+        support,
+        counter,
+        counts: tallyVerdicts([...support, ...counter]),
+      };
+    });
+    const orphans = claims.filter((c) => !linked.has(c.id));
+    if (orphans.length) {
+      groups.push({
+        id: `${subId}:orphan`, question: '', answer: '', confidence: '',
+        support: orphans, counter: [], counts: tallyVerdicts(orphans), orphan: true,
+      });
+    }
+    return {
+      findings, claims, unresolved, actions, groups,
+      counts: tallyVerdicts(claims),
+    };
+  }
+
+  function packTurn(turn) {
+    const kids = kidsOf(byParent, turn.id);
+    const subagents = kids.filter((n) => n.kind === 'subagent').map((s) => {
+      const packed = packClaims(s.id);
+      return {
+        id: s.id, type: s.subtype, title: s.title, status: s.status,
+        ts: ms(s.ts), endedAt: ms(s.endedAt), text: s.text, ...packed,
+      };
+    });
+    const reports = kids.filter((n) => n.kind === 'report');
+    const reply = [...kids].reverse().find((n) => n.kind === 'agent');
+    const judgments = notesByTurn.get(turn.id) || [];
+    const work = subagents.length > 0 || reports.length > 0 || judgments.some((j) => j.kind === 'judgment');
+    return {
+      id: turn.id,
+      subtype: turn.subtype,
+      title: turn.title,
+      text: turn.text,
+      status: turn.status,
+      ts: ms(turn.ts),
+      endedAt: ms(turn.endedAt),
+      grade: work ? 'work' : 'idle',
+      reply: reply ? { id: reply.id, title: reply.title, text: reply.text, status: reply.status } : null,
+      subagents,
+      reports: reports.map((r) => ({
+        id: r.id, title: r.title, text: r.text, entryId: r.refs?.entryId || '',
+        judgments: kidsOf(byParent, r.id).filter((n) => n.kind === 'kj').length,
+      })),
+      judgments,
+    };
+  }
+
+  const threadIds = new Set(trace.map((n) => n.threadId || CHAT_THREAD_ID));
+  for (const note of noteList) threadIds.add(note.threadId || CHAT_THREAD_ID);
+  const threads = [];
+  for (const tid of threadIds) {
+    const isChat = tid === CHAT_THREAD_ID;
+    const task = isChat ? null : taskById.get(tid);
+    const turns = (turnsByThread.get(tid) || []).slice().sort((a, b) => ms(b.ts) - ms(a.ts)).map(packTurn);
+    const looseNotes = notesByTurn.get(`thread:${tid}`) || [];
+    if (!turns.length && !looseNotes.length && isChat) continue;
+    threads.push({
+      id: tid,
+      title: isChat ? '对话' : (task ? task.name : '已删除的追踪任务'),
+      kind: isChat ? 'chat' : 'heartbeat',
+      paused: !!(task && task.enabled === false),
+      deleted: !isChat && !task,
+      turns,
+      looseNotes,
+    });
+  }
+  threads.sort((a, b) => {
+    const ta = a.turns[0]?.ts || 0;
+    const tb = b.turns[0]?.ts || 0;
+    return tb - ta;
+  });
+  const workTurns = threads.reduce((n, t) => n + t.turns.filter((x) => x.grade === 'work').length, 0);
+  return {
+    projectName: projectName || '项目',
+    threads,
+    stats: {
+      threads: threads.length,
+      turns: threads.reduce((n, t) => n + t.turns.length, 0),
+      workTurns,
+      subagents: threads.reduce((n, t) => n + t.turns.reduce((m, u) => m + u.subagents.length, 0), 0),
+    },
+  };
+}
+
+export function isProcessEmpty(model) {
+  return !model || !model.threads.some((t) => t.turns.length || t.looseNotes.length);
+}

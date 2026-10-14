@@ -76,3 +76,10 @@ export function safeJsonParse(text, fallback = {}) {
     return fallback;
   }
 }
+
+/** 各协议的「输出被上限截断」收成 length，其余原样小写。 */
+export function normalizeFinishReason(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'length' || s === 'max_tokens' || s.includes('max_token')) return 'length';
+  return s || 'stop';
+}

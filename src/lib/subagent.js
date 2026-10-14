@@ -33,6 +33,7 @@ import {
   formatAgentCatalog, filterToolsForAgent, allowedToolNames, formatTaskResult,
   revisionRequestFor, serializeSubagentSessions, restoreSubagentSessions,
 } from './subagent-core.js';
+import { appendViewportShots } from './tool-round-messages.js';
 import { emitUsage, usageTotalTokens } from './usage.js';
 import { logActivity } from './activity-log.js';
 
@@ -98,7 +99,7 @@ async function resolveJudgeApiConfig(ctx, limits) {
   return channelApiConfig(limits && limits.checkChannelId, ctx.apiConfig && ctx.apiConfig.contextTokens);
 }
 
-function budgetState(budget, usedTokens, startedAt) {
+export function budgetState(budget, usedTokens, startedAt) {
   const tokenRatio = budget.tokens > 0 ? usedTokens / budget.tokens : 0;
   const timeRatio = budget.ms > 0 ? (Date.now() - startedAt) / budget.ms : 0;
   const ratio = Math.max(tokenRatio, timeRatio);
@@ -147,11 +148,19 @@ function childSystemPrompt(agent, maxTabs = SUBAGENT_MAX_TABS) {
     '经验记忆只读：系统会按当前页与任务自动注入相关条目（如有）。不要调用 save_memory；值得记的经验写进给父代理的报告即可。',
     `标签预算：同时最多打开 ${maxTabs} 个标签页。读完不需要的先 manage_tabs(close, tab_id) 关掉再开新的——读过的内容仍在你的上下文里，不必为留着标签而占额度。`,
     '任务完成后必须调用 submit_report。自然语言正文、Markdown 或自称“已完成”都不算交回。',
-    '事实拆成 claims；每条 evidence 必须给 doc_id、锚点和来源逐字 quote。只有 URL、标签页 id 或转述的内容放 unresolved，不得伪造证据。',
-    '每条 claim 写明 attribution（最初是谁说的，不是转载网站）与 modality。当事方的说法是 claimed，媒体转述是 reported，不要把它们写成 confirmed；claim 句子本身也要保留“X 称”。',
-    '查过但没找到的方向也写进 unresolved（例如“检索 A/B 两类来源均未见报道”），这本身是有用的情报。',
-    '单篇长文档超出当前上下文时可调用 section_job；它只读指定 doc_id 的章节并返回结构化 claims。不要用它代替普通网页检索。',
-    '操作型任务把已执行动作与产物引用写入 actions；没有事实 claim 时 claims 可以为空。',
+    ...(agent.name === 'explore'
+      ? [
+        '阅读交回使用 passages：每条包含 use、doc_id、anchor、逐字 quote。claims 传空数组，不要写 findings。',
+        '查过但没有原文的要点写进 unresolved。summary 只列覆盖了哪些 use，不要写文档正文。',
+      ]
+      : [
+        '事实拆成 claims；每条 evidence 必须给 doc_id、锚点和来源逐字 quote。只有 URL、标签页 id 或转述的内容放 unresolved，不得伪造证据。',
+        '每条 claim 写明 attribution（最初是谁说的，不是转载网站）与 modality。当事方的说法是 claimed，媒体转述是 reported，不要把它们写成 confirmed；claim 句子本身也要保留“X 称”。',
+        '查过但没找到的方向也写进 unresolved。操作型任务把已执行动作写入 actions；没有事实 claim 时 claims 可以为空。',
+      ]),
+    '单篇长文档超出当前上下文时可调用 section_job。'
+      + '返回 content_has_more=true 时，用相同 doc_id 与 goal、只传 offset=content_next_offset 续拉，直到 content_has_more=false。'
+      + '阅读任务把其中的逐字 quote 收进 passages。不要用它代替普通网页检索。',
     '禁止把网页原文或大段摘录粘进 summary；长材料只通过 evidence 锚点引用。',
     '',
     agent.prompt || '',
@@ -204,7 +213,10 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
   if (agent.name === 'browser') {
     try {
       const snap = await executeToolCall('browser_act', { op: 'observe' }, childCtx);
+      const shot = childCtx._viewportShot;
+      childCtx._viewportShot = null;
       messages.push({ role: 'user', content: `[PAGE-SNAPSHOT]\n${snap}` });
+      if (shot) appendViewportShots(messages, messages, [shot]);
     } catch (_) {}
   }
 
@@ -230,9 +242,10 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
       forced = true;
       session.card.budgetExhausted = state.by;
       childCtx.subagentAllowedTools = new Set(['submit_report']);
+      childCtx.subagentBudgetForced = true;
       messages.push({
         role: 'user',
-        content: `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：已核实的写进 claims，没查完的方向和原因写进 unresolved。`,
+        content: `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：已核实的写进 claims，能回答的问题写进 findings，没查完的方向和原因写进 unresolved。`,
       });
     } else if (!warned && !forced && state.ratio >= SUBAGENT_BUDGET_WARN_RATIO) {
       warned = true;
@@ -499,7 +512,8 @@ export async function runTaskTool(args, ctx = {}) {
       const incomplete = !aborted && !result.submitted;
       const state = aborted ? 'error' : (incomplete ? 'incomplete' : 'completed');
       session.report = result.report || null;
-      session.verification = result.submitted
+      const passageOnly = !!(result.report && (result.report.passages || []).length && !(result.report.claims || []).length);
+      session.verification = result.submitted && !passageOnly
         ? await runCheckPipeline(result.report, {
           projectId: ctx.projectId || 'default',
           apiConfig: apiCfg,

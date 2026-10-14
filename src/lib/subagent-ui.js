@@ -36,8 +36,11 @@ function structuredInner(card, prefix) {
   }).join('');
   const actions = (report.actions || []).map((a) =>
     `<li><span>${esc(a.description)}</span>${a.result_ref ? `<small>${esc(a.result_ref)}</small>` : ''}</li>`).join('');
+  const findings = (report.findings || []).map((f) =>
+    `<li><span><b>${esc(f.question)}</b> ${esc(f.answer)}</span><small>${esc([...(f.supporting || []), ...(f.contradicting || []).map((id) => `≠${id}`)].join(' · '))}</small></li>`).join('');
   return `<div class="${prefix}-subagent-label">结构化交回</div>
     <p>${esc(report.summary || '')}</p>
+    ${findings ? `<ul>${findings}</ul>` : ''}
     ${claims ? `<ul>${claims}</ul>` : ''}
     ${actions ? `<ul>${actions}</ul>` : ''}`;
 }

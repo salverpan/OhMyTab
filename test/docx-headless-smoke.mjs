@@ -137,5 +137,77 @@ assert.ok(!eBad.ok && !eBad.edits, '失败操作不得带 edits');
 // 痕迹缓冲按次清空：失败操作后紧接的成功操作只带自己那一条
 const e6 = await word.execWordTool('replace_text', { find: '第二段正文', replace: '次段正文' });
 assert.ok(e6.ok && e6.edits && e6.edits.length === 1 && e6.edits[0].before === '第二段正文', '每次操作痕迹独立: ' + JSON.stringify(e6.edits));
+assert.ok(!e1.edits[0].tracked, '直接替换不是待审修订');
+assert.ok(e5.edits[0].tracked, 'suggest_replace 必须标 tracked');
 
-console.log('docx 无头引擎链路（修订/直接改/undo/accept/设置注入/稳定 id/reject 回显/待审守卫/嵌套修复/修改痕迹）: ALL PASS');
+// 11) set_format：文字格式 + 段落格式直接写入，不产生修订痕迹
+await word.initWordEditor(null, await docxWith('格式样本'));
+const fmt = await word.execWordTool('set_format', {
+  find: '格式样本',
+  font: '微软雅黑',
+  size: 14,
+  bold: true,
+  color: '#C00000',
+  highlight: 'yellow',
+  align: 'center',
+  line_spacing: 1.5,
+  space_before: 6,
+  indent: 12,
+});
+assert.ok(fmt.ok && fmt.edits && fmt.edits[0].op === 'format' && !fmt.edits[0].tracked, 'set_format 直接写入: ' + JSON.stringify(fmt));
+assert.equal(word.pendingReviewCount(), 0, 'set_format 不产生修订');
+const fmtXml = await (await JSZip.loadAsync(await word.exportWordDocx())).file('word/document.xml').async('string');
+assert.ok(fmtXml.includes('微软雅黑'), '写入字体');
+assert.ok(fmtXml.includes('w:val="28"'), '14 磅 = sz 28');
+assert.ok(fmtXml.includes('C00000'), '写入颜色');
+assert.ok(fmtXml.includes('w:val="yellow"'), '写入高亮');
+assert.ok(fmtXml.includes('w:val="center"'), '段落居中');
+assert.ok(fmtXml.includes('w:line="360"'), '1.5 倍行距');
+assert.ok(fmtXml.includes('w:before="120"'), '段前 6 磅');
+assert.ok(fmtXml.includes('w:left="240"'), '左缩进 12 磅');
+const badFmt = await word.execWordTool('set_format', { find: '格式样本', color: 'red' });
+assert.ok(!badFmt.ok && !badFmt.edits, '非法颜色不得写入');
+
+// 12) find===replace 不写修订；相同 find/replace 的待审修订不重复添加
+const beforeDup = word.pendingReviewCount();
+const noop = await word.execReviewTool('suggest_replace', { find: '格式样本', replacement: '格式样本', note: '无意义' });
+assert.ok(noop.ok && noop.noop, '相同文本应是 noop: ' + JSON.stringify(noop));
+assert.equal(word.pendingReviewCount(), beforeDup, 'noop 不增加修订');
+const once = await word.execReviewTool('suggest_replace', { find: '格式样本', replacement: '格式样本甲', note: '商业上合理的努力' });
+assert.ok(once.ok && !once.already_pending, '第一次替换应写入: ' + JSON.stringify(once));
+const twice = await word.execReviewTool('suggest_replace', { find: '格式样本', replacement: '格式样本甲', note: '再来一次' });
+assert.ok(twice.ok && twice.already_pending, '重复提交应已存在: ' + JSON.stringify(twice));
+assert.equal(twice.revision.id, once.revision.id, '重复提交回放同一条修订');
+
+// 13) 重载引擎后 note 从 comments.xml 读回
+const persisted = await word.exportWordDocx();
+await word.initWordEditor(null, persisted);
+const revived = word.listReviewItems().find((r) => r.replacement === '格式样本甲');
+assert.ok(revived && revived.note.includes('商业上合理的努力'), '重载后 note 仍在: ' + JSON.stringify(revived));
+
+// 14) 相同 w:id 的 delete 与 insert 列表编号不撞车，accept 只处理一条
+const clash = await (async () => {
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', CT + `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`);
+  zip.file('_rels/.rels', CT + `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
+  zip.file('word/_rels/document.xml.rels', CT + `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`);
+  zip.file('word/document.xml', CT + `<w:document xmlns:w="${W}"><w:body>`
+    + `<w:p><w:del w:id="4" w:author="Citecat"><w:r><w:delText>买方条件</w:delText></w:r></w:del></w:p>`
+    + `<w:p><w:ins w:id="4" w:author="Citecat"><w:r><w:t>usine</w:t></w:r></w:ins></w:p>`
+    + `</w:body></w:document>`);
+  return zip.generateAsync({ type: 'arraybuffer' });
+})();
+await word.initWordEditor(null, clash);
+const clashList = word.listReviewItems();
+assert.equal(clashList.length, 2, '未相邻的 del/ins 仍是两条: ' + JSON.stringify(clashList));
+const clashIds = clashList.map((r) => r.id);
+assert.equal(new Set(clashIds).size, 2, '列表 id 必须唯一: ' + JSON.stringify(clashIds));
+const dropIns = clashList.find((r) => r.type === 'insert');
+const acc = await word.execReviewTool('accept', { id: dropIns.id });
+assert.ok(acc.ok && acc.processed.length === 1 && acc.processed[0].type === 'insert', 'accept 只处理被点名的那条: ' + JSON.stringify(acc));
+const left = word.listReviewItems();
+assert.equal(left.length, 1, '另一条还在');
+assert.equal(left[0].type, 'delete', '留下的是删除修订');
+assert.ok(left[0].find.includes('买方条件'), '买方条件那条未被连坐接受');
+
+console.log('docx 无头引擎链路（修订/直接改/undo/accept/设置注入/稳定 id/reject 回显/待审守卫/嵌套修复/修改痕迹/set_format/noop/note/唯一 id）: ALL PASS');

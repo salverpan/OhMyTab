@@ -25,6 +25,8 @@ import { processRoundToolCalls, buildEntriesDigest, retrieveMemories, HISTORY_KE
 import { compactHistory, estimateMessagesTokens, estimateTokens } from '../sidepanel/history-compact.js';
 import { getStaticSystemPrompt, buildDynamicPreamble } from '../sidepanel/chat-prompt.js';
 import { getPlan } from '../lib/plan.js';
+import { listNotes } from '../lib/notebook.js';
+import { listInsights } from '../lib/insight.js';
 import { buildChatTools } from '../lib/tools.js';
 import { listAgents, formatAgentCatalog, parseAgentMentions } from '../lib/subagent.js';
 import { loadConnectors, formatApiCatalog } from '../lib/api-call.js';
@@ -716,6 +718,7 @@ async function dispatchDocReview(d) {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'ann-chat') return;
   let abortCtrl = null;
+  let chatGen = 0;
   const portState = {
     pid: null,
     entries: [],
@@ -809,17 +812,30 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
     if (msg.type !== 'CHAT') return;
-    if (!(await isRuntimeLicensed())) {
-      try { port.postMessage({ type: 'error', error: LICENSE_DENIED.error }); } catch (_) {}
-      return;
-    }
+    const myGen = ++chatGen;
+    const live = () => myGen === chatGen;
+    const emit = (payload) => {
+      if (!live()) return;
+      try { port.postMessage(payload); } catch (_) {}
+    };
     if (abortCtrl) abortCtrl.abort();
     abortCtrl = new AbortController();
     const { signal } = abortCtrl;
+    if (!(await isRuntimeLicensed())) {
+      emit({ type: 'error', error: LICENSE_DENIED.error });
+      return;
+    }
+    if (!live()) return;
     const pid = await getCurrentProject();
+    if (!live()) return;
     const apiConfig = await getProjectConfig(pid);
+    if (!live()) return;
     if (!apiConfig.apiKey) {
-      try { port.postMessage({ type: 'error', error: '未配置 API Key，请先在设置中填写' }); } catch (_) {}
+      emit({ type: 'error', error: '未配置 API Key，请先在设置中填写' });
+      return;
+    }
+    if (signal.aborted) {
+      emit({ type: 'done', messages: portState.messages, aborted: true });
       return;
     }
     const projectSwitched = portState.pid !== pid;
@@ -830,31 +846,22 @@ chrome.runtime.onConnect.addListener((port) => {
       portState.entries = await getEntries(pid);
       portState.entriesDirty = false;
     }
+    if (!live()) return;
     portState.pendingSuggestions = null;
     portState.pendingScopeQuiz = null;
     portState.pendingCharts = [];
+    let roundText = '';
+    let savedFinal = false;
+    let showedQuiz = false;
+    let turnDone = false;
     try {
       // ---- 消息组装（与侧栏 buildMessagesForApi 同构）----
       // system（静态前缀）→ 压缩摘要 → 历史 → 动态前言 → 本条用户消息
       const userMessages = Array.isArray(msg.messages) ? msg.messages.filter((m) => m && m.role === 'user') : [];
       const lastUser = userMessages[userMessages.length - 1] || { role: 'user', content: '' };
       const userText = (lastUser.content || '').toString();
-      // 权威历史维护：用户消息入史（done 回传 content 覆盖本地历史，保证跨轮一致）。
-      // 之前只 push assistant/tool、调 API 时又只带 user 消息 —— 模型看不到自己
-      // 上轮的回答与工具结果，多轮对话失忆（"第二点呢"答不上来）。
-      portState.messages.push(lastUser);
       const { maxParallel } = await getSubagentLimits().catch(() => ({ maxParallel: undefined }));
-      const callMessages = [
-        { role: 'system', content: getStaticSystemPrompt({ maxParallel }) },
-      ];
-      if (portState.summary) {
-        callMessages.push({
-          role: 'system',
-          content: `## 前情摘要（早期对话已压缩，仅供参考，如有冲突以最新上下文为准）\n${portState.summary}`,
-        });
-      }
-      // 历史：除当前这条用户消息外全部带上（含上轮 assistant/tool 消息，与侧栏 buildMessagesForApi 同构）
-      callMessages.push(...portState.messages.slice(0, -1));
+      if (!live()) return;
 
       // 动态前言（与侧栏 buildDynamicContext 同源；tab 信息用发起聊天的页面）
       const now = new Date();
@@ -868,6 +875,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const memories = await retrieveMemories(userText, {
         currentUrl: (senderTab && senderTab.url) || '',
       });
+      if (!live()) return;
       const agents = await listAgents().catch(() => []);
       const mentionedAgents = parseAgentMentions(userText, agents.map((a) => a.name));
       const selCtx = msg.context || {};
@@ -887,9 +895,30 @@ chrome.runtime.onConnect.addListener((port) => {
         memories,
         agentCatalog: formatAgentCatalog(agents),
         mentionedAgents,
+        notebookNotes: await listNotes(pid),
+        insights: await listInsights(pid),
         plan: await getPlan(pid),
         apiCatalog: formatApiCatalog(await loadConnectors()),
       });
+      if (!live()) return;
+      if (signal.aborted) {
+        emit({ type: 'done', messages: portState.messages, aborted: true });
+        return;
+      }
+      // 用户消息在开问之前入史。最终回答（无 tool_calls 的那一轮）也必须入史，
+      // 否则下一轮模型看不到自己刚说的话，追问「第二点呢」会失忆。
+      // 被更新的一轮顶掉时不要再写，避免旧回答插到新问题后面。
+      portState.messages.push(lastUser);
+      const callMessages = [
+        { role: 'system', content: getStaticSystemPrompt({ maxParallel }) },
+      ];
+      if (portState.summary) {
+        callMessages.push({
+          role: 'system',
+          content: `## 前情摘要（早期对话已压缩，仅供参考，如有冲突以最新上下文为准）\n${portState.summary}`,
+        });
+      }
+      callMessages.push(...portState.messages.slice(0, -1));
       callMessages.push({ role: 'user', content: preamble + selectionBlock });
       callMessages.push(lastUser);
 
@@ -899,18 +928,30 @@ chrome.runtime.onConnect.addListener((port) => {
       const chatTools = buildChatTools(agents, { maxParallel });
 
       // ---- 工具循环（与侧栏 sendMessage 同构）----
-      let turnDone = false;
       for (let round = 0; round < AGENT_MAX_ROUNDS; round++) {
-        if (signal.aborted) break;
+        if (!live() || signal.aborted) break;
+        roundText = '';
         // 接近工具调用上限：注入收尾提示（与侧栏一致；只进 callMessages 不进 portState 持久历史）
         if (round === AGENT_WRAP_HINT_ROUND) {
           callMessages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
         }
         const result = await streamChatWithTools(callMessages, chatTools, apiConfig,
-          (chunk) => { try { port.postMessage({ type: 'chunk', text: chunk }); } catch (_) {} },
+          (chunk) => {
+            roundText += chunk;
+            emit({ type: 'chunk', text: chunk });
+          },
           signal);
-        if (result.toolCalls.length === 0) break;
+        if (!live()) return;
         if (signal.aborted) break;
+        if (result.toolCalls.length === 0) {
+          const finalText = String(result.content || roundText || '').trim();
+          roundText = '';
+          if (finalText) {
+            portState.messages.push({ role: 'assistant', content: finalText });
+            savedFinal = true;
+          }
+          break;
+        }
 
         // 一轮工具调用：骨架在 chat-executor.processRoundToolCalls（与侧栏共用一份实现），
         // 这里只注入浮动窗的端口上报与写库后的缓存重读
@@ -922,43 +963,62 @@ chrome.runtime.onConnect.addListener((port) => {
           signal,
           minAcceptDelayMs: 600, // 与侧栏同节奏：状态行 520ms 内完成淡出，防快速切换残留
           hooks: {
-            start: (label, name) => { try { port.postMessage({ type: 'tool', status: 'start', label, tool: name }); } catch (_) {} },
-            argError: (label) => { try { port.postMessage({ type: 'tool', status: 'error', label }); } catch (_) {} },
-            done: (label) => { try { port.postMessage({ type: 'tool', status: 'done', label }); } catch (_) {} },
-            fail: (label) => { try { port.postMessage({ type: 'tool', status: 'error', label }); } catch (_) {} },
+            start: (label, name) => emit({ type: 'tool', status: 'start', label, tool: name }),
+            argError: (label) => emit({ type: 'tool', status: 'error', label }),
+            done: (label) => emit({ type: 'tool', status: 'done', label }),
+            fail: (label) => emit({ type: 'tool', status: 'error', label }),
             // 写库工具：统一兜底重读；重读后缓存已是最新，清脏位避免下轮重复读
             writeRefresh: async () => {
+              if (!live()) return;
               portState.entries = await getEntries(pid);
               portState.entriesDirty = false;
             },
           },
         });
+        // 工具轮的正文已经记在 assistant.tool_calls 上，不要再当成最终回答存一次
+        roundText = '';
+        if (!live()) return;
+        if (signal.aborted) break;
 
         // suggest_actions / ask_research_scope：把确认 UI 推给 content 侧渲染
         if (portState.pendingSuggestions) {
-          try { port.postMessage({ type: 'ui', suggestions: portState.pendingSuggestions }); } catch (_) {}
+          emit({ type: 'ui', suggestions: portState.pendingSuggestions });
           portState.pendingSuggestions = null;
         }
         if (portState.pendingScopeQuiz) {
-          try { port.postMessage({ type: 'ui', scopeQuiz: portState.pendingScopeQuiz }); } catch (_) {}
+          emit({ type: 'ui', scopeQuiz: portState.pendingScopeQuiz });
           portState.pendingScopeQuiz = null;
+          showedQuiz = true;
           turnDone = true;
           break;
         }
         if (portState.toolUndos.length > 0) {
-          try { port.postMessage({ type: 'ui', undo: portState.toolUndos.length }); } catch (_) {}
+          emit({ type: 'ui', undo: portState.toolUndos.length });
           portState.toolUndos = [];
         }
         turnDone = true;
       }
+      if (!live()) return;
       if (signal.aborted) {
-        try { port.postMessage({ type: 'done', messages: portState.messages, aborted: true }); } catch (_) {}
+        const partial = roundText.trim();
+        if (partial) portState.messages.push({ role: 'assistant', content: partial + '\n\n(已中断)' });
+        emit({ type: 'done', messages: portState.messages, aborted: true });
         closeAiTabs('chat').catch(() => {});
         return;
       }
+      if (!savedFinal && !showedQuiz) {
+        if (turnDone) {
+          portState.messages.push({ role: 'assistant', content: '已执行操作。' });
+        } else {
+          const reason = 'AI 未返回内容，请检查模型配置或稍后重试。';
+          portState.messages.push({ role: 'assistant', content: reason });
+          emit({ type: 'chunk', text: reason });
+        }
+      }
       // 让 tool 状态行停留一下再进入回复（与侧栏 600ms 最小停留同感）
       await new Promise((r) => setTimeout(r, 300));
-      try { port.postMessage({ type: 'done', messages: portState.messages }); } catch (_) {}
+      if (!live()) return;
+      emit({ type: 'done', messages: portState.messages });
       closeAiTabs('chat').catch(() => {});
 
       // 非阻塞后台压缩（与侧栏 scheduleBackgroundCompaction 同策略；阈值按模型窗口推导）
@@ -966,11 +1026,17 @@ chrome.runtime.onConnect.addListener((port) => {
         compactSwHistory(portState, apiConfig).catch(() => {});
       }
     } catch (err) {
-      if (err.name === 'AbortError') {
+      if (!live()) return;
+      if (err.name === 'AbortError' || signal.aborted) {
+        const partial = roundText.trim();
+        if (partial) portState.messages.push({ role: 'assistant', content: partial + '\n\n(已中断)' });
+        emit({ type: 'done', messages: portState.messages, aborted: true });
         closeAiTabs('chat').catch(() => {});
         return;
       }
-      try { port.postMessage({ type: 'error', error: err.message }); } catch (_) {}
+      const partial = roundText.trim();
+      if (partial) portState.messages.push({ role: 'assistant', content: partial });
+      emit({ type: 'error', error: err.message, messages: portState.messages });
       closeAiTabs('chat').catch(() => {});
     }
   });
@@ -2184,7 +2250,8 @@ async function handleFeedItemsCollect({ itemIds, projectId, concurrency }) {
       }
 
       const bodyFromHtml = item.contentHtml ? htmlToText(item.contentHtml, { preserveNewlines: false }) : '';
-      const bodyFromSummary = item.summary || '';
+      // 证据要锚在原文上：翻译回填会就地改写 summary，原文在 originalSummary。
+      const bodyFromSummary = item.originalSummary || item.summary || '';
       let fullText = item.fullText || bodyFromHtml || bodyFromSummary || '';
       let title = item.title || '';
       let publishedAt = item.publishedAt

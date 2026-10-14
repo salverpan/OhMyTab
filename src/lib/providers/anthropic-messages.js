@@ -7,12 +7,14 @@
  *  - 工具调用是 content blocks（assistant 的 tool_use / user 消息里的 tool_result）
  *  - SSE 是 message_start/content_block_delta/message_delta 事件流 */
 
-import { ApiError, readSseLines, parseSseData, contentToText, parseDataImageUrl, safeJsonParse } from './util.js';
+import { ApiError, readSseLines, parseSseData, contentToText, parseDataImageUrl, safeJsonParse, normalizeFinishReason } from './util.js';
+import { isViewportShotMessage } from '../tool-round-messages.js';
 import { finalizeToolCalls } from './openai-chat.js';
 import { applyAnthropicThinking } from './reasoning.js';
+import { resolveChatMaxTokens } from '../model-limits.js';
+import { estimateRequestTokens } from '../token-estimate.js';
 
 const ANTHROPIC_VERSION = '2023-06-01';
-const DEFAULT_MAX_TOKENS = 8192;
 
 /** 由 Base URL 推导 /v1/messages 端点。兼容填法：
  *  - 完整端点 .../v1/messages → 原样使用
@@ -97,7 +99,14 @@ export function convertMessages(messages) {
     }
     flushResults();
     if (m.role === 'user') {
-      out.push({ role: 'user', content: toAnthropicContent(m.content) });
+      const blocks = toAnthropicContent(m.content);
+      const prev = out[out.length - 1];
+      const list = Array.isArray(blocks) ? blocks : [{ type: 'text', text: String(blocks || '') }];
+      if (isViewportShotMessage(m) && prev?.role === 'user' && Array.isArray(prev.content)) {
+        prev.content.push(...list);
+      } else {
+        out.push({ role: 'user', content: blocks });
+      }
     } else if (m.role === 'assistant') {
       const blocks = [];
       const text = contentToText(m.content);
@@ -134,7 +143,9 @@ function buildBody(cfg, messages, tools, opts) {
   const { system, messages: converted } = convertMessages(messages);
   const body = {
     model: cfg.model,
-    max_tokens: cfg.maxTokens || DEFAULT_MAX_TOKENS,
+    max_tokens: resolveChatMaxTokens(cfg, opts?.maxTokens, {
+      usedTokens: estimateRequestTokens(messages, tools),
+    }),
     messages: converted,
   };
   if (system) body.system = system;
@@ -185,6 +196,7 @@ export async function chatComplete(cfg, messages, opts = {}) {
     content: text.trim(),
     toolCalls,
     usage: normalizeUsage(data.usage?.input_tokens, data.usage?.output_tokens),
+    finishReason: normalizeFinishReason(data.stop_reason),
   };
 }
 
