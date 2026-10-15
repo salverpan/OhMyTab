@@ -389,7 +389,7 @@ export function subagentReportNodes({ projectId, parentId, threadId, report, ver
  * evidence 是判断所引证据的快照（不指回子代理的 claim 节点：同一主张可能来自多个子任务，已在证据池里合并）。
  * @param {object} input
  * @param {object} input.outline  validateOutline 之后的骨架
- * @param {Array}  input.evidence 证据池条目（report-writer buildEvidencePool().items）
+ * @param {Array}  input.evidence 判断所引证据快照（id 与 outline.basis / counter 对齐）
  */
 export function reportTraceNodes({
   projectId, parentId = '', threadId, ts, reportId, title, question, entryId = '', outline, evidence = [],

@@ -26,10 +26,3 @@ export async function pickLocalFiles({ multiple = true, types } = {}) {
 export const OPML_PICK_TYPES = [
   { description: 'OPML', accept: { 'text/xml': ['.opml', '.xml'], 'application/xml': ['.opml', '.xml'] } },
 ];
-
-export const DOCX_PICK_TYPES = [
-  {
-    description: 'Word 文档',
-    accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] },
-  },
-];

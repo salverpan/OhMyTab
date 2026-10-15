@@ -5,12 +5,11 @@
   "type": "module",
   "scripts": {
     "test": "npm run test:smoke",
-    "test:smoke": "node test/workspace-smoke.mjs && node test/plan-smoke.mjs && node test/project-concurrency-smoke.mjs && node test/subagent-smoke.mjs && node test/agent-pipeline-smoke.mjs && node test/report-smoke.mjs && node test/providers-smoke.mjs && node test/memory-retrieve-smoke.mjs && node test/search-smoke.mjs && node test/heartbeat-smoke.mjs && node test/scope-quiz-smoke.mjs && node test/plot-spec-smoke.mjs && node test/api-call-smoke.mjs && node test/vision-probe-smoke.mjs && node test/viewport-shot-smoke.mjs && node test/rss-tools-smoke.mjs && node test/license-smoke.mjs && node test/doc-text-smoke.mjs && node test/timeline-smoke.mjs && node test/activity-smoke.mjs && node test/trace-smoke.mjs && node test/decision-smoke.mjs && node test/docx-headless-smoke.mjs && node test/xlsx-headless-smoke.mjs && node test/pdf-repair-smoke.mjs && node test/docx-chart-smoke.mjs && node test/place-images-smoke.mjs && node test/inline-media-smoke.mjs",
+    "test:smoke": "node test/workspace-smoke.mjs && node test/plan-smoke.mjs && node test/project-concurrency-smoke.mjs && node test/subagent-smoke.mjs && node test/agent-pipeline-smoke.mjs && node test/report-smoke.mjs && node test/providers-smoke.mjs && node test/memory-retrieve-smoke.mjs && node test/search-smoke.mjs && node test/heartbeat-smoke.mjs && node test/scope-quiz-smoke.mjs && node test/plot-spec-smoke.mjs && node test/api-call-smoke.mjs && node test/vision-probe-smoke.mjs && node test/viewport-shot-smoke.mjs && node test/rss-tools-smoke.mjs && node test/license-smoke.mjs && node test/doc-text-smoke.mjs && node test/timeline-smoke.mjs && node test/activity-smoke.mjs && node test/trace-smoke.mjs && node test/decision-smoke.mjs && node test/docx-headless-smoke.mjs && node test/xlsx-headless-smoke.mjs && node test/pdf-repair-smoke.mjs && node test/docx-chart-smoke.mjs && node test/place-images-smoke.mjs && node test/inline-media-smoke.mjs && node test/figure-catalog-smoke.mjs",
     "build": "node build.js",
     "dev": "node build.js && echo 'Load dist/ folder in chrome://extensions'"
   },
   "dependencies": {
-    "@dagrejs/dagre": "^3.1.1",
     "@mozilla/readability": "^0.6.0",
     "@tiptap/core": "^2.27.2",
     "@tiptap/extension-table": "^2.27.2",
@@ -21,7 +20,6 @@
     "@tiptap/starter-kit": "^2.27.2",
     "@univerjs/presets": "^0.25.1",
     "@xmldom/xmldom": "^0.9.11",
-    "@xyflow/react": "^12.12.0",
     "defuddle": "^0.19.1",
     "docx": "^9.1.0",
     "docx-preview": "^0.4.0",

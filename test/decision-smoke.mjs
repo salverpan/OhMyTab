@@ -1,5 +1,5 @@
-/* 决策板与 P0 核验冒烟（node test/decision-smoke.mjs）：
- * 独立信源计数、claim 归因/模态、子代理预算、限额归一化、决策板模型与渲染。 */
+/* 决策模型与 P0 核验冒烟（node test/decision-smoke.mjs）：
+ * 独立信源计数、claim 归因/模态、子代理预算、限额归一化、决策板模型。 */
 
 import assert from 'node:assert';
 
@@ -22,7 +22,6 @@ const { validateTaskReport, reportForMain, normalizeModality } = await import('.
 const { budgetState } = await import('../src/lib/subagent.js');
 const { normalizeSubagentLimits } = await import('../src/lib/storage.js');
 const D = await import('../src/lib/decision-model.js');
-const { decisionBoardHtml } = await import('../src/sidepanel/decision-board.js');
 
 let passed = 0;
 function ok(cond, label) {
@@ -143,18 +142,5 @@ ok(D.buildDecisionBoard({ now }).empty, '空输入为空');
 
 ok(D.researchPrompt('黑海', { type: 'single-source', title: 'X' }).includes('第二来源'), '单源调研指令');
 ok(D.decisionPrompt({ title: 'A', options: ['1', '2'] }).includes('1 / 2'), '决策指令带备选');
-
-// ---------- 渲染 ----------
-const html = decisionBoardHtml(board);
-ok(html.includes('需要你关注') && html.includes('待你拍板'), '关注区');
-ok(html.includes('当前结论') && html.includes('置信中') && html.includes('↑'), '结论与趋势');
-ok(html.includes('db-seg is-strong') && html.includes('db-seg is-contested'), '强度条');
-ok(html.includes('data-db-draft=') && html.includes('派去调研'), '调研按钮');
-ok(html.includes('data-db-note="note1"'), '笔记可点开');
-ok(html.includes('只证明了“某方这么说”'), '弱模态提示');
-ok(!/<script/i.test(decisionBoardHtml(D.buildDecisionBoard({
-  nodes: [{ id: 'q', kind: 'insight', subtype: 'goal', title: '<script>alert(1)</script>', status: 'active', threadId: 'chat', ts: now }], now,
-}))), '转义');
-ok(decisionBoardHtml({ empty: true }).includes('db-empty'), '空态');
 
 console.log(`decision-smoke: ${passed} assertions passed`);

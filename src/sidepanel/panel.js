@@ -1,11 +1,11 @@
-import { getEntries, updateEntry, reorderEntries, saveEntry, saveEntries, saveEntryList, getBlacklist, setBlacklist, getProjectConfig, setProjectConfig, getExportTemplate, setExportTemplate, clearExportTemplate, getAiChannels, saveAiChannels, getActiveChannelId, setActiveChannelId, ensureDefaultChannel, normalizeChannelModels, resolveChannelModel, setActiveChannelModel, setActiveModelTuning, getCustomSubagents, saveCustomSubagents, getSubagentLimits, setSubagentLimits } from '../lib/storage.js';
+import { getEntries, updateEntry, reorderEntries, saveEntry, saveEntries, saveEntryList, getBlacklist, setBlacklist, getProjectConfig, setProjectConfig, getAiChannels, saveAiChannels, getActiveChannelId, setActiveChannelId, ensureDefaultChannel, normalizeChannelModels, resolveChannelModel, setActiveChannelModel, setActiveModelTuning, getCustomSubagents, saveCustomSubagents, getSubagentLimits, setSubagentLimits } from '../lib/storage.js';
 import {
   ensureDefaultSearchChannels, getSearchChannels, saveSearchChannels,
   getActiveSearchChannelId, setActiveSearchChannelId, executeSearchChannel,
 } from '../lib/search-channels.js';
 import { SEARCH_PRESETS, searchPreset, normalizeSearchChannel } from '../lib/search-providers.js';
 import { entriesToMarkdownDocxBlob, markdownToDocxBlob } from '../lib/md-to-docx.js';
-import { testApiConnection, PROMPT_TEMPLATE, streamChatWithTools } from '../lib/ai-client.js';
+import { testApiConnection, streamChatWithTools } from '../lib/ai-client.js';
 import { createExportApi } from './panel-export.js';
 import { PROVIDER_PRESETS } from '../lib/providers/presets.js';
 import { inferModelCaps, formatContextLabel, contextPresets, EFFORT_LEVELS, probeModelMeta, refreshModelCatalog, catalogSourceLabel, defaultWorkingContext, resolveEffortId } from '../lib/model-limits.js';
@@ -19,7 +19,6 @@ import {
   parseEvery, normalizeSchedule, WEEKDAY_LABEL, taskBelongsToProject,
 } from '../lib/heartbeat.js';
 import { buildChatTools } from '../lib/tools.js';
-import { parseDocxSample, detectStructure, buildTemplate, ROLE_LABELS, aiDetectStructure } from '../lib/template-parser.js';
 import { initFeedView, startManualIndexRebuild } from './feed-view.js';
 import { mountPeekCat, setPeekCatThinking, peekCatEnter } from './pixel-cat.js';
 import { getStaticSystemPrompt, buildDynamicPreamble } from './chat-prompt.js';
@@ -31,7 +30,7 @@ import { saveDocFile, getDocFile, deleteDocFile } from '../lib/doc-store.js';
 import { purgeProject, restoreProject, purgeProjects, restoreProjects } from '../lib/project-purge.js';
 import { extractDocTextFromBuffer, normalizeSpreadsheetUpload } from '../lib/doc-import.js';
 import { isUploadDocName } from '../lib/doc-kind.js';
-import { pickLocalFiles, DOCX_PICK_TYPES } from '../lib/pick-files.js';
+import { pickLocalFiles } from '../lib/pick-files.js';
 import { listNotes, clearNotes, revalidateNotes } from '../lib/notebook.js';
 import { logActivity } from '../lib/activity-log.js';
 import { putTrace, newTraceId, CHAT_THREAD } from '../lib/trace-log.js';
@@ -3643,19 +3642,11 @@ async function init() {
   entries = await getEntries(currentProject);
   await loadChatSession(); // 恢复当前项目的对话（关面板/SW 重启不丢）
   adoptVisible(ensureRun(currentProject));
-  updateTemplateBadge();
   render();
   updateTokenMeter();
   await ensureHeartbeatAlarm();
   refreshHeartbeatBadge();
   drainIdleWork();
-}
-
-async function updateTemplateBadge() {
-  const badge = document.getElementById('templateStatusBadge');
-  if (!badge) return;
-  const tmpl = await getExportTemplate();
-  badge.hidden = !(tmpl && tmpl.docxBase64);
 }
 
 function render() {
@@ -4647,15 +4638,12 @@ async function initSettings() {
     getBlacklist(),
     chrome.runtime.sendMessage({ type: 'FEED_GET_PREFS' }).catch(() => null),
   ]);
-  const tmpl = await getExportTemplate();
 
   document.getElementById('blacklistTextarea').value = blacklist.join('\n');
   await ensureDefaultChannel(); // 首次进设置页：把旧配置合成「默认」渠道（幂等）
   renderChannelManager();
   await ensureDefaultSearchChannels();
   await renderSearchChannels();
-  document.getElementById('promptTemplate').value = PROMPT_TEMPLATE;
-
   const prefs = (feedPrefsResp && feedPrefsResp.prefs) || {};
   const autoEl = document.getElementById('feedAutoTranslate');
   const langEl = document.getElementById('feedTargetLang');
@@ -4709,22 +4697,6 @@ async function initSettings() {
         showSettingsStatus('uiScaleStatus', '已应用', 'success');
       });
     }
-  }
-
-  // Preserve pending sample state across panel switches
-  if (pendingSample) {
-    showStructureConfirmation(pendingSample.detected);
-    document.getElementById('templateDrop').hidden = true;
-    document.getElementById('templateInfo').hidden = true;
-    document.getElementById('templateStructArea').hidden = false;
-  } else if (tmpl) {
-    document.getElementById('templateDrop').hidden = true;
-    document.getElementById('templateInfo').hidden = false;
-    document.getElementById('templateStructArea').hidden = true;
-  } else {
-    document.getElementById('templateDrop').hidden = false;
-    document.getElementById('templateInfo').hidden = true;
-    document.getElementById('templateStructArea').hidden = true;
   }
 
   bindSettingsEvents();
@@ -6453,10 +6425,6 @@ function bindSettingsEvents() {
     }
   });
 
-  document.getElementById('resetPromptBtn').addEventListener('click', () => {
-    document.getElementById('promptTemplate').value = PROMPT_TEMPLATE;
-  });
-
   // Feed translation prefs
   const savePrefsBtn = document.getElementById('saveFeedPrefsBtn');
   if (savePrefsBtn) {
@@ -6608,46 +6576,7 @@ function bindSettingsEvents() {
       renderTranslateProgress(message.data);
     }
   });
-  refreshTranslateProgress();  // Template
-  const templateDrop = document.getElementById('templateDrop');
-  templateDrop.addEventListener('dragover', (e) => { e.preventDefault(); templateDrop.classList.add('drag-over'); });
-  templateDrop.addEventListener('dragleave', () => templateDrop.classList.remove('drag-over'));
-  templateDrop.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    templateDrop.classList.remove('drag-over');
-    const file = e.dataTransfer?.files?.[0];
-    if (file) await handleTemplateFile(file);
-  });
-  templateDrop.addEventListener('click', async () => {
-    try {
-      const files = await pickLocalFiles({ multiple: false, types: DOCX_PICK_TYPES });
-      if (files[0]) await handleTemplateFile(files[0]);
-    } catch (err) {
-      showToast('无法打开文件选择: ' + (err.message || err), true);
-    }
-  });
-  document.getElementById('buildTemplateBtn').addEventListener('click', () => handleBuildTemplate());
-  document.getElementById('cancelStructBtn').addEventListener('click', () => {
-    pendingSample = null;
-    document.getElementById('templateStructArea').hidden = true;
-    document.getElementById('templateDrop').hidden = false;
-    document.getElementById('templateStatus').textContent = '';
-  });
-  document.getElementById('clearTemplateBtn').addEventListener('click', async () => {
-    await clearExportTemplate();
-    document.getElementById('templateInfo').hidden = true;
-    document.getElementById('templateDrop').hidden = false;
-    updateTemplateBadge();
-    showSettingsStatus('templateStatus', '已清除', 'success');
-  });
-  document.getElementById('resetToDefaultBtn').addEventListener('click', async () => {
-    await clearExportTemplate();
-    document.getElementById('templateInfo').hidden = true;
-    document.getElementById('templateDrop').hidden = false;
-    updateTemplateBadge();
-    showSettingsStatus('templateStatus', '已恢复默认格式', 'success');
-  });
-
+  refreshTranslateProgress();
   // Check for extension updates
   const versionEl = document.getElementById('extVersion');
   if (versionEl) versionEl.textContent = chrome.runtime.getManifest().version;
@@ -6703,195 +6632,6 @@ function bindSettingsEvents() {
       }
       checkUpdateBtn.disabled = false;
     });
-  }
-}
-
-let pendingSample = null; // { file, paragraphs, docxBase64, detected }
-
-async function handleTemplateFile(file) {
-  if (!file.name.endsWith('.docx')) {
-    showSettingsStatus('templateStatus', '请选择 .docx 文件', 'error');
-    return;
-  }
-  try {
-    showSettingsStatus('templateStatus', '正在解析文档...', '');
-    const result = await parseDocxSample(file);
-
-    // Try AI-assisted detection first, fallback to heuristic
-    let detected;
-    const config = await getProjectConfig(currentProject);
-    if (config.apiKey) {
-      showSettingsStatus('templateStatus', 'AI 正在分析文档结构...', '');
-      try {
-        detected = await aiDetectStructure(result.paragraphs, {
-          apiKey: config.apiKey,
-          baseUrl: config.baseUrl,
-          model: config.model,
-          protocol: config.protocol || 'openai',
-        });
-        console.log('[模板] AI 结构分析结果:', detected.aiRaw);
-      } catch (aiErr) {
-        console.warn('[模板] AI 分析失败，使用规则引擎:', aiErr.message);
-        detected = detectStructure(result.paragraphs);
-      }
-    } else {
-      detected = detectStructure(result.paragraphs);
-    }
-
-    pendingSample = { file, paragraphs: result.paragraphs, docxBase64: result.docxBase64, detected };
-
-    showStructureConfirmation(detected);
-    document.getElementById('templateDrop').hidden = true;
-    document.getElementById('templateInfo').hidden = true;
-    document.getElementById('templateStatus').textContent = '';
-  } catch (err) {
-    showSettingsStatus('templateStatus', `解析失败: ${err.message}`, 'error');
-  }
-}
-
-function showStructureConfirmation(detected) {
-  const area = document.getElementById('templateStructArea');
-  const list = document.getElementById('templateStructList');
-  if (!area || !list) return;
-
-  area.hidden = false;
-  list.innerHTML = '';
-
-  const isPattern = !!detected.entryPattern;
-  const entryIndices = new Set(detected.entryPattern || detected.entryBlock || []);
-  const docIdxSet = new Set(detected.docLevel || []);
-  const sepIdx = detected.separator;
-  const ignoreSet = new Set();
-
-  // In pattern mode, everything not in docLevel/entryPattern/separator is ignored
-  if (isPattern) {
-    detected.classified.forEach((item) => {
-      if (!docIdxSet.has(item.index) && !entryIndices.has(item.index) && item.index !== sepIdx) {
-        ignoreSet.add(item.index);
-      }
-    });
-  }
-
-  // Show section heads
-  if (isPattern) {
-    list.innerHTML += `<div style="font-size:11px;color:var(--muted);padding:4px 0">文档级 (出现一次)</div>`;
-  }
-
-  detected.classified.forEach((item) => {
-    if (ignoreSet.has(item.index)) return; // will be shown in ignored section
-
-    let levelClass = 'entry-level';
-    let labelType = 'entry';
-    let labelText = '条目';
-    if (docIdxSet.has(item.index)) {
-      levelClass = 'doc-level';
-      labelType = 'doc';
-      labelText = '文档';
-    }
-    if (item.index === sepIdx) {
-      levelClass = 'separator';
-      labelType = 'sep';
-      labelText = '分隔';
-    }
-    if (isPattern && entryIndices.has(item.index)) {
-      labelText = '条目模板'; // mark as part of the repeatable pattern
-    }
-
-    const roles = ['doc-title', 'doc-subtitle', 'doc-date', 'entry-body', 'entry-source', 'entry-link', 'separator', 'ignore'];
-    const options = roles.map((r) =>
-      `<option value="${r}"${item.role === r ? ' selected' : ''}>${ROLE_LABELS[r]}</option>`
-    ).join('');
-
-    list.innerHTML += `
-      <div class="template-struct-row ${levelClass}" data-idx="${item.index}">
-        <span class="template-struct-label ${labelType}">${labelText}</span>
-        <span class="template-struct-idx">#${item.index}</span>
-        <select class="template-struct-role-select" data-idx="${item.index}">
-          ${options}
-        </select>
-        <span class="template-struct-text" title="${escAttr(item.text)}">${escHtml(item.text)}</span>
-      </div>
-    `;
-  });
-
-  // Show ignored paragraphs section
-  if (ignoreSet.size > 0) {
-    list.innerHTML += `<div style="font-size:11px;color:var(--muted);padding:8px 0 4px">忽略 (不纳入模板)</div>`;
-    detected.classified.forEach((item) => {
-      if (!ignoreSet.has(item.index)) return;
-      list.innerHTML += `
-        <div class="template-struct-row separator" data-idx="${item.index}">
-          <span class="template-struct-label sep">忽略</span>
-          <span class="template-struct-idx">#${item.index}</span>
-          <span class="template-struct-text">${escHtml(item.text || '(空段落)')}</span>
-        </div>
-      `;
-    });
-  }
-}
-
-async function handleBuildTemplate() {
-  if (!pendingSample) return;
-
-  // Read user-adjusted roles from the UI
-  const selects = document.querySelectorAll('.template-struct-role-select');
-  const docLevel = [];
-  const entryBlock = [];
-  const docRoles = {};
-  const entryRoles = {};
-  let separator = -1;
-  let entryRoleIdx = 0;
-
-  selects.forEach((sel) => {
-    const idx = parseInt(sel.dataset.idx);
-    const role = sel.value;
-
-    if (role === 'ignore') return; // skip ignored paragraphs
-
-    if (role === 'doc-title' || role === 'doc-subtitle' || role === 'doc-date') {
-      docLevel.push(idx);
-      docRoles[idx] = role;
-    } else if (role === 'separator') {
-      if (separator === -1) separator = idx;
-    } else if (role === 'entry-body' || role === 'entry-source' || role === 'entry-link') {
-      entryBlock.push(idx);
-      entryRoles[entryRoleIdx++] = role;
-    }
-  });
-
-  const isPattern = !!(pendingSample.detected.entryPattern);
-  const structure = {
-    docLevel: docLevel.sort((a, b) => a - b),
-    entryBlock: entryBlock.sort((a, b) => a - b),
-    entryPattern: isPattern ? entryBlock.sort((a, b) => a - b) : undefined,
-    separator,
-    docRoles,
-    entryRoles,
-    numberRunMap: pendingSample.detected.numberRunMap || {},
-  };
-
-  console.log('[模板] 构建结构:', structure);
-
-  try {
-    showSettingsStatus('templateStatus', '正在构建模板...', '');
-    const result = await buildTemplate(pendingSample.file, structure);
-    const tmpl = {
-      docxBase64: result.docxBase64,
-      structure: result.structure,
-      labeled: pendingSample.detected.classified
-        .filter((p) => !(p.role === 'ignore'))
-        .map((p) => `[${ROLE_LABELS[p.role] || p.role}] ${p.text.slice(0, 60)}`)
-        .join('\n'),
-    };
-    await setExportTemplate(tmpl);
-    document.getElementById('templateStructArea').hidden = true;
-    document.getElementById('templateDrop').hidden = true;
-    document.getElementById('templateInfo').hidden = false;
-    pendingSample = null;
-    updateTemplateBadge();
-    showSettingsStatus('templateStatus', '已激活，导出时将使用此格式', 'success');
-  } catch (err) {
-    showSettingsStatus('templateStatus', `构建失败: ${err.message}`, 'error');
   }
 }
 

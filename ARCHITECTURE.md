@@ -15,7 +15,7 @@
 2. **Service Worker 是消息总线**：`src/background/service-worker.js` 用 `chrome.runtime.onMessage` 的 `switch(message.type)` 路由一切。要加新功能，**先在这里加一个 `case`**，再让 panel/content/reader 发对应消息。
 3. **五套持久化**，分工严格：
    - `chrome.storage.sync`  -- 用户配置（API Key、黑名单、项目级配置、当前项目 id）
-    - `chrome.storage.local` -- 工作区 Entry（`entries_{projectId}`）、笔记（`notebook_{projectId}`）、**任务清单（`plan_{projectId}`）**、schema 版本 `workspaceSchemaVersion=2`、DOCX 模板、RSS 偏好、AI 渠道/记忆/自定义 Sub、标注、聊天会话与心跳任务。清空来源/笔记/产出不会顺带清空聊天。
+    - `chrome.storage.local` -- 工作区 Entry（`entries_{projectId}`）、笔记（`notebook_{projectId}`）、**任务清单（`plan_{projectId}`）**、schema 版本 `workspaceSchemaVersion=2`、RSS 偏好、AI 渠道/记忆/自定义 Sub、标注、聊天会话与心跳任务。清空来源/笔记/产出不会顺带清空聊天。
    - `IndexedDB (citecat-feeds, v3)` -- RSS 订阅源 + items（v2：`publishedAt` 单字段索引；v3：`itemTokens` 2-gram 倒排 + `seqPub`）
    - `IndexedDB (citecat-docs, v1)` -- 上传/生成的文档**原始二进制原件**（PDF/Word/Excel/CSV 的 ArrayBuffer，按 docId 存，供阅读器预览、编辑回写、下载）
    - `IndexedDB (citecat-artifacts, v2)` -- 可按 `doc_id#anchor` 回读的来源快照与 chunks；记录 provenance、信任等级、来源 Entry、SHA-256 与采集时间
@@ -59,8 +59,8 @@
 │                            │ import                                       │
 │                     src/lib/* （领域服务）                                   │
 │  ┌──────────┬──────────┬──────────┬───────────┬───────────┬───────────┐   │
-│  │extractor │ai-client │export-docx│template- │feed-* 系列 │translator │   │
-│  │extract-  │tools(定义)│md-to-docx│parser    │(fetcher/   │(local+    │   │
+│  │extractor │ai-client │md-to-docx │create-docx│feed-* 系列 │translator │   │
+│  │extract-  │tools(定义)│doc-import│video-ext │(fetcher/   │(local+    │   │
 │  │ common   │similarity│doc-import│video-ext │parser/db/  │ cloud)    │   │
 │  │html-utils│tag-library│doc-marks │          │backfill/   │limits     │   │
 │  │page-data │chat-exec │doc-store │          │rsshub-fall │external-  │   │
@@ -70,7 +70,7 @@
 │  └──────────┴──────────┴──────────┴───────────┴───────────┴───────────┘   │
 │                                                                            │
 │  持久化:  chrome.storage.sync   (配置)                                      │
-│           chrome.storage.local  (文库 entries + DOCX 模板 + feedPrefs      │
+│           chrome.storage.local  (文库 entries + feedPrefs)             │
 │                                   + externalBridge + installationId       │
 │                                   + agentMemories + effortProbeCache       │
 │                                   + annotations_<url> + annotations_index)│
@@ -171,7 +171,7 @@ npm run dev       # build + 提示加载 dist/
 
 | 模块 | 存储位置 | 关键导出 |
 |---|---|---|
-| **storage.js** | `chrome.storage.sync` + `chrome.storage.local` | `getEntries / saveEntry / saveEntries / saveEntryList / updateEntry / deleteEntry / clearEntries / reorderEntries / getEntryByUrl`、`getApiConfig / setApiConfig`（旧 searchProvider 只在首次迁移搜索渠道时读取；现行选择在 search-channels.js）、**`getAiChannels / saveAiChannels / getActiveChannelId / setActiveChannelId / ensureDefaultChannel`**（ccswitch 式渠道管理，数据在 local 不入 sync；ensureDefaultChannel 幂等地把旧配置合成首个「默认」渠道）。**`getProjectConfig` 解析顺序：有渠道时以激活渠道为准返回 {model,baseUrl,protocol,apiKey,contextTokens,channelId,channelName}（projConfig 的旧 model/baseUrl 字段不再参与）；无渠道回落旧合成逻辑**、`getBlacklist / setBlacklist`、`getProjectConfig / setProjectConfig`、`getExportTemplate / setExportTemplate / clearExportTemplate`；**`getCustomSubagents / saveCustomSubagents`**（`chrome.storage.local.customSubagents`）；常量 `STORAGE_KEYS / DEFAULT_BLACKLIST / DEFAULT_API_CONFIG / PROMPT_TEMPLATE_VERSION (=4)`（`DEFAULT_API_CONFIG` 含 `contextTokens=1000000` 模型上下文窗口（1M），推导上下文防护阈值用；`getProjectConfig` 带钳制回落，**并透传 `protocol` 字段**（'openai'|'anthropic'|'gemini'，缺省回落 openai）供多协议适配层 providers/ 使用；设置页「接入预设 + 接口协议」下拉写入）。**所有写操作带按 storage key 串行写队列**（`_enqueue`）：读-改-写整体排队，防止批量采集并发（`handleFeedItemsCollect` 并发 3~6）读改写互相覆盖静默丢条目 |
+| **storage.js** | `chrome.storage.sync` + `chrome.storage.local` | `getEntries / saveEntry / saveEntries / saveEntryList / updateEntry / deleteEntry / clearEntries / reorderEntries / getEntryByUrl`、`getApiConfig / setApiConfig`（旧 searchProvider 只在首次迁移搜索渠道时读取；现行选择在 search-channels.js）、**`getAiChannels / saveAiChannels / getActiveChannelId / setActiveChannelId / ensureDefaultChannel`**（ccswitch 式渠道管理，数据在 local 不入 sync；ensureDefaultChannel 幂等地把旧配置合成首个「默认」渠道）。**`getProjectConfig` 解析顺序：有渠道时以激活渠道为准返回 {model,baseUrl,protocol,apiKey,contextTokens,channelId,channelName}（projConfig 的旧 model/baseUrl 字段不再参与）；无渠道回落旧合成逻辑**、`getBlacklist / setBlacklist`、`getProjectConfig / setProjectConfig`；**`getCustomSubagents / saveCustomSubagents`**（`chrome.storage.local.customSubagents`）；常量 `STORAGE_KEYS / DEFAULT_BLACKLIST / DEFAULT_API_CONFIG`（`DEFAULT_API_CONFIG` 含 `contextTokens=1000000` 模型上下文窗口（1M），推导上下文防护阈值用；`getProjectConfig` 带钳制回落，**并透传 `protocol` 字段**（'openai'|'anthropic'|'gemini'，缺省回落 openai）供多协议适配层 providers/ 使用；设置页「接入预设 + 接口协议」下拉写入）。**所有写操作带按 storage key 串行写队列**（`_enqueue`）：读-改-写整体排队，防止批量采集并发（`handleFeedItemsCollect` 并发 3~6）读改写互相覆盖静默丢条目 |
 | **feed-db.js** | IndexedDB `citecat-feeds`（**v3**, stores: `feeds` / `items` / `itemTokens` / `seqPub`；索引：feeds 的 `url`(unique)/`scope`/`sortOrder` 均为 v1；items 的 `feedId`/`feedId_publishedAt`(复合)/`read`(已废弃，字段保留)/`starred` 为 v1，`publishedAt` 单字段为 **v2 新增**；v3 为 2-gram 倒排 `itemTokens` + `seqPub`，升级只建结构，索引由 SW 异步 `buildTokenIndex` 回填）。`listItems({ metaOnly })` 聚合扫描时只回 `{id,feedId,publishedAt,title,starred,collectedEntryId,hasFullText,summary}`，不带 `fullText` | `listFeeds / listFeedsForProject / getFeed / getFeedByUrl / addFeed / updateFeed / deleteFeed`、`deleteAllItemsForFeeds / reorderFeeds`、`upsertItems / listItems / getItem / getItemsByIds`、`makeItemId`、`toggleStar / setCollectedEntryId / updateItemFullText`、`countFeedItems`（走 feedId 索引 `count()`，O(log n)，不再全表扫）、`listItemsNeedingTranslation / countItemsNeedingTranslation / applyItemTranslation / resetTranslateFailures` |
 | **artifact-store.js** | IndexedDB `citecat-artifacts`（**v2**：docs 新增 `sourceEntryId` / `trustClass` 索引，chunks 保持原主键） | 来源证据快照。除既有 `docId/kind/url/fullText/chunks/pageOffsets/projectId` 外，写入 `provenanceType/sourceEntryId/contentHash/capturedAt/trustClass`；`readSection` 返回 provenance 摘要。`kind=text` 旧记录可读但为 `derived`，不能用于 Check。删除支持 docId/URL/sourceEntryId 级联；`migrateArtifactProvenance` 原地补字段，不改变 docId 与锚点 |
 | **notebook.js** | `chrome.storage.local` 的 `notebook_{projectId}`（最多 200 条） | **调研笔记本 / 事实库**：`(claim, confidence, sources[], status)` 跨轮存活，与证据库分离。`addNote`（**sources 必填**，空数组直接回错误——引用强制的落点）、`listNotes`、`updateNote`、`removeNote`、`normalizeSource`（doc_id#锚点 / URL / 描述 都收）、`formatNotebookDigest`（注入主助手动态前言，超长截断并指向 `notebook(list)`）。写操作带本地串行队列 |
@@ -290,8 +290,7 @@ npm run dev       # build + 提示加载 dist/
 | **subagent-policy.js** | 无运行时依赖的白名单：父级专属工具、explore 可调工具、browser 可调工具、explore 允许的 `interact_page` action。chat-executor 与 subagent 都要读，不能互相 import | `PARENT_ONLY_TOOLS`（含 `save_memory`、`notebook`、`plot_chart`、`place_images`、`plan`：子代理只读注入、禁止写入/画图/改清单）、`EXPLORE_TOOLS`（含 `ingest`/`read_section`/`search_workspace`/`refresh_feeds`/`call_api`）, `BROWSER_TOOLS`（含 `browser_act` + `interact_page` 逃生口）, `isExploreInteractAllowed` |
 | **task-report.js / subagent-core.js** | `submit_report` schema、TaskReport 校验、Main 短摘要、Agent 工种/白名单/会话序列化。claim 必填 `attribution`（谁说的）+ `modality`（`CLAIM_MODALITIES`：confirmed/claimed/reported/denied/assessed/speculative，非法值回落 reported），可选 `event_time`；“X 称…”不得写成 confirmed。`formatTaskResult` 输出 JSON envelope，XML 与 Markdown 软协议已删除。主代理摘要（`reportForMain`）：有 findings 时事实挂在判断的 supporting/contradicting 下，不再平铺 claims；未被引用的事实只留条数；claims ≥ 3 且没有 findings 时只留 `claim_count`。`verificationForMain` 只列未通过的 `failures`，通过项不重复交回。完整 claims 与引文留在子会话，供 Check 与 compose_report | `SUBMIT_REPORT_TOOL`, `validateTaskReport`, `reportForMain`, `formatTaskResult`, `revisionRequestFor` |
 | **subagent.js** | Sub 独立有状态消息循环、`task_id` 续传/后台回注。只有成功调用 `submit_report` 才是 completed；否则 incomplete。交回后强制运行 Check；内容错误最多一次 revision，运行时仅注入失败 claim id 与错误类型。仍保留 `Object.defineProperty` 隔离父子历史与 `commitRoundToolTranscript` | `runTaskTool`, `listAgents` |
-| **report-writer.js** | 旧研报写作阶段，测试仍覆盖。运行时成文已改走 `document-writer.js` | `buildEvidencePool`, `validateOutline`, `lintReport`, `renderReport`, `composeReport`, `OUTLINE_TOOL` |
-| **document-writer.js** | 按体裁成文。收集子会话 `passages`，干净上下文写一稿，再对照原文改一稿。`<<<GAPS>>>` 里还有会改变做法的要点时不保存，把 `need_reading` 交回主代理补派 | `collectPassages`, `splitDraft`, `writeDocument`, `genreGuide` |
+| **document-writer.js** | 按体裁成文。收集子会话 `passages`，干净上下文写一稿，再对照原文改一稿。`<<<GAPS>>>` 里还有会改变做法的要点时不保存，把 `need_reading` 交回主代理补派。`compose_report` 与 `write_document` 走同一条路径 | `collectPassages`, `splitDraft`, `writeDocument`, `genreGuide` |
 | **section-worker.js** | Sub 专属无状态章节 Worker。只接受可核验来源，预读指定 chunk/page/offset，模型仅拥有 `submit_report`；不持久化 session，不可浏览、写入或再委派。单次最多 2 万字，结果带 `content_has_more` / `content_next_offset`，Sub 用 `offset` 续拉直到读完。并发/轮数/超时见 limits.js | `SECTION_JOB_TOOL`, `runSectionJob`, `sectionJobCursor` |
 | **decision-model.js** | 决策板数据模型（纯函数，无 DOM/chrome）：按线程聚合 trace + 笔记 + 心跳任务为议题（结论、证据强度、判断、分歧、缺口、7 天变化）与全局关注区（待拍板、告警、到期复核），并生成“派去调研 / 去回答”的预填指令。测试 `test/decision-smoke.mjs` | `buildDecisionBoard`, `claimStrength`, `researchPrompt`, `decisionPrompt` |
 | **check/** | 强制 Check 管线：schema/项目归属、锚点回读、SHA-256、quote match、entailment、跨信源、verdict 与 Main 摘要（只含 failures，不含通过项全文）。核验身份与 usage 全由运行时产生。`CHECKER_VERSION='citecat-check-v2'`：entailment 同时核模态与归因（引文只证明“某方称”却写 confirmed → overclaim）；判定模型取设置里的 `checkChannelId`（独立审查渠道），未配置时回落撰写模型并在结果里标 `sameModelJudge` / Main 摘要带 `judge_note`。`independence.js`：来源身份 = 发布方名（`entry.provenance.publisher`/`entry.source`）> 可注册主域名 > doc，再按引文 3-gram Jaccard≥0.6 / 包含关系做并查集归并通稿转载，`cross-source-pass` 需 ≥2 个**独立**来源 | `runCheckPipeline`, `verificationForMain`, `deriveClaimVerdict` |
@@ -336,9 +335,7 @@ listItems({
 
 | 模块 | 作用 | 关键导出 |
 |---|---|---|
-| **export-docx.js** | 单条/多条导出。**有模板** -> `exportWithTemplate`（占位符替换 + ZIP 重打包）；**无模板** -> 用 `docx` 库直接生成段落版 DOCX | `exportSingleDocx(entry)`, `exportMultipleDocx(entries)` |
 | **md-to-docx.js** | Markdown -> DOCX 转换器，用于侧栏导出 / PDF 转可编辑 / 旧条目懒预览。用 `marked` 解析 markdown AST -> `docx` 库构建 OOXML。`create_document(format=docx)` 在 SW 走 `create-docx.js`（避免把 docx/marked 打进 SW）。**图表插图（与 create-docx 同一份引用写法）**：`markdownToDocxBlob` 顶部一次性解析 `![说明](chart:<id>)` 引用的字节与题注/来源（唯一 await 段），随后把 `currentChartImages` 置好、**同步**建块（同步段不可能被并发导出插进来，模块级变量才安全）——整行引用渲染成居中图片 +「图 N：说明」+ 8pt 灰字来源，行内引用渲染成图片本体，取不到字节留 `[图表缺图：id]` 占位。**`ImageRun` 必须显式传 `type:'png'`**（漏了媒体文件会叫 `media/<sha1>.undefined`，Word 直接坏） | `markdownToDocxBlob(md, options?)`、`entriesToMarkdownDocxBlob(entries)` |
-| **template-parser.js** | DOCX 模板引擎三步走：①`parseDocxSample` 解析样例 DOCX -> ②`detectStructure` / `aiDetectStructure` AI 识别每段角色（`doc-title/doc-subtitle/doc-date/entry-body/entry-source/entry-link/separator/ignore`）-> ③`buildTemplate` 压缩成 base64 存 storage，导出时 1:1 复刻版式。`ROLE_TO_PLACEHOLDER` 是模块内 `const`（不导出） | `parseDocxSample`, `detectStructure`, `aiDetectStructure`, `buildTemplate`, `ROLE_LABELS`, `collectParaElements`, `replaceTextInElement`, `base64ToBuffer`, `bufferToBase64` |
 
 ### 4.6 导出面板子模块
 
@@ -545,14 +542,7 @@ panel.js --{FEED_ITEMS_COLLECT, itemIds[]}--> SW
 ### 6.4 DOCX 导出
 
 ```
-panel.js -- export-docx.exportSingleDocx / exportMultipleDocx
-    |- getExportTemplate() 拿到 base64 模板？
-    |   |- 有 --> exportWithTemplate
-    |   |       |- base64ToBuffer --> JSZip 打开 --> 找 word/document.xml
-    |   |       |- collectParaElements 找占位段
-    |   |       |- replaceTextInElement 把 {{ENTRY_*}} 替换为实际内容
-    |   |       \- JSZip 重打包 --> Blob
-    |   \- 无 --> exportLegacy（docx 库直接生成简洁版式 DOCX）
+panel.js -- entriesToMarkdownDocxBlob / markdownToDocxBlob
     \- downloadBlob --> 文件下载
 
 panel.js -- create_document 工具
@@ -783,7 +773,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 - AI 可返回 `plot_chart` -> `plot-spec.js#buildPlotOption` 编 option，宿主 `onChart` 立刻把图挂进当前气泡（侧栏直接 DOM；浮动/阅读器经 ann-chat `{type:'ui', chart}`）；回合结束 `msg.charts` 写入会话，`renderChat` 重建后 `mountChatCharts` 再挂一次。不要用 ASCII/Markdown 表冒充图
 - AI 可返回 `place_images` -> `place-images.js#runPlaceImages` 取图并交货；`to=chat` 时宿主 `onImage` 把预览挂进当前气泡（侧栏直接 DOM；浮动/阅读器经 `{type:'ui', image}`），回合结束 `msg.images` 写入会话
 - **任务清单卡**（`plan` 工具）：`planTool` 成功后回调 `ctx.onPlan(plan)`，侧栏 `applyPlanUpdate` / 浮动窗 `upsertFloatPlan` **删掉旧卡再把新卡挂到最新一条 AI 消息**（数据上同时清掉其它消息的 `plan` 字段 → 单实例不变量），`clear` / 清空对话 / 整库清空时传 null 撤卡。卡片头部 `N/M` + 进度条 + 状态徽标，全完成自动收起；`renderChat` 用 `chatPlanHtml(m)` 从 `msg.plan` 重建（会话落盘自带）。`loadChatSession` 时用 `reconcilePlanFromStorage` 对齐按项目存的清单（浮动聊天建的清单切回侧栏也能看到）。样式 `.chat-plan*` / `.cw-plan*`
-- **任务追踪页**（工作区时间线 `timeline-view.js` 的「任务追踪」tab → `trace-graph.js`）：三种视图，**默认「论证」**。论证图 = `argument-model.js#buildArgumentGraph`（问题 → 结论 → 判断 → 证据；支撑绿边、反对红虚线；每个判断最多展开 3 条证据，其余 bundle，点开再展开）→ `trace-flow.js` React Flow + `layoutArgumentGraph` 按列排布（仅切到论证时懒加载）。优先用 `compose_report` 写入的 report/kj/evidence；没有研报时用最近调研回合的 findings+claims。过程 = `buildProcessTimeline` HTML 时间线：闲聊回合压成一行，子代理断言按 finding 分组，不再平铺。决策视图仍是 `decision-model.js`。`data-tg-output` 打开产出。样式 `.tf-*` / `.tp-*` / `.db-*`、切换器 `.tg-mode*`
+- **任务追踪页**（工作区时间线 `timeline-view.js` 的「任务追踪」tab → `trace-graph.js`）：简报（`briefing-view.js`，数据来自 `briefing-model.js` / `decision-model.js`）加过程时间线（`chat-flow-view.js`，数据来自 `trace-model.js#buildProcessTimeline`）。闲聊回合降级，调研回合保留子代理与断言分组。`data-tg-output` 打开产出。
 - **文档修改卡**（对照 Cursor 的 diff 视图）：doc_edit 引擎回带 `edits` → 执行器 `ctx.onDocEdit(card)` → 侧栏 `applyDocEdit` / 浮动窗 `upsertFloatDocEdit` 挂 `.chat-diffs` 里的 `.chat-diff`（同一文档一张卡，多次编辑就地累加；本轮的卡默认展开）。卡内每处改动是 `位置 / 操作` + 改前（− 红底）改后（+ 主色底）两行，直接写入标「已写入」；只有 track_changes 产生的条目标「待审修订」并指向阅读器/Word。**不在卡上放接受/拒绝按钮**（与 Word 原生修订双头管理必出 bug）。doc_review 的 accept/reject 同样回带 edits，挂进同一张卡
 - 工具执行状态由 `chat-executor.js#toolDisplayLabel` 生成标签、宿主 `showToolStatus/updateToolStatus` 渲染成 `.tool-status`，成功后最少显示 600ms 再淡出；视觉是 `style.css` 里的 `background-clip:text` shimmer：**同色相浅色 tint 软渐变高光**（业界标准参数：底色实色蓝 `#4e75df`，高光为同色相浅蓝 `#8ca5ea→#afc1f1→#8ca5ea` 五段柔和衰减，`background-size:200%` 扫过 2.5s ease-in-out；深色主题底 `#8aa7f2`、高光 `#a7bdf5→#b9caf7→#a7bdf5`；float-css 的 `.cw-thinking-text` 同款）。**不要用灰/白高光 + 硬边停靠**（灰色压在蓝字上发脏、三段硬边停靠显假，历史版本踩过这两个坑）
 - `system prompt` 拆分为**静态前缀**（`chat-prompt.js#STATIC_PREFIX`/`getStaticSystemPrompt`，字节稳定，可被提供商 prompt cache 命中）+ **动态前导**（`chat-prompt.js#buildDynamicPreamble`，作为 user message 注入）。含当前时间/项目/页面、**自动检索的相关经验记忆**、**当前任务清单 `plan`**（`formatPlanDigest`，空清单不注入；未完成带一行「每完成一步立刻 set」的催促）、**调研笔记本摘要 `notebookNotes`**（`formatNotebookDigest`，有则注入）、**决策板摘要 `insights`**（`formatInsightDigest`，record_insight 仍有效条目，v49 起侧栏与 SW 两宿主都注入——决策板跟项目走，清空对话后 AI 仍能读到自己的目标/结论/风险/待拍板）、**当前阅读器会话 `sessionReaderNote`**（若有）、勾选 id / 首条预览 / 条目摘要 / 上下文变化。**RSS items 不进 prompt**，AI 全靠 `list_feeds` / `query_feed_items` / `refresh_feeds` 工具按需查 IndexedDB（数量大也不会爆 token）。对话历史过长时由 `history-compact.js#compactHistory` 自动压缩（LLM 摘要 + 规则兜底，摘要请求带 30s 超时防挂起）；触发阈值按模型上下文窗口推导（`chat-executor.js#contextCompactBudget` = 窗口×0.7−20k；窗口来自项目配置 `contextTokens`，设置页 AI 区可填，默认 1000000 即 1M），不再写死 500k。`HISTORY_KEEP_TAIL_TOKENS=32000` 是压缩保留尾部。**上下文防护（不截断 read）**：read 结果不做中途折叠/截断（callMessages 始终全量）；大文档由 read 工具源头分页（`offset`+`content_next_offset`，见 page-data.js）；API 超限 `isContextOverflowError` 识别后，侧栏面板「压缩更早历史 + `messages.slice(turnStart)` 保留本轮全文 + 重试一次」，浮动窗 SW 直接把错误报给用户。工具循环 `MAX_ROUNDS=100`（侧栏与 SW 一致），第 95 轮注入收尾提示引导模型停止调工具给最终回答，防模型陷在工具循环不收敛
@@ -794,7 +784,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 
 **全局拖放导入**：`panel.js` 顶层监听 `dragenter/dragleave/dragover/drop`，拖入 OPML/JSON 文件时弹出 `.drop-overlay` 蒙层；松开后路由到对应导入逻辑（OPML -> `FEED_IMPORT_OPML`）。
 
-**文件选择器（2026-09-10）**：回形针 / 文库导入 / OPML / DOCX 模板都走 `showOpenFilePicker`（`src/lib/pick-files.js`），**不要**用透明 `<input type=file>` 盖按钮，也**不要**对 hidden input 调 `click()`。Chrome 145+/150+ 把低透明度覆盖当 UI 冒充（CVE-2026-2322 / CVE-2026-14031），Side Panel 对不可见 file input 的 `click()` 也会卡数秒。导入/回形针不设类型过滤（全部文件），选完 `ingestFiles` 白名单拒绝：文档 `pdf/docx/xlsx/csv/md`、文库 JSON、配图 `png/jpeg/webp`。OPML / 模板仍用短 `types`。拖放导入不受影响。
+**文件选择器（2026-09-10）**：回形针 / 文库导入 / OPML 都走 `showOpenFilePicker`（`src/lib/pick-files.js`），**不要**用透明 `<input type=file>` 盖按钮，也**不要**对 hidden input 调 `click()`。Chrome 145+/150+ 把低透明度覆盖当 UI 冒充（CVE-2026-2322 / CVE-2026-14031），Side Panel 对不可见 file input 的 `click()` 也会卡数秒。导入/回形针不设类型过滤（全部文件），选完 `ingestFiles` 白名单拒绝：文档 `pdf/docx/xlsx/csv/md`、文库 JSON、配图 `png/jpeg/webp`。OPML 仍用短 `types`。拖放导入不受影响。
 
 ### 7.1 content script 页面交互层（`content/global.js`）
 
@@ -839,17 +829,14 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 5. `npm run build`，到 `chrome://extensions` 点重新加载
 
 ### 场景 B：改 AI 提示词
-- 改 `src/lib/ai-client.js` 顶部的 `PROMPT_TEMPLATE`
-- 注意 `storage.js` 的 `PROMPT_TEMPLATE_VERSION`（当前 = 4）：保存项目配置时**会主动 `delete promptTemplate / promptTemplateVersion`**（见 `setProjectConfig`），统一用 lib 默认模板，避免老配置覆盖新模板。新增可调字段时务必同步在 `DEFAULT_API_CONFIG` 和 `getProjectConfig` 的默认值合并里加上
+- 改 `src/lib/ai-client.js` 顶部的 `PROMPT_TEMPLATE`。设置页不再提供可编辑副本。`setProjectConfig` 仍会丢掉存量里的 `promptTemplate` / `promptTemplateVersion`，避免旧配置把模板写回去。
 
 ### 场景 C：加一个新订阅源类型 / 新的 RSSHub 实例
 - 仅追加公共实例 -> `rsshub-fallback.js` 的 `PUBLIC_RSSHUB_INSTANCES`
 - 新增完全不同的 feed 格式 -> `feed-parser.js` 加 `parseXxx` 分支
 
-### 场景 D：DOCX 模板新增一种段落角色
-1. `template-parser.js` 的 `ROLE_LABELS` 加一条（`ROLE_TO_PLACEHOLDER` 是模块内 const，同步加）
-2. `aiDetectStructure` 的 AI 提示词里说明新角色
-3. `export-docx.js` 的 `exportWithTemplate` 处理新占位符
+### 场景 D：侧栏 DOCX 导出版式
+导出统一走 `md-to-docx.js`（`entriesToMarkdownDocxBlob` / `markdownToDocxBlob`）。Service Worker 里的 `create_document` 走 `create-docx.js`，不要把 `docx` / `marked` 打进 SW。
 
 ### 场景 E：数据库迁移
 - `feed-db.js` 的 `DB_VERSION` +1，在 `onupgradeneeded` 里写 `if (event.oldVersion < N) { ... }`（v2 迁移还从 createdAt/Date.now() 回填缺失的 publishedAt）
@@ -931,7 +918,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 4. **content script 上下文可能失效**（页面关闭、扩展更新）。`global.js` 顶部的 `safeSendMessage` 会先检查 `chrome.runtime?.id`，否则直接 reject，避免崩溃。
 5. **`build.js` 多入口分别打包**：SW / content / sidepanel / reader 的运行时全局不同（SW 没有 `window`，content 共享页面 `window`，sidepanel 是独立 iframe，reader 是独立扩展页）。共享 lib 直接 `import`，由 rollup tree-shake + 重复打包，每个 bundle 自包含。**`plot-runtime.js` 额外打成 `dist/lib/plot-runtime.js`**（minify + inlineDynamicImports），content 经 WAR 动态加载。构建后 `validateSwBundle()` 会检查 SW 产物是否含 `window.`/`document.` 引用，防止 Vite 升级后注入浏览器代码导致 SW 崩溃。
 6. **`manifest.json` 在仓库根也有一份**，`build.js` 会把它拷到 `dist/`。两份必须一致；想改权限改仓库根那份即可。
-7. **DOCX 模板存储位置**：`chrome.storage.local` 的 `exportTemplate` 字段，包含 base64 编码的整个 .docx 文件 + AI 检测的段落角色映射。模板可能挺大，**不要存到 `storage.sync`**（有 8KB/item 限制）。
+7. **不要把大块二进制放进 `storage.sync`**。`chrome.storage.sync` 有约 8KB/item 限制；文档原件走 IndexedDB `citecat-docs`。
 8. **search_web 走当前选中的搜索渠道**（`search-channels.js`，档案在 `chrome.storage.local.searchChannels`，指针 `activeSearchChannelId`，Key 不进 sync）。设置页「搜索与提示词」是渠道列表：点一行即切换，可同时保存 Tavily / Brave / Serper / Exa / 博查 / SearXNG / DeepSeek 原生 / 网页抓取。缺 Key 直接报错；其它失败改用网页抓取（DuckDuckGo，失败再 Bing）。**请求在 sidepanel（chat-executor.js#fetchSearchResults）跑，不在 SW**。旧 `apiConfig.searchProvider` 只在首次迁移时读一次。
 9. **翻译有三层链路**（`feed-backfill.js#buildTierChain`）：用户在设置里选首选 provider（`google` / `tencent` / `local`），失败的条目逐项 fallback 到下一 tier，`local` 始终兜底。云端 provider 由 `translator-cloud.js` 实现（`google` 主端点为 Chrome 内置翻译同款的 dict-chrome-ex（免 Key），gtx 回退；`tencent` 用 TMT TextTranslateBatch 走 TC3-HMAC-SHA256 签名）。失败时**只递增 `translateAttempts`、不写 `translatedTo`**，否则该条目会被永久跳过；切换 provider 时调 `TRANSLATE_RETRY_FAILED` 走 `resetTranslateFailures` 让历史失败可重试。
 10. **项目（project）= 一个独立的文库**。所有跨项目的数据隔离都是用 `entries_{projectId}` / `projConfig_{projectId}` / `taglib_{projectId}` 这类带后缀的 storage key 实现的。Feed 的 scope 字段（`'global'` vs `<projectId字符串>`）决定它在哪个项目下可见（scope 是字符串，过滤用 `f.scope === 'global' || f.scope === projectId`）。
@@ -971,7 +958,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 41. **Sub 完成条件是 `submit_report`，不是正文**。没有合法 TaskReport 必须标记 incomplete；报告到 Main 前必须强制 Check。核验元数据只能由运行时生成。内容失败最多 revision 一次，基础设施失败不计数。并行 3、depth=1、单 Sub 标签 6、父子历史隔离与 tool transcript 规则保持不变。**预算用满不是失败**：强制轮只开放 `submit_report`（`childCtx.subagentAllowedTools` 同步收窄，防模型硬调别的工具），交回的报告照常过 Check，卡片带 `budgetNote`；只有强制轮也没交才判 incomplete。
 42. **Nested 不是第三层有状态 Agent**。`section_job` 只允许 Sub 调用，只读合格 artifact 的指定章节，每作业新上下文且不保存 session；并行 4、单次 20k 字（分页，不是文件上限）、3 轮、45 秒。返回 `content_has_more` / `content_next_offset`，Sub 用 `offset` 续拉，续拉时不要再带 page/chunk。它的结构化结果由 Sub 去重后再 `submit_report`。
 43. **来源 / 笔记 / 产出是唯一工作区模型**。`ingest` 不接受裸文本；`kind=text` 仅兼容读取且不可引用。笔记只有全部来源均为合格 `doc_id#anchor` 才能 verified。清空三个主干相互独立且保留聊天；来源删除后关联 verified 笔记降为 open。旧 assets 存储、四主干 UI、hidden entryList、XML task_result 和重复导出入口均已删除。
-44. **侧栏文件选择器走 `showOpenFilePicker`**（2026-09-10）：Chrome Side Panel 对不可见 file input 调 `.click()` 会卡数秒；Chrome 145+/150+ 对 `opacity≈0` 覆盖的 file input 会当 UI 冒充再卡几秒。回形针/导入/OPML/模板用 `pickLocalFiles`（File System Access API），不要叠透明 input。导入/回形针不设类型过滤，选完 `ingestFiles` + `isUploadDocName` 拒绝。白名单：`pdf/docx/xlsx/csv/md` + JSON 文库 + `png/jpeg/webp`。`.doc/.xls/.txt/.gif/.markdown` 不再接收（库内旧条目阅读器仍能开）。
+44. **侧栏文件选择器走 `showOpenFilePicker`**（2026-09-10）：Chrome Side Panel 对不可见 file input 调 `.click()` 会卡数秒；Chrome 145+/150+ 对 `opacity≈0` 覆盖的 file input 会当 UI 冒充再卡几秒。回形针/导入/OPML 用 `pickLocalFiles`（File System Access API），不要叠透明 input。导入/回形针不设类型过滤，选完 `ingestFiles` + `isUploadDocName` 拒绝。白名单：`pdf/docx/xlsx/csv/md` + JSON 文库 + `png/jpeg/webp`。`.doc/.xls/.txt/.gif/.markdown` 不再接收（库内旧条目阅读器仍能开）。
 45. **修改痕迹（doc_edit `edits`）三条实现约束**：①`paraLocation()`/`beforeText` 必须在**原节点被移除或包裹之前**取——`loc.runs[0]` 一旦 `removeNode` 或塞进 `w:del`，宿主链就变了，事后取只能拿到空定位（曾导致 location 全空）；②`edits` 按次清空（`editBuf.length = 0` 在入口重置，失败操作不得带残迹，成功才 `splice` 回带）；③回喂模型的摘要用 `formatEditsForModel`（单侧 60 字）而**不是**原始 `edits`（单侧 240 字 + 全量），执行器把 `edits` 从返回 JSON 里剔除再拼摘要，否则一次批量改表能把上下文翻几倍。写操作的「验收证据」= 同一份数据同时给人（修改卡）和给模型（摘要），不要在工具返回值里另写一套。
 46. **清单卡是单实例，靠数据不变量而非 DOM 去重**：`plan` 工具成功后必须回调 `ctx.onPlan(plan)`（clear 传 null）——只写存储不通知，UI 不会动；宿主 `applyPlanUpdate` 先把所有消息的 `plan` 字段清掉再写最新一条，DOM 侧同样先删旧卡再挂新卡，否则 `renderChat` 重建后会出现多张卡。`plan_{projectId}` 是**按项目**存的（浮动聊天与侧栏共享），`loadChatSession` 用 `reconcilePlanFromStorage` 按 `updatedAt` 对齐；清空对话 / `clear_context` / 整库清空都要 `clearPlan`（残留旧计划会持续污染动态前言）。
 47. **图表进 docx 的四条硬约束**：①**光栅化必须有真 DOM 且容器保留布局**——ECharts 量不到宽高就出白图，`display:none` 不行（用 `left:-10000px`）；SW 没有 DOM（`chat-charts.js` 禁 import），浮动窗/阅读器走 `RASTERIZE_CHART` 消息借页面渲染，**回传 base64 字符串**（ArrayBuffer 过 sendMessage 会变 `{}`，老坑）；②**图片进 docx 要四处齐全**，缺一处 Word 报「内容有问题」：`word/media/imageN.png` 部件 + `[Content_Types].xml` 的 `<Default Extension="png">` + `document.xml.rels` 的 image 关系 + **根元素声明 r/wp/a/pic 四个命名空间**（embed 引用靠 `r:embed`，命名空间缺了 rId 解析不出来）；③**正文的 r:embed 必须与 rels 同源**——relId/docPrId 由 `planChartImages` 一次分配、正文与 zip 共用同一份结果（各分一次必然对不上）；④**尺寸按 9525 EMU/px 换算并压进可打印宽度**（A4 减页边距≈577px，取 560 上限），字号要跟着放大：图从 480 逻辑 px 缩到 560px 印在纸上，轴标签 10px 只剩 ~7.5pt，必须 11px 起。
@@ -979,7 +966,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 49. **核验通过 ≠ 事情为真**（2026-10-07）：`entailment-pass` 只说明引文支持“该 attribution 以该 modality 说了这件事”。①claim 的 `modality`/`attribution` 必须一路透传（task-report → Check → trace 节点 meta → 决策板），下游不能把 claimed/reported 渲染成事实；②独立来源数以 `independence.js` 为准，**不要回退成按 docId 或完整 hostname 计数**（转载/通稿会被算成多源印证）；③Check 判定模型优先用设置里的独立审查渠道，回落同模型时必须保留 `sameModelJudge`/`judge_note` 标记，不得静默。
 50. **证据原文不得被翻译覆盖**：RSS 翻译回填只改 `item.summary`/`title`，原文保存在 `item.originalSummary`；入库正文、`fetch_feed_item(s)` 取证一律 `originalSummary || summary`，`fullText` 永不被译文覆盖。新写取 RSS 正文作为证据的路径要遵守同一优先级。AI `create_document` 产出的 `sourceTier` 留空，不得自标 high。
 51. **成文按体裁，材料是原文段落**（2026-10-14）：用户要一份文档时，Main 派 explore，任务书列出要覆盖的要点。explore 用 `passages`（use、doc_id、anchor、逐字 quote）交回，claims 为空则不跑 Check。Main 只看 `covered` / `unresolved`。覆盖够了调用 `write_document`（`document-writer.js`）：干净上下文按体裁写一稿，再对照原文改一稿。改稿标出仍会改变做法、但没有原文的要点时不保存，返回 `need_reading`，Main 只为这些要点再派阅读。成功后对话只告知已保存。`create_document` 仍用于用户已经给了内容的整理和数据表。`compose_report` 名称保留，走同一条成文路径。
-52. **论证图不是过程日志**（2026-10-09）：追踪页默认画「问题 → 结论 → 判断 → 证据」，边是 support/counter 不是调用关系。断言禁止在论证图或过程图里平铺；每个判断默认最多 3 条证据 + bundle。闲聊回合（无子代理/研报/笔记判断）在过程时间线里 grade=idle。`compose_report` 必须 `reportTraceNodes` 写入论证结构；主代理回复节点的 title 用正文首行，不要写死「主代理回复」。
+52. **追踪页是简报加过程，不是论证图**（2026-10-15）：`trace-graph.js` 渲染 `briefing-view.js` 与 `chat-flow-view.js`。闲聊回合（无子代理/研报/笔记判断）在过程时间线里 grade=idle。旧的 React Flow 论证图、dagre 布局和决策板 HTML 已删除。
 
 ---
 
@@ -989,8 +976,8 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 |---|---|---|
 | `@mozilla/readability` | 网页正文提取（Defuddle 之后的回退） | `extractor.js`、`content/global.js` |
 | `defuddle` | 网页正文提取（**首选**，Markdown 输出 + schema.org 元数据） | `extractor.js` |
-| `docx` | 程序化生成 DOCX | `export-docx.js`、`md-to-docx.js`、`doc-edit-word.js` |
-| `jszip` | 解压/重打包 DOCX（即 ZIP） | `export-docx.js`、`template-parser.js` |
+| `docx` | 程序化生成 DOCX | `md-to-docx.js`、`doc-edit-word.js` |
+| `jszip` | 解压/重打包 DOCX（即 ZIP） | `create-docx.js`、`doc-edit-word.js`、`doc-edit-xlsx.js` |
 | `fast-xml-parser` | RSS/Atom/OPML 解析 | `feed-parser.js` |
 | `marked` | Markdown 解析为 token AST | `md-to-docx.js` |
 | `pdfjs-dist` | PDF 渲染（阅读器 canvas + TextLayer）+ PDF 文本提取（doc-import） | `reader/reader.js`、`doc-import.js` |

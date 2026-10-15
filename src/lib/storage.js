@@ -9,7 +9,6 @@ const STORAGE_KEYS = {
   BLACKLIST: 'blacklist',
   API_CONFIG: 'apiConfig',
   ENTRIES: 'entries',
-  TEMPLATE: 'exportTemplate',
 };
 
 const CHANNELS_KEY = 'aiChannels';       // chrome.storage.local：渠道档案列表
@@ -21,7 +20,6 @@ const DEFAULT_API_CONFIG = {
   apiKey: '',
   baseUrl: 'https://api.deepseek.com/chat/completions',
   model: 'deepseek-v4-flash',
-  promptTemplate: '',
   // 模型上下文窗口（tokens）。用于推导对话历史自动压缩阈值（chat-executor.js
   // 的 contextCompactBudget）。按所用模型填写：
   // GLM-4.6=200000 / DeepSeek=64000 / GPT-4o=128000 / Gemini 等 1M 窗口=1000000；不填用默认 1M
@@ -29,9 +27,6 @@ const DEFAULT_API_CONFIG = {
   // 旧下拉，只在首次迁移搜索渠道时读取。现行选择见 search-channels.js 的 activeSearchChannelId。
   searchProvider: 'auto',
 };
-
-// v4: 摘要模板 JSON 示例全角引号 -> 英文直引号 + 显式"不要用全角引号"规则 + response_format json_object
-const PROMPT_TEMPLATE_VERSION = 4;
 
 const DEFAULT_BLACKLIST = [];
 
@@ -184,19 +179,6 @@ export async function getEntryByUrl(url, projectId) {
   return entries.find((e) => e.url === url);
 }
 
-export async function getExportTemplate() {
-  const { [STORAGE_KEYS.TEMPLATE]: tmpl } = await chrome.storage.local.get(STORAGE_KEYS.TEMPLATE);
-  return tmpl || null;
-}
-
-export async function setExportTemplate(template) {
-  await chrome.storage.local.set({ [STORAGE_KEYS.TEMPLATE]: template });
-}
-
-export async function clearExportTemplate() {
-  await chrome.storage.local.remove(STORAGE_KEYS.TEMPLATE);
-}
-
 function clampContextTokens(raw) {
   const n = Number(raw);
   return Number.isFinite(n) && n >= 16000 && n <= 2000000 ? Math.floor(n) : undefined;
@@ -274,7 +256,6 @@ export async function getProjectConfig(projectId) {
         model: active.name || cur.model || DEFAULT_API_CONFIG.model,
         baseUrl: cur.baseUrl || DEFAULT_API_CONFIG.baseUrl,
         protocol: cur.protocol || 'openai',
-        promptTemplate: DEFAULT_API_CONFIG.promptTemplate,
         apiKey: cur.apiKey || '',
         contextTokens: Number.isFinite(ctxRaw) && ctxRaw >= 16000 && ctxRaw <= 2000000
           ? Math.floor(ctxRaw)
@@ -295,7 +276,6 @@ export async function getProjectConfig(projectId) {
     baseUrl: config?.baseUrl || DEFAULT_API_CONFIG.baseUrl,
     // 接口协议（providers/index.js）：'openai' | 'anthropic' | 'gemini'，存量配置回落 openai
     protocol: config?.protocol || 'openai',
-    promptTemplate: DEFAULT_API_CONFIG.promptTemplate,
     apiKey: apiConfig.apiKey || '',
     // 上下文窗口：项目配置有效值优先，否则默认（异常值一律回落默认，钳制交给 chat-executor）
     contextTokens: Number.isFinite(ctxRaw) && ctxRaw >= 16000 && ctxRaw <= 2000000
@@ -455,9 +435,10 @@ export async function setProjectConfig(projectId, config) {
   const { [key]: existing } = await chrome.storage.sync.get(key);
   const { promptTemplate, promptTemplateVersion, ...rest } = config;
   const next = { ...existing, ...rest };
+  // 旧版设置页曾把摘要提示词写进项目配置；提示词只认 ai-client.js 的常量。
   delete next.promptTemplate;
   delete next.promptTemplateVersion;
   await chrome.storage.sync.set({ [key]: next });
 }
 
-export { STORAGE_KEYS, DEFAULT_BLACKLIST, DEFAULT_API_CONFIG, PROMPT_TEMPLATE_VERSION };
+export { STORAGE_KEYS, DEFAULT_BLACKLIST, DEFAULT_API_CONFIG };

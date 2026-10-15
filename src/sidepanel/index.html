@@ -482,14 +482,6 @@
                 <span id="sgStatus" class="status-msg"></span>
               </div>
                       </div>
-          <div class="settings-section">
-            <h3>采集摘要提示词</h3>
-            <div class="form-group">
-                <label for="promptTemplate">采集摘要提示词模板</label>
-                <textarea id="promptTemplate" rows="4" spellcheck="false"></textarea>
-                <button id="resetPromptBtn" class="btn btn-sm" style="margin-top:4px">恢复默认</button>
-              </div>
-          </div>
           </div>
           <div class="settings-pane" data-settings-pane="feed" hidden>
           <div class="settings-section">
@@ -619,30 +611,6 @@
             </div>
             <div class="form-actions"><span id="colorSchemeStatus" class="status-msg"></span><span id="uiScaleStatus" class="status-msg"></span></div>
           </div>
-          <div class="settings-section">
-            <h3>DOCX 导出模板 <span id="templateStatusBadge" class="template-status-badge" hidden>已就绪</span></h3>
-              <div id="templateDrop" class="template-drop">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                <p>拖入或选择 DOCX</p>
-                <span id="templatePickBtn" class="btn btn-sm">选择文件</span>
-              </div>
-              <div id="templateStructArea" class="template-struct-area" hidden>
-                <div class="template-struct-header"><span>识别结果</span></div>
-                <div id="templateStructList" class="template-struct-list"></div>
-                <div class="template-struct-actions">
-                  <button id="buildTemplateBtn" class="btn btn-primary btn-sm">确认使用此格式</button>
-                  <button id="cancelStructBtn" class="btn btn-sm">取消</button>
-                </div>
-              </div>
-              <div id="templateInfo" class="template-info" hidden>
-                <div class="template-active-indicator"><span class="template-active-dot"></span>已激活</div>
-                <div style="display:flex;gap:8px;margin-top:8px">
-                  <button id="clearTemplateBtn" class="btn btn-sm">更换格式</button>
-                  <button id="resetToDefaultBtn" class="btn btn-sm">恢复默认</button>
-                </div>
-              </div>
-              <div style="margin-top:4px"><span id="templateStatus" class="status-msg"></span></div>
-                      </div>
           </div>
           <div class="settings-pane" data-settings-pane="keep" hidden>
           <div class="settings-section">

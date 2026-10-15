@@ -1,4 +1,4 @@
-/* 任务追踪思维导图冒烟（node test/trace-smoke.mjs）：trace-log / trace-model / dagre 布局 / 详情卡。 */
+/* 任务追踪冒烟（node test/trace-smoke.mjs）：trace-log / trace-model / 简报 / ChatFlow。 */
 
 import assert from 'node:assert';
 
@@ -19,10 +19,7 @@ globalThis.chrome = {
 const T = await import('../src/lib/trace-log.js');
 T.__useMemoryBackend();
 const { buildTraceGraph, isGraphEmpty, focusNodeIds, ROOT_ID, buildProcessTimeline, isProcessEmpty } = await import('../src/lib/trace-model.js');
-const { layoutGraph } = await import('../src/lib/trace-layout.js');
 const { traceDetailHtml } = await import('../src/sidepanel/trace-graph.js');
-const { buildArgumentGraph, isArgumentEmpty, layoutArgumentGraph } = await import('../src/lib/argument-model.js');
-const { processTimelineHtml } = await import('../src/sidepanel/trace-process.js');
 const { chatFlowHtml } = await import('../src/sidepanel/chat-flow-view.js');
 const { briefingHtml } = await import('../src/sidepanel/briefing-view.js');
 const { buildBriefing } = await import('../src/lib/briefing-model.js');
@@ -181,62 +178,6 @@ ok(cyc.nodes.some((n) => n.id === 'c1') && cyc.nodes.some((n) => n.id === 'c2'),
 ok(cyc.edges.some((e) => e.type === 'tree' && e.target === 'o' && e.source === 'thread:chat'), '找不到父节点的孤儿挂线程根');
 ok(isGraphEmpty(buildTraceGraph({})) && !isGraphEmpty(g), '空图判定');
 
-// —— dagre 布局 ——
-const lay = layoutGraph(g);
-const pos = new Map(lay.nodes.map((n) => [n.id, n]));
-ok(lay.nodes.length === g.nodes.length && lay.width > 0 && lay.height > 0, '每个节点都有坐标');
-let overlap = 0;
-for (let i = 0; i < lay.nodes.length; i++) {
-  for (let j = i + 1; j < lay.nodes.length; j++) {
-    const a = lay.nodes[i];
-    const b = lay.nodes[j];
-    if (a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height) overlap += 1;
-  }
-}
-ok(overlap === 0, '节点互不重叠');
-ok(g.edges.filter((e) => e.type === 'tree').every((e) => pos.get(e.source).x < pos.get(e.target).x), '父节点总在子节点左侧（从左到右）');
-
-// —— 论证图 / 过程时间线 ——
-const argNodes = [
-  tn({ id: 'turnR', kind: 'turn', subtype: 'user', title: '帮我写研报', ts: t0 + 10 }),
-  ...outlineNodes.map((n) => ({ ...n, ts: t0 + 20 })),
-];
-const arg = buildArgumentGraph({ nodes: argNodes });
-ok(!isArgumentEmpty(arg) && arg.nodes.some((n) => n.kind === 'question') && arg.nodes.some((n) => n.kind === 'judgment'), '论证图：问题 + 判断');
-ok(arg.edges.some((e) => e.type === 'support') && arg.edges.some((e) => e.type === 'counter'), '论证图有支撑边和反对边');
-const argLay = layoutArgumentGraph(arg);
-ok(argLay.nodes.length === arg.nodes.length && argLay.width > 0, '论证图每个节点都有坐标');
-const qX = argLay.nodes.find((n) => n.id === arg.nodes.find((x) => x.kind === 'question').id).x;
-const eX = argLay.nodes.find((n) => arg.nodes.find((x) => x.id === n.id && x.kind === 'evidence')).x;
-ok(qX < eX, '论证图问题在证据左侧');
-
-const manyClaims = Array.from({ length: 12 }, (_, i) => ({ id: `c${i}`, claim: `事实${i}`, evidence: [] }));
-const flood = T.subagentReportNodes({
-  projectId: 'p1', parentId: 'saFlood', threadId: 'chat', ts: t0,
-  report: {
-    summary: 's',
-    findings: [{ question: '趋势？', answer: '向下', supporting: manyClaims.map((c) => c.id), contradicting: [], confidence: 'low' }],
-    claims: manyClaims, unresolved: [], actions: [],
-  },
-});
-const floodArg = buildArgumentGraph({
-  nodes: [
-    tn({ id: 'turnF', kind: 'turn', subtype: 'user', title: '调研趋势', ts: t0 }),
-    tn({ id: 'saFlood', parentId: 'turnF', kind: 'subagent', subtype: 'explore', title: '查趋势', ts: t0 + 1, status: 'completed' }),
-    ...flood,
-  ],
-});
-ok(floodArg.nodes.some((n) => n.kind === 'bundle') && floodArg.nodes.filter((n) => n.kind === 'evidence').length <= 4, '证据过多时聚合成 bundle');
-const expanded = buildArgumentGraph({
-  nodes: floodArg.nodes.length ? [
-    tn({ id: 'turnF', kind: 'turn', subtype: 'user', title: '调研趋势', ts: t0 }),
-    tn({ id: 'saFlood', parentId: 'turnF', kind: 'subagent', subtype: 'explore', title: '查趋势', ts: t0 + 1, status: 'completed' }),
-    ...flood,
-  ] : [],
-  expanded: { [flood.find((n) => n.kind === 'finding').id]: true },
-});
-ok(!expanded.nodes.some((n) => n.kind === 'bundle') && expanded.nodes.filter((n) => n.kind === 'evidence').length === 12, '展开后露出全部证据');
-
 const proc = buildProcessTimeline({
   nodes: [
     tn({ id: 'idle1', kind: 'turn', subtype: 'user', title: '怎么全是标签格式？', ts: t0 }),
@@ -261,8 +202,6 @@ const idle = proc.threads[0].turns.find((t) => t.id === 'idle1');
 const work = proc.threads[0].turns.find((t) => t.id === 'work1');
 ok(idle.grade === 'idle' && work.grade === 'work', '闲聊回合降级，调研回合保留');
 ok(work.subagents[0].groups[0].question === '替代进展？' && work.subagents[0].counts.pass === 1, '断言按 finding 分组');
-const procHtml = processTimelineHtml(proc);
-ok(procHtml.includes('is-idle') && procHtml.includes('替代进展') && !procHtml.includes('主代理回复'), '过程 HTML：闲聊折叠、判断可见、回复用正文');
 const flowHtml = chatFlowHtml(proc);
 ok(flowHtml.includes('ChatFlow') && flowHtml.includes('稀土替代深度调研') && !flowHtml.includes('怎么全是标签格式'), 'ChatFlow 只画调研回合');
 ok(!flowHtml.includes('这条对话怎么走的') && flowHtml.includes('子代理'), 'ChatFlow 标题与派出线');

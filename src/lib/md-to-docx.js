@@ -1,7 +1,6 @@
-/* Markdown -> DOCX converter for AI-generated documents.
+/* Markdown -> DOCX converter for side-panel export.
    Uses marked (parse markdown to token AST) + docx (build pure OOXML).
-   Separate from export-docx.js (which serves collected-page briefs with
-   template support). Produces structured Word documents:
+   Produces structured Word documents:
    headings / lists / tables / bold / italic / code / quotes / hr / links.
    Runs in the sidepanel context (has Blob). create_document(format=docx) in SW
    uses create-docx.js (JSZip, no docx/marked) so the SW bundle stays DOM-free. */
