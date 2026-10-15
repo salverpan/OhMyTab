@@ -2000,23 +2000,20 @@ html[data-theme="dark"] { --peek-line: #52525b; }
   text-align: right;
 }
 
-.chat-placed-images {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 10px 0 4px;
-  width: 100%;
-  max-width: 100%;
-}
+.chat-placed-image,
 .chat-placed-images img {
   display: block;
   max-width: 100%;
   max-height: 280px;
+  width: auto;
+  height: auto;
   object-fit: contain;
   border-radius: 8px;
   border: 1px solid var(--hairline);
   background: var(--surface-cream, #f7f4ee);
+  margin: 8px 0;
 }
+.chat-stream-body[hidden] { display: none; }
 .chat-live-charts {
   display: flex;
   flex-direction: column;
@@ -2800,6 +2797,67 @@ html[data-theme="dark"] { --peek-line: #52525b; }
 
 /* ---- Settings panel ---- */
 
+/* 苹果分段控件：灰轨道 + 浮起的滑块，选中项只改字重和颜色 */
+.settings-tabs {
+  position: relative;
+  display: flex;
+  margin: 10px 12px 0;
+  padding: 2px;
+  flex-shrink: 0;
+  border-radius: 9px;
+  background: rgba(120, 120, 128, 0.16);
+}
+.settings-tab-pill {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 0;
+  width: 0;
+  border-radius: 7px;
+  background: var(--canvas);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.12), 0 1px 1px rgba(0, 0, 0, 0.04);
+  pointer-events: none;
+  transition: transform 280ms cubic-bezier(0.2, 0.8, 0.2, 1), width 280ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.settings-tab {
+  flex: 1;
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+}
+.settings-tab:hover { color: var(--ink); }
+.settings-tab.active {
+  color: var(--ink);
+  font-weight: 600;
+}
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+.settings-pane[hidden] { display: none !important; }
+.settings-note {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin: 0 0 10px;
+}
+.settings-section.is-danger {
+  border-color: color-mix(in srgb, var(--error) 35%, var(--hairline));
+}
+.settings-section.is-danger h3 { color: var(--error); }
+
 .settings-inner {
   padding: var(--space-md);
   display: flex;
@@ -2807,6 +2865,9 @@ html[data-theme="dark"] { --peek-line: #52525b; }
   gap: var(--space-md);
   overflow-y: auto;
   flex: 1;
+  /* panel 是 overflow:hidden 的定高容器。缺 min-height:0 时这里会被内容撑高并裁掉下半截，
+     外部 API 编辑表单打开后落在可视区外，看起来像点击无反应。 */
+  min-height: 0;
   scrollbar-width: thin;
   scrollbar-color: #d4d4d8 transparent;
   /* 滚轮失效防御（见 .entry-list 注释） */
@@ -4657,6 +4718,8 @@ html[data-theme="dark"] ::selection { background: rgba(138, 167, 242, 0.30); col
   /* 毛玻璃条 */
 html[data-theme="dark"] .header,
 html[data-theme="dark"] .tab-bar { background: rgba(23, 23, 26, 0.85); }
+html[data-theme="dark"] .settings-tabs { background: rgba(118, 118, 128, 0.24); }
+html[data-theme="dark"] .settings-tab-pill { background: var(--surface-cream-strong); }
 html[data-theme="dark"] .export-dropdown { background: rgba(30, 30, 34, 0.92); }
 
   /* 白底元素 → 画布色 */
@@ -5008,8 +5071,17 @@ html {
 .settings-fold[open] .fold-body > *:nth-child(n+6) { animation-delay: 130ms; }
 
 /* 渠道编辑器展开同理复用（display:none→显示时动画自动重放） */
-#channelEditor:not([hidden]) {
+#channelEditor:not([hidden]),
+#apiConnectorEditor:not([hidden]) {
   animation: foldItemIn 380ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 外部 API：表单跟在被点的那一行后面，而不是掉到整段列表底下 */
+.channel-list > #apiConnectorEditor {
+  padding: 8px 10px 2px;
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--primary) 6%, var(--canvas));
 }
 
 /* summary 交互反馈保持克制：文字色轻移 + 箭头非线性旋转 */

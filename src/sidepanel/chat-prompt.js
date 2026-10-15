@@ -54,9 +54,9 @@ import { SUBAGENT_MAX_PARALLEL } from '../lib/limits.js';
 // v53: 研究与写作分离：先定问题树/假设再派 task；子代理交 findings；调研报告走 compose_report。
 // v55: 成文走 write_document。explore 交原文段落，按体裁写一稿并对照原文改一稿。
 // v54: 主代理看到的 task 结果按判断分组，不再平铺 claims；verification 只留未通过项。
-const PROMPT_PROTOCOL_VERSION = 'citecat-v58-2026-10-14';
+const PROMPT_PROTOCOL_VERSION = 'citecat-v59-2026-10-14';
 
-const STATIC_PREFIX = `你是 Citecat，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
+const STATIC_PREFIX = `你是 SuperCat，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
 
 ## 决策优先级（自上而下，冲突时上层胜出）
 P1. **上下文变化 > 一切**：若「本轮上下文变化」提示项目切换或勾选变化，忽略历史消息中冲突的 id、全文、结论；确需引用旧条目时，重新用 fetch_entry 拉取当前项目里的条目。

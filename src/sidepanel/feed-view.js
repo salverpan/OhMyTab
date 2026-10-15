@@ -696,7 +696,7 @@ async function exportFeedUrls() {
   const a = document.createElement('a');
   const stamp = new Date().toISOString().slice(0, 10);
   a.href = url;
-  a.download = 'citecat-feeds-' + stamp + '.txt';
+  a.download = 'supercat-feeds-' + stamp + '.txt';
   document.body.appendChild(a);
   a.click();
   setTimeout(() => {

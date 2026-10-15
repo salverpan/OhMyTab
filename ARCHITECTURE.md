@@ -1,8 +1,8 @@
-# Citecat 架构说明（面向 AI 协作者）
+# SuperCat 架构说明（面向 AI 协作者）
 
 > 本文是给后续 AI 助手阅读的「项目地图」。目标：让你不读完所有代码也能快速定位「在哪改、怎么改、改了会影响谁」。
 >
-> 项目代号：**Citecat**（仓库 `trusted-source-collector`）
+> 项目代号：**SuperCat**（仓库 `trusted-source-collector`）
 > 形态：**Chrome MV3 扩展**，Side Panel 形态的 AI 网页采集 + RSS 聚合 + DOCX 导出 + **文档阅读器/标注/编辑** 工具。
 >
 > **维护约定**：改了 `src/*` 就要同步更新本文对应章节（模块表 §4 / 消息路由 §5 / 数据流 §6 / UI §7 / 陷阱 §9 / 依赖 §10）。数字、字段名、版本号一律以代码为准，不要凭记忆抄。
@@ -134,16 +134,16 @@ npm run dev       # build + 提示加载 dist/
 ```json
 {
   "manifest_version": 3,
-  "name": "Citecat",
+  "name": "SuperCat",
   "version": "0.3.0",
-  "description": "Citecat - 采集网页、AI摘要、导出DOCX",
+  "description": "SuperCat - 采集网页、AI摘要、导出DOCX",
   "update_url": "http://47.104.128.124/citecat/update.xml",
   "permissions": ["storage", "sidePanel", "tabs", "scripting", "webNavigation", "alarms", "debugger", "unlimitedStorage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background/service-worker.js", "type": "module" },
   "side_panel":  { "default_path": "src/sidepanel/index.html" },
   "content_scripts": [{ "matches": ["<all_urls>"], "js": ["content/global.js"], "run_at": "document_end" }],
-  "action": { "default_title": "Citecat" },
+  "action": { "default_title": "SuperCat" },
   "icons": { "16": "icon/logo.png", "48": "icon/logo.png", "128": "icon/logo.png" },
   "web_accessible_resources": [{ "resources": ["lib/plot-runtime.js"], "matches": ["<all_urls>"] }]
 }
@@ -155,7 +155,7 @@ npm run dev       # build + 提示加载 dist/
 - **`scripting`** 用于 SW 主动注入到目标 tab 抓取（`extractor.js#fetchViaTab`）及页面交互（`browser_act` 的 `loop_observe`/`loop_act`，以及 `interact_page` 的 `number_elements` / `click_number` 等）。
 - **`debugger`** 用于 `interact_page` 的 CDP 可信事件：`cdp_click` / `cdp_type` / `ax_snapshot` / `ax_click`。统一走 `src/lib/cdp.js`：attach 前 `tabs.update({active:true})` + 聚焦窗口（不改尺寸；仅最小化才还原，禁止 `state:'normal'` 把最大化窗口压成小窗），`discarded/frozen` 先唤醒；`debugger.attach` / `Page.captureScreenshot` / `Accessibility.getFullAXTree` 硬超时 `CDP_TIMEOUT_MS=20000`，超时抛错并 detach，让 `acquireBrowserLock` 释放。会短暂显示调试横幅。
 - **`unlimitedStorage`** 解除 `chrome.storage.local` 默认 10MB 配额（文库条目带 `fullText`、文档原件存 IDB，体积增长快）。
-- **`webNavigation`** 用于 SPA 路由（pushState / hash）变化通知 content script：监听 `onHistoryStateUpdated` + `onReferenceFragmentUpdated`，向对应 tab 发 `URL_CHANGED`；**`onCommitted` 另用于 PDF 阅读器接管**（检测 `.pdf` URL，开 Citecat 阅读器 tab 替代内置 viewer）。
+- **`webNavigation`** 用于 SPA 路由（pushState / hash）变化通知 content script：监听 `onHistoryStateUpdated` + `onReferenceFragmentUpdated`，向对应 tab 发 `URL_CHANGED`；**`onCommitted` 另用于 PDF 阅读器接管**（检测 `.pdf` URL，开 SuperCat 阅读器 tab 替代内置 viewer）。
 - **`host_permissions: <all_urls>`** 覆盖所有出站请求：SW 抓取原网页、sidepanel 里 `search_web`（`fetch('https://html.duckduckgo.com/html/?q=...')` 在 panel.js 跑，不在 SW）、视频字幕 API、RSS 源等。已移除单独的 `https://duckduckgo.com/*`（`<all_urls>` 已覆盖）。
 - **`update_url`** 指向自托管更新服务器，用于扩展自更新。
 - **`web_accessible_resources`** 仅暴露 `lib/plot-runtime.js`，给页面浮动聊天窗的 content script 动态 import ECharts 运行时。侧栏/阅读器是扩展页，不依赖 WAR，但也走同一 URL。
@@ -365,7 +365,7 @@ listItems({
 |---|---|---|
 | **reader.js** (`src/reader/`) | 文档阅读器页面主逻辑。统一渲染 5 种格式：PDF / docx / **doc（旧版 Word，抽出纯文本只读）** / xlsx / csv。xlsx/csv 走 SheetJS；docx 走 docx-preview；doc 走 `legacy-doc.js`。划词标注、片段收藏、浮动 AI、编辑模式入口（仅 xlsx/docx）。**content script 不注入 `chrome-extension://` 页，阅读器自己响应 `EXTRACT_CONTENT` / `SCROLL_COLLECT`**（`extractDocFullText` 按 docKind 分派，带全文懒缓存 + docUrl/title/kind 签名失效；**EXTRACT_CONTENT 先等文档就绪**——`beginDocLoad`/`endDocLoad` 包住下载+渲染，上限 15s，否则 AI 在 `manage_tabs(open)` 后立刻 `read_tab` 会拿到空正文）；PDF 分支同时产出 `pageOffsets` 随响应回给 `page-data.js`，供工作区按页锚定 | （非模块，无导出） |
 | **doc-edit-sheets.js** | xlsx 编辑模式的可编辑层，基于 **Univer**（`@univerjs/presets` 的 `UniverSheetsCorePreset`）。因 Univer OSS 0.25 的 xlsx 导入导出是 Pro 功能不可用，故用 SheetJS 桥接：导入 SheetJS 解析 -> 构造 Univer workbook snapshot -> `createWorkbook`；导出 `workbook.save()` 快照 -> 转回 SheetJS -> `write`。公式以文本进 Univer 由其引擎计算，样式仅支持粗体。AI 编辑工具：`switch_sheet`/`set_range`/`set_bold`/`append_row`/`append_col`/`clear_range`/`undo`/`redo`（undo/redo 走 `univerAPI.undo()/redo()`） | `initSheetsEditor`, `disposeSheetsEditor`, `execSheetsTool`, `exportSheetsXlsx`, `sheetsText`, `getSelectionText`, `isDirty`, `onSheetsSelectionChange` |
-| **doc-edit-word.js** | docx 编辑引擎 = **OOXML 定点手术**（2026-08-17 重写，替代 mammoth+Tiptap+htmlToDocx 有损往返）：JSZip 解压 -> DOMParser 解析 word/document.xml -> 文本索引层（w:t 全文拼接 + 段间换行 + 空白归一化匹配 + 跨 run 拆分定位）-> 只改目标节点 -> 塞回 zip 重压缩；**其余 zip 条目（styles/numbering/页眉页脚/媒体）字节原样保留，未动区域 100% 保真**（替换文本继承原 run 的 rPr 字体字号颜色）。AI 编辑工具：replace_text/insert_text/set_format（字体、字号、颜色、高亮、对齐、行距、缩进，直接写入）/set_bold/set_heading（复用或注入 heading 样式）/add_list（无 numbering.xml 时整包注入 part+Override+rel）/add_table（显式边框）/set_cell/undo/redo（document.xml 快照栈，cap 30）。**审阅修订**（doc_review）= OOXML 原生痕迹：w:ins/w:del（作者 Citecat，del 内 w:t 转 w:delText），note 以**原生批注**锚定（comments.xml part + commentRangeStart/End + commentReference，接受/拒绝时一并清理）；accept=去 del+解包 ins、reject=删 ins+delText 还原；保存**保留修订痕迹**（Word/WPS 打开仍可逐条审阅），不强制落定；**首次创建修订时向 settings.xml 注入 `<w:trackChanges/>`**（Word 打开修订模式直接开启，用户后续输入也被跟踪）。**v30 起引擎在 SW 无头运行**（`@xmldom/xmldom` 提供 DOMParser/XMLSerializer；DOM 全局走 `docRef` 间接引用以通过 SW bundle 校验；`initWordEditor(null, ab)` 跳过渲染容器/selection 监听，`renderDoc` 为 no-op——阅读器已自行渲染）；**xmldom 无 `Element.remove()`，全部改用 `removeNode(node)` 帮助函数**（原生 DOM 同样可用）。曾用 `await import('docx-preview')` 动态加载渲染器，已删除（会向 SW bundle 注入 Vite `__vitePreload` 触发 build.js 回归守卫误报，且 SW 无 window 走不到）。Node 冒烟测试：test/docx-headless-smoke.mjs（无头链路：修订/直接改/undo/accept/settings 注入） | initWordEditor, disposeWordEditor, execWordTool, execReviewTool, pendingReviewCount, listReviewItems, exportWordDocx, wordText, isDirty |
+| **doc-edit-word.js** | docx 编辑引擎 = **OOXML 定点手术**（2026-08-17 重写，替代 mammoth+Tiptap+htmlToDocx 有损往返）：JSZip 解压 -> DOMParser 解析 word/document.xml -> 文本索引层（w:t 全文拼接 + 段间换行 + 空白归一化匹配 + 跨 run 拆分定位）-> 只改目标节点 -> 塞回 zip 重压缩；**其余 zip 条目（styles/numbering/页眉页脚/媒体）字节原样保留，未动区域 100% 保真**（替换文本继承原 run 的 rPr 字体字号颜色）。AI 编辑工具：replace_text/insert_text/set_format（字体、字号、颜色、高亮、对齐、行距、缩进，直接写入）/set_bold/set_heading（复用或注入 heading 样式）/add_list（无 numbering.xml 时整包注入 part+Override+rel）/add_table（显式边框）/set_cell/undo/redo（document.xml 快照栈，cap 30）。**审阅修订**（doc_review）= OOXML 原生痕迹：w:ins/w:del（作者 SuperCat，del 内 w:t 转 w:delText），note 以**原生批注**锚定（comments.xml part + commentRangeStart/End + commentReference，接受/拒绝时一并清理）；accept=去 del+解包 ins、reject=删 ins+delText 还原；保存**保留修订痕迹**（Word/WPS 打开仍可逐条审阅），不强制落定；**首次创建修订时向 settings.xml 注入 `<w:trackChanges/>`**（Word 打开修订模式直接开启，用户后续输入也被跟踪）。**v30 起引擎在 SW 无头运行**（`@xmldom/xmldom` 提供 DOMParser/XMLSerializer；DOM 全局走 `docRef` 间接引用以通过 SW bundle 校验；`initWordEditor(null, ab)` 跳过渲染容器/selection 监听，`renderDoc` 为 no-op——阅读器已自行渲染）；**xmldom 无 `Element.remove()`，全部改用 `removeNode(node)` 帮助函数**（原生 DOM 同样可用）。曾用 `await import('docx-preview')` 动态加载渲染器，已删除（会向 SW bundle 注入 Vite `__vitePreload` 触发 build.js 回归守卫误报，且 SW 无 window 走不到）。Node 冒烟测试：test/docx-headless-smoke.mjs（无头链路：修订/直接改/undo/accept/settings 注入） | initWordEditor, disposeWordEditor, execWordTool, execReviewTool, pendingReviewCount, listReviewItems, exportWordDocx, wordText, isDirty |
 
 > **doc_edit 工具全集**（tools.js L669 注册）：xlsx 6 个专属 + docx 8 个专属（含 set_format） + 通用 `undo`/`redo`/`export`，与两个编辑模块的 switch 及 reader 的 export 拦截完全对应。**入口归一化**：`chat-executor.js#executeToolCall` 对 `doc_edit`/`doc_review` 的 `args.tool` 做 `action`/`act`/`op` 别名回退，仍缺失时直接返回可用动作清单（引导模型自纠重试，不再透传 undefined 到编辑器）；编辑器 default 分支错误同样列出全部可用动作。触发链见 §6.9。
 
@@ -429,7 +429,7 @@ listItems({
 ### 5.3c 多标签页相关（后台虚拟操作引擎）
 | 消息 | 处理函数 | 作用 |
 |---|---|---|
-| `TAB_SNAPSHOT` | `handleTabSnapshot` | manage_tabs(list)：全部可读 tab 的 `{tabId, url, title, pageType, 摘要}` 快照。走 **EXTRACT_SNAPSHOT**（禁止 EXTRACT_CONTENT 全文），并发 6，单页 1.5s 超时、总预算 8s；休眠/冻结 tab 只回标题/URL。超时或 SW 被杀时 chat-executor 回退 `chrome.tabs.query` 元数据列表，避免「Managing tabs…」卡死。**候选过滤保留 Citecat 阅读器页**（`isReadableTab`/`isReaderPage`）——阅读器页是 doc_edit/doc_review 的目标页，必须可被 AI 列出/读取 |
+| `TAB_SNAPSHOT` | `handleTabSnapshot` | manage_tabs(list)：全部可读 tab 的 `{tabId, url, title, pageType, 摘要}` 快照。走 **EXTRACT_SNAPSHOT**（禁止 EXTRACT_CONTENT 全文），并发 6，单页 1.5s 超时、总预算 8s；休眠/冻结 tab 只回标题/URL。超时或 SW 被杀时 chat-executor 回退 `chrome.tabs.query` 元数据列表，避免「Managing tabs…」卡死。**候选过滤保留 SuperCat 阅读器页**（`isReadableTab`/`isReaderPage`）——阅读器页是 doc_edit/doc_review 的目标页，必须可被 AI 列出/读取 |
 | `TAB_READ_MANY` | `handleTabReadMany` | read_many：批量 buildPageData（并发 4，≤10 页），每页带 `untrusted` 标记 |
 | `TAB_SESSION_OPERATE` | `handleTabSessionOperate` | interact_page(tabId) 后台 CDP 操作：cdp_click / cdp_type / ax_snapshot / ax_click / capture_network / screenshot / exec_js / exec_js_main / scroll / scroll_to_bottom / navigate，走 TabSession 持久会话池 |
 | `TAB_SESSION_STATUS` / `TAB_SESSION_RELEASE` | 直调 `sessionPool` | 会话池状态查询 / 释放指定 tab 会话 |
@@ -460,7 +460,7 @@ listItems({
 - `chrome.action.onClicked` -> 打开 SidePanel
 - `chrome.alarms.onAlarm`（SW 文件内监听器，3 个）：`citecat-feed-refresh`（每 `prefs.intervalMin` 分钟批量刷 feeds，刷完触发一次翻译 backfill）；`citecat-index-build`（索引重建 alarm 兜底续跑——仅手动重建期间存在）；**`citecat-heartbeat-tick`**（每 1 分钟扫到期心跳任务，侧栏在则 `HEARTBEAT_FIRE`，否则 queued）
 - `chrome.webNavigation.onHistoryStateUpdated` / `onReferenceFragmentUpdated` -> SPA 路由（pushState / hash）变化时推 `URL_CHANGED` 给 content
-- `chrome.webNavigation.onCommitted` -> **PDF 阅读器接管**：检测 `.pdf` URL（15 秒去重），开 Citecat 阅读器 tab 替代内置 viewer（见 §6.10）
+- `chrome.webNavigation.onCommitted` -> **PDF 阅读器接管**：检测 `.pdf` URL（15 秒去重），开 SuperCat 阅读器 tab 替代内置 viewer（见 §6.10）
 - `chrome.runtime.onConnect` -> **ann-chat 长连接端口**（见 §5.6）
 - `chrome.storage.onChanged` -> `entries_*` 写入时标记各 ann-chat 端口 `entriesDirty`（下次该端口聊天时重读条目）
 - `chrome.tabs.onRemoved` -> 若该 tab 是用户从条目卡上点开重试的，关闭时自动 `handleRetry({entryId})`；并清理 `readerSession`
@@ -811,7 +811,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 
 ### 7.2 阅读器与标注子系统（`src/reader/`）
 
-**为什么独立**：浏览器内置 PDF viewer 是受保护扩展页，content script 无法注入（无法跑标注/浮动聊天）。故 Citecat 把 PDF/Word/Excel/CSV 统一在扩展页 `src/reader/index.html` 内渲染，reader.js 自行实现提取/标注/聊天/编辑全套逻辑（与 content script 共用 `doc-marks.js`/`annotations.js`/`float-css.js`/`orb-state.js`/`chat-executor.js`）。
+**为什么独立**：浏览器内置 PDF viewer 是受保护扩展页，content script 无法注入（无法跑标注/浮动聊天）。故 SuperCat 把 PDF/Word/Excel/CSV 统一在扩展页 `src/reader/index.html` 内渲染，reader.js 自行实现提取/标注/聊天/编辑全套逻辑（与 content script 共用 `doc-marks.js`/`annotations.js`/`float-css.js`/`orb-state.js`/`chat-executor.js`）。
 
 **打开方式**（URL 参数）：
 - `?url=<远程URL>` -- 网页 PDF 自动接管（`onCommitted` 检测 `.pdf` 触发，§6.10），`loadRemote` 拉取
@@ -956,7 +956,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 29. **`exec_js` vs `exec_js_main`**：前者在 content script 隔离世界跑（`eval`，能访问 `chrome.runtime`、编号状态，但读不到页面框架变量）；后者在页面**主世界**跑（`chrome.scripting.executeScript({world:'MAIN'})`，能读 `__NEXT_DATA__`/React fiber/Vue `$data`，但受页面 CSP 约束、结果需 JSON 可序列化）。虚拟列表源数据用 `exec_js_main`，DOM 操作用 `exec_js`。
 30. **UI 刷新铁律：只要有 `entries_*` 数据变动就刷新，不依赖任何单点**。三层保障：①`chrome.storage.onChanged` 全局监听（panel.js 监听 `entries_` 前缀 -> `refreshEntriesAndRender()`，**终极兜底**：覆盖 AI 工具 / SW 采集 / 订阅入库 / 手动操作 / 多窗口 sidepanel / 将来任何新功能，微任务防抖合并批量写入，读操作不回写无循环；另监听 `annotations_` 前缀 -> `renderAnnotationList()`，监听 `blacklist` 键 -> 同步设置页黑名单文本框）；②`COLLECTION_STATUS_CHANGED` 广播监听（SW -> panel）；③工具循环对写工具集合（`WRITE_TOOLS`：delete/update/reorder/collect 系列/create_document，定义在 `chat-executor.js`）执行后强制 `getEntries + render + renderLibrary`。**新增任何改文库数据的代码路径时不需要再手动补刷新**--只要写 `entries_{projectId}` 就会被兜住。注意：订阅面板的 IDB 数据不在 storage 里，onChanged 管不到，feed-view 自管；标注数据 `annotations_*` 在 storage 里，由前缀监听兜住。
 31. **阅读器是扩展页，content script 不注入**。所以 reader.js 必须自行监听 `EXTRACT_SNAPSHOT`/`EXTRACT_CONTENT`/`SCROLL_COLLECT`：快照只回标题+缓存摘要（禁止为 list 抽 PDF 全文），全文提取仍给 SW 采集管线。同理 reader 的标注/浮动聊天逻辑自带，但共用 `doc-marks.js`/`annotations.js`/`float-css.js`/`chat-executor.js`。
-32. **浏览器内置 PDF viewer 是受保护扩展页**，content script 无法注入（无法跑标注/浮动聊天）。故 `webNavigation.onCommitted` 检测 `.pdf/.docx/.doc/.xlsx/.xls/.csv/.txt/.md` 时开 Citecat 阅读器 tab 替代（§6.10）。Office 直链还常变成下载，`FETCH_PAGE` / `manage_tabs(open)` / `interact_page(navigate)` 同样改写到阅读器。测试：`node test/doc-xlsx-smoke.mjs`、`node test/xlsx-headless-smoke.mjs`。
+32. **浏览器内置 PDF viewer 是受保护扩展页**，content script 无法注入（无法跑标注/浮动聊天）。故 `webNavigation.onCommitted` 检测 `.pdf/.docx/.doc/.xlsx/.xls/.csv/.txt/.md` 时开 SuperCat 阅读器 tab 替代（§6.10）。Office 直链还常变成下载，`FETCH_PAGE` / `manage_tabs(open)` / `interact_page(navigate)` 同样改写到阅读器。测试：`node test/doc-xlsx-smoke.mjs`、`node test/xlsx-headless-smoke.mjs`。
 33. **删 Entry 必须走 `entry-cascade.js`**。直接调用 storage 的 `deleteEntry` 会漏掉 artifact、原件和笔记核验状态；UI 与 AI `delete_entry` 均使用 `deleteEntryCascade/restoreEntryCascade`。
 34. **ann-chat 权威历史由 SW 维护**。content/reader 浮动窗的本地 `messages` 只是显示用；`done` 消息回传的 `messages`（含 assistant+tool 完整记录）会覆盖本地。故浮动窗重连后历史不丢（向 SW 发 CHAT 时 SW 用自己的 portState.messages）。
 35. **检视模式（inspect）不是 chrome.devtools**，是扩展自建的页面元素选择模式（capture 阶段事件拦截）。右键在检视模式下复制区块名，**不自动调 AI**（仅 `navigator.clipboard.writeText` + toast）。

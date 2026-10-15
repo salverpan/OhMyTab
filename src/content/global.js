@@ -1,4 +1,4 @@
-/* ---- Citecat content script ---- */
+/* ---- SuperCat content script ---- */
 
 import { Readability } from '@mozilla/readability';
 import {
@@ -27,6 +27,7 @@ import { THEME_KEY, loadThemeMode, normalizeThemeMode, resolveTheme } from '../l
 // 改为打开浮动聊天时再动态 import（build 侧 inlineDynamicImports，仍打成单文件）。
 import { ORB_STATE_BY_TOOL } from '../lib/orb-state.js';
 import { upsertSubagentCardEl, syncLiveTurnOrder } from '../lib/subagent-ui.js';
+import { syncInlineMedia } from '../lib/inline-media.js';
 import { attachScopeQuiz } from '../lib/scope-quiz.js';
 import { appendChartsTo, disposeChatCharts, rasterizeChartOption } from '../lib/chat-charts.js';
 import { upsertPlanCardEl } from '../lib/plan.js';
@@ -558,7 +559,7 @@ function extractStructuredMarkdown() {
       mode: 'markdown',
     };
   } catch (err) {
-    console.warn('[Citecat] structured extraction failed:', err);
+    console.warn('[SuperCat] structured extraction failed:', err);
     return null;
   }
 }
@@ -673,7 +674,7 @@ async function init() {
       await createPageCheckbox();
       injectAnnotationStyles();
     } catch (err) {
-      console.warn('[Citecat] 页面按钮初始化失败:', err.message);
+      console.warn('[SuperCat] 页面按钮初始化失败:', err.message);
     }
   }
 }
@@ -2989,7 +2990,7 @@ async function processResults() {
       } catch { continue; }
 
       if (isUrlBlacklisted(url)) {
-        console.log('[Citecat] 黑名单隐藏:', url);
+        console.log('[SuperCat] 黑名单隐藏:', url);
         el.classList.add('tsc-filtered');
         continue;
       }
@@ -3069,7 +3070,7 @@ function reprocessAll() {
 const themeHosts = [];
 let pageThemeMode = 'auto';
 
-function paintCitecatTheme(mode) {
+function paintSuperCatTheme(mode) {
   pageThemeMode = normalizeThemeMode(mode);
   const resolved = resolveTheme(pageThemeMode);
   document.documentElement.dataset.citecatTheme = resolved;
@@ -3080,24 +3081,24 @@ function paintCitecatTheme(mode) {
 
 function registerThemeHost(el) {
   if (el && !themeHosts.includes(el)) themeHosts.push(el);
-  paintCitecatTheme(pageThemeMode);
+  paintSuperCatTheme(pageThemeMode);
 }
 
-function initCitecatTheme() {
-  loadThemeMode().then((mode) => paintCitecatTheme(mode)).catch(() => {});
+function initSuperCatTheme() {
+  loadThemeMode().then((mode) => paintSuperCatTheme(mode)).catch(() => {});
   try {
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-      if (pageThemeMode === 'auto') paintCitecatTheme('auto');
+      if (pageThemeMode === 'auto') paintSuperCatTheme('auto');
     });
   } catch (_) {}
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local' || !changes[THEME_KEY]) return;
-      paintCitecatTheme(changes[THEME_KEY].newValue);
+      paintSuperCatTheme(changes[THEME_KEY].newValue);
     });
   } catch (_) {}
 }
-initCitecatTheme();
+initSuperCatTheme();
 
 /* ======== Regular page: floating button ======== */
 
@@ -3383,6 +3384,7 @@ let chatContext = null; // { label, text, system } —— 随时可被新的划�
 let chatBusy = false;
 let liveScopeQuiz = null;
 let chatStreamText = '';
+let floatPlacedImages = [];
 // 最近一次选区手势。划词不要被之前的检视多选抢走，反过来也一样。
 let chatAskMode = ''; // 'text' | 'element' | 'multi'
 let selPointer = null;
@@ -3679,6 +3681,7 @@ async function openChatWindow() {
   chatHistory = [];
   chatBusy = false;
   chatStreamText = '';
+  floatPlacedImages = [];
   chatChartData = null;
   // 重置 tab 到「引用内容」
   win.querySelectorAll('.cw-tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === 'ctx'));
@@ -3707,7 +3710,7 @@ function handleChatPortMessage(m) {
     }
     try { finishAiChunk(); }
     catch (err) {
-      console.warn('[Citecat] finish float chat failed', err);
+      console.warn('[SuperCat] finish float chat failed', err);
       chatBusy = false;
       updateSendBtn();
     }
@@ -3824,7 +3827,7 @@ function sendChatMessage() {
   const ai = document.createElement('div');
   ai.className = 'cw-msg ai';
   // 全程常驻：orb + 右侧 shimmer 文字一行，流式正文在下方独立容器填充（不再用竖杠光标）
-  ai.innerHTML = '<div class="cw-msg-label">Citecat</div>' +
+  ai.innerHTML = '<div class="cw-msg-label">SuperCat</div>' +
     '<div class="cw-subagents"></div>' +
     '<p class="cw-stream"></p>' +
     '<div class="cw-thinking-row"><span class="cw-thinking-orb"></span><span class="cw-thinking-text">Thinking</span></div>';
@@ -3834,6 +3837,7 @@ function sendChatMessage() {
   body.scrollTop = body.scrollHeight;
   chatBusy = true;
   chatStreamText = '';
+  floatPlacedImages = [];
   updateSendBtn();
   armChatWatchdog();
   // 不再本地拼 system：SW 侧注入完整静态提示词 + 动态前言；这里只附选区上下文
@@ -4039,6 +4043,18 @@ function renderScopeQuiz(quiz) {
   body.scrollTop = body.scrollHeight;
 }
 
+function paintFloatStream(ai) {
+  if (!ai) return;
+  const stream = syncInlineMedia(ai, chatStreamText, floatPlacedImages, {
+    streamClass: 'cw-stream',
+    streamTag: 'p',
+    pinSelector: ':scope > .cw-thinking-row',
+    renderSlice: (el, slice) => { el.textContent = slice; },
+  });
+  if (stream) INSPECT.chatStreamEl = stream;
+  syncLiveTurnOrder(ai, 'cw');
+}
+
 function appendFloatImage(image) {
   const win = INSPECT.chatWin;
   const body = win && win.querySelector('.cw-body');
@@ -4046,22 +4062,12 @@ function appendFloatImage(image) {
   armChatWatchdog();
   const ai = body.querySelector('.cw-msg.ai:last-of-type');
   if (!ai) return;
-  let stack = ai.querySelector('.chat-placed-images');
-  if (!stack) {
-    stack = document.createElement('div');
-    stack.className = 'chat-placed-images';
-    const before = ai.querySelector('.chat-live-charts')
-      || ai.querySelector('.cw-thinking-row')
-      || ai.querySelector('.scope-quiz-host');
-    if (before) ai.insertBefore(stack, before);
-    else ai.appendChild(stack);
-  }
-  if (stack.querySelector(`[data-placed-id="${image.id}"]`)) return;
-  const img = document.createElement('img');
-  img.dataset.placedId = image.id;
-  img.src = image.dataUrl;
-  img.alt = image.alt || '';
-  stack.appendChild(img);
+  const at = Number.isFinite(image.at) ? image.at : chatStreamText.length;
+  const next = { ...image, at };
+  const idx = floatPlacedImages.findIndex((x) => x.id === next.id);
+  if (idx >= 0) floatPlacedImages[idx] = next;
+  else floatPlacedImages.push(next);
+  paintFloatStream(ai);
   body.scrollTop = body.scrollHeight;
 }
 
@@ -4126,10 +4132,11 @@ function resetChatBody() {
   unmountChatOrb();
   INSPECT.chatStreamEl = null;
   chatStreamText = '';
+  floatPlacedImages = [];
   const body = win.querySelector('.cw-body');
   disposeChatCharts(body);
   body.innerHTML =
-    '<div class="cw-msg ai"><div class="cw-msg-label">Citecat</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
+    '<div class="cw-msg ai"><div class="cw-msg-label">SuperCat</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
 }
 
 function appendAiChunk(t) {
@@ -4142,9 +4149,12 @@ function appendAiChunk(t) {
   }
   armChatWatchdog();
   chatStreamText += t;
-  el.textContent = chatStreamText;
   const ai = el.closest('.cw-msg.ai');
-  if (ai) syncLiveTurnOrder(ai, 'cw');
+  if (ai && floatPlacedImages.length) paintFloatStream(ai);
+  else {
+    el.textContent = chatStreamText;
+    if (ai) syncLiveTurnOrder(ai, 'cw');
+  }
   const body = INSPECT.chatWin?.querySelector('.cw-body');
   if (body) body.scrollTop = body.scrollHeight;
 }
@@ -4158,7 +4168,9 @@ function removeThinkingRow(fromEl) {
 
 function finishAiChunk() {
   const el = INSPECT.chatStreamEl;
-  if (el) el.textContent = chatStreamText;
+  const ai = el && el.closest('.cw-msg.ai');
+  if (ai && floatPlacedImages.length) paintFloatStream(ai);
+  else if (el) el.textContent = chatStreamText;
   // 先卸 React root 再移除 .cw-thinking-row（里面是 orb 容器），否则 removeChild 抛 NotFoundError，
   // chatBusy 永远停在 true，发送按钮卡在停止。
   unmountChatOrb();
@@ -4467,10 +4479,15 @@ function tryShowSelectionBar() {
   updateChatContext(); // 聊天窗打开时：随时划新内容，引用同步更新
 }
 
+function isDomNode(n) {
+  return !!(n && typeof n.nodeType === 'number');
+}
+
 function repositionSelectionBar(e) {
   const t = e && e.target;
   const host = document.getElementById('tsc-float-container');
-  if (host && t && (t === host || host.contains(t))) return;
+  // resize 的 target 是 window，不是 Node，直接 contains 会抛 TypeError
+  if (host && isDomNode(t) && (t === host || host.contains(t))) return;
   const bar = INSPECT.barEl;
   if (!bar || bar.style.display === 'none') return;
   if (INSPECT.barMode === 'text' && INSPECT.lastTextRange) {
@@ -4488,7 +4505,7 @@ function onMarkClick(e) {
   const pop = INSPECT.popEl;
   // 浮层/自有 UI 内的点击交给它们自己的监听；其余非标注点击收起浮层
   const floatHost = document.getElementById('tsc-float-container');
-  const inFloatUi = (floatHost && (e.target === floatHost || floatHost.contains(e.target))) || isOwnUi(e.target);
+  const inFloatUi = (floatHost && isDomNode(e.target) && (e.target === floatHost || floatHost.contains(e.target))) || isOwnUi(e.target);
   // 文本标注 mark 与元素标注（citecat-el-hl/ul，图表等元素）都可点开浮层
   const mark = e.target.closest('mark.citecat-hl, mark.citecat-ul, .citecat-el-hl, .citecat-el-ul, [data-ann-el]');
   if (!mark) {
@@ -4581,7 +4598,8 @@ function onViewportChange() {
 }
 
 function isOwnUi(el) {
-  return el === INSPECT.host || (INSPECT.host && INSPECT.host.contains(el));
+  if (!isDomNode(el)) return false;
+  return el === INSPECT.host || !!(INSPECT.host && INSPECT.host.contains(el));
 }
 
 function onInspectHover(e) {
@@ -5187,7 +5205,7 @@ function bindCollectEvent(cb, url, title) {
       } else {
         markFail(`采集失败: ${resp.error || '未知错误'}`);
         if (resp.needsVerification) {
-          alert('Citecat 检测到人机验证。请在当前页面完成 Cloudflare / 验证码后，再重新勾选采集。');
+          alert('SuperCat 检测到人机验证。请在当前页面完成 Cloudflare / 验证码后，再重新勾选采集。');
         }
       }
     } catch (err) {

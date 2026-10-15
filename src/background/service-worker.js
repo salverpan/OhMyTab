@@ -51,7 +51,7 @@ const FEED_PREFS_KEY = 'feedPrefs';
 const RETRY_TAB_KEY = 'retryTabMap';
 
 ensureWorkspaceMigration().catch((err) => {
-  console.error('[Citecat] workspace migration failed:', err);
+  console.error('[SuperCat] workspace migration failed:', err);
 });
 
 /* ---- AI 工具打开的标签页追踪 ----
@@ -312,7 +312,7 @@ async function runPool(items, worker, concurrency) {
 async function handleTabSnapshot({ maxTabs = 20 } = {}) {
   const all = await chrome.tabs.query({});
   const candidates = all
-    // 排除浏览器内部页与其它扩展页；Citecat 阅读器页（chrome-extension://.../src/reader/index.html）
+    // 排除浏览器内部页与其它扩展页；SuperCat 阅读器页（chrome-extension://.../src/reader/index.html）
     // 例外保留——它是可读/可操作的（doc_edit/doc_review 的目标页），曾因整段排除而消失于列表
     .filter(isReadableTab)
     .slice(0, maxTabs || 20);
@@ -451,7 +451,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 
 /* 文档阅读器接管：浏览器内置 PDF viewer 是受保护扩展页面（content script
    无法注入）；Office / CSV 直链通常会变成下载，AI 也读不到正文。检测到
-   pdf/docx/doc/xlsx/xls/csv URL 时用 Citecat 阅读器打开。15 秒内同 URL 去重。 */
+   pdf/docx/doc/xlsx/xls/csv URL 时用 SuperCat 阅读器打开。15 秒内同 URL 去重。 */
 const READER_BASE = chrome.runtime.getURL('src/reader/index.html');
 const recentPdfOpens = new Map(); // url -> timestamp
 chrome.webNavigation.onCommitted.addListener((details) => {

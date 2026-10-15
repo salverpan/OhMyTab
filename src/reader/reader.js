@@ -1,5 +1,5 @@
 /**
- * Citecat 文档阅读器 —— PDF / Word (.docx / .doc) / Excel (.xlsx / .csv) 在网页中的
+ * SuperCat 文档阅读器 —— PDF / Word (.docx / .doc) / Excel (.xlsx / .csv) 在网页中的
  * 划词 / 荧光笔 / 下划线 / 片段收藏 / AI 提问。
  *
  * 浏览器内置 PDF viewer 是受保护扩展页面，content script 无法注入，
@@ -20,6 +20,7 @@ import { createRoot } from 'react-dom/client';
 import { ThinkingOrb } from 'thinking-orbs';
 import { ORB_STATE_BY_TOOL } from '../lib/orb-state.js';
 import { upsertSubagentCardEl, syncLiveTurnOrder } from '../lib/subagent-ui.js';
+import { syncInlineMedia } from '../lib/inline-media.js';
 import { attachScopeQuiz } from '../lib/scope-quiz.js';
 import { appendChartsTo, disposeChatCharts } from '../lib/chat-charts.js';
 import { upsertPlanCardEl } from '../lib/plan.js';
@@ -204,7 +205,7 @@ async function loadArrayBufferInner(name, ab, urlForAnnotations) {
   } catch (err) {
     viewerEl.innerHTML = '';
     showStatus('渲染失败：' + (err.message || String(err)), 6000);
-    console.error('[Citecat reader] render failed:', err);
+    console.error('[SuperCat reader] render failed:', err);
     return false;
   }
 }
@@ -665,8 +666,9 @@ function pickSelectionRect(range, pointer, index) {
 
 function repositionReaderBar(e) {
   const t = e && e.target;
-  if (t && chatWin && (t === chatWin || chatWin.contains(t))) return;
-  if (t && barEl && (t === barEl || barEl.contains(t))) return;
+  const node = t && typeof t.nodeType === 'number' ? t : null;
+  if (node && chatWin && (node === chatWin || chatWin.contains(node))) return;
+  if (node && barEl && (node === barEl || barEl.contains(node))) return;
   if (!barEl || barEl.style.display === 'none' || !lastRange) return;
   const picked = pickSelectionRect(lastRange, null, selRectIndex);
   if (!picked.rect || (picked.rect.width === 0 && picked.rect.height === 0)) return;
@@ -728,6 +730,7 @@ let chatContext = null;
 let chatBusy = false;
 let liveScopeQuiz = null;
 let chatStreamText = '';
+let floatPlacedImages = [];
 let chatStreamEl = null;
 
 function buildChatContext(opts) {
@@ -796,6 +799,7 @@ async function openChatWindow(opts) {
   chatHistory = [];
   chatBusy = false;
   chatStreamText = '';
+  floatPlacedImages = [];
   const body = chatWin.querySelector('.cw-body');
   body.innerHTML = '';
   chatWin.querySelector('.cw-input input').value = '';
@@ -818,7 +822,7 @@ function handleChatPortMessage(m) {
     }
     try { finishAiChunk(); }
     catch (err) {
-      console.warn('[Citecat] finish float chat failed', err);
+      console.warn('[SuperCat] finish float chat failed', err);
       chatBusy = false;
       updateSendBtn();
     }
@@ -933,7 +937,7 @@ function sendChatMessage() {
   const ai = document.createElement('div');
   ai.className = 'cw-msg ai';
   // 全程常驻：orb + 右侧 shimmer 文字一行，流式正文在下方独立容器填充（不再用竖杠光标）
-  ai.innerHTML = '<div class="cw-msg-label">Citecat</div>' +
+  ai.innerHTML = '<div class="cw-msg-label">SuperCat</div>' +
     '<div class="cw-subagents"></div>' +
     '<p class="cw-stream"></p>' +
     '<div class="cw-thinking-row"><span class="cw-thinking-orb"></span><span class="cw-thinking-text">Thinking</span></div>';
@@ -943,6 +947,7 @@ function sendChatMessage() {
   body.scrollTop = body.scrollHeight;
   chatBusy = true;
   chatStreamText = '';
+  floatPlacedImages = [];
   updateSendBtn();
   // 无响应看门狗：SW 无任何回传（chunk/tool/done/error）超时则解锁，避免按钮卡死
   armChatWatchdog();
@@ -1032,9 +1037,12 @@ function appendAiChunk(t) {
   }
   armChatWatchdog();
   chatStreamText += t;
-  chatStreamEl.textContent = chatStreamText;
   const ai = chatStreamEl.closest('.cw-msg.ai');
-  if (ai) syncLiveTurnOrder(ai, 'cw');
+  if (ai && floatPlacedImages.length) paintFloatStream(ai);
+  else {
+    chatStreamEl.textContent = chatStreamText;
+    if (ai) syncLiveTurnOrder(ai, 'cw');
+  }
   const body = chatWin?.querySelector('.cw-body');
   if (body) body.scrollTop = body.scrollHeight;
 }
@@ -1047,7 +1055,9 @@ function removeThinkingRow() {
 }
 
 function finishAiChunk() {
-  if (chatStreamEl) chatStreamEl.textContent = chatStreamText;
+  const ai = chatStreamEl && chatStreamEl.closest('.cw-msg.ai');
+  if (ai && floatPlacedImages.length) paintFloatStream(ai);
+  else if (chatStreamEl) chatStreamEl.textContent = chatStreamText;
   // 先卸 React root 再移除它的容器行（.cw-thinking-row 含 .cw-thinking-orb），
   // 否则 removeChild 抛 NotFoundError
   unmountChatOrb();
@@ -1163,28 +1173,30 @@ function renderScopeQuiz(quiz) {
   body.scrollTop = body.scrollHeight;
 }
 
+function paintFloatStream(ai) {
+  if (!ai) return;
+  const stream = syncInlineMedia(ai, chatStreamText, floatPlacedImages, {
+    streamClass: 'cw-stream',
+    streamTag: 'p',
+    pinSelector: ':scope > .cw-thinking-row',
+    renderSlice: (el, slice) => { el.textContent = slice; },
+  });
+  if (stream) chatStreamEl = stream;
+  syncLiveTurnOrder(ai, 'cw');
+}
+
 function appendFloatImage(image) {
   const body = chatWin && chatWin.querySelector('.cw-body');
   if (!body || !image || !image.dataUrl) return;
   armChatWatchdog();
   const ai = body.querySelector('.cw-msg.ai:last-of-type');
   if (!ai) return;
-  let stack = ai.querySelector('.chat-placed-images');
-  if (!stack) {
-    stack = document.createElement('div');
-    stack.className = 'chat-placed-images';
-    const before = ai.querySelector('.chat-live-charts')
-      || ai.querySelector('.cw-thinking-row')
-      || ai.querySelector('.scope-quiz-host');
-    if (before) ai.insertBefore(stack, before);
-    else ai.appendChild(stack);
-  }
-  if (stack.querySelector(`[data-placed-id="${image.id}"]`)) return;
-  const img = document.createElement('img');
-  img.dataset.placedId = image.id;
-  img.src = image.dataUrl;
-  img.alt = image.alt || '';
-  stack.appendChild(img);
+  const at = Number.isFinite(image.at) ? image.at : chatStreamText.length;
+  const next = { ...image, at };
+  const idx = floatPlacedImages.findIndex((x) => x.id === next.id);
+  if (idx >= 0) floatPlacedImages[idx] = next;
+  else floatPlacedImages.push(next);
+  paintFloatStream(ai);
   body.scrollTop = body.scrollHeight;
 }
 
@@ -1243,10 +1255,11 @@ function resetChatBody() {
   unmountChatOrb();
   chatStreamEl = null;
   chatStreamText = '';
+  floatPlacedImages = [];
   const body = chatWin.querySelector('.cw-body');
   disposeChatCharts(body);
   body.innerHTML =
-    '<div class="cw-msg ai"><div class="cw-msg-label">Citecat</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
+    '<div class="cw-msg ai"><div class="cw-msg-label">SuperCat</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
 }
 
 /* ================= 聊天窗 DOM ================= */
@@ -1522,7 +1535,7 @@ async function enterEditMode() {
   } catch (err) {
     editorHost.hidden = true;
     viewerEl.hidden = false;
-    console.error('[Citecat reader] 编辑器初始化失败:', err);
+    console.error('[SuperCat reader] 编辑器初始化失败:', err);
     showStatus('编辑器打开失败: ' + (err.message || String(err)), 6000);
   }
 }
@@ -1552,7 +1565,7 @@ async function exitEditMode(confirmIfDirty = true) {
     try {
       await loadArrayBuffer(docTitle, currentAb, docUrl);
     } catch (err) {
-      console.error('[Citecat reader] 退出编辑后重渲染失败:', err);
+      console.error('[SuperCat reader] 退出编辑后重渲染失败:', err);
     }
   }
   return true;
@@ -1641,7 +1654,7 @@ async function saveEdit() {
     showStatus('已保存：下载回本地' + (libDocId ? '，并已更新库内副本' : ''));
     return true;
   } catch (err) {
-    console.error('[Citecat reader] 保存失败:', err);
+    console.error('[SuperCat reader] 保存失败:', err);
     showStatus('保存失败: ' + (err.message || String(err)), 6000);
     return false;
   } finally {

@@ -49,6 +49,7 @@ import { aoaToXlsxBuffer, rowsFromCreateDocumentArgs } from '../lib/create-xlsx.
 import { processRoundToolCalls, buildEntriesDigest, retrieveMemories, calcRelevance, contextCompactBudget, isContextOverflowError, HISTORY_KEEP_TAIL_TOKENS } from '../lib/chat-executor.js';
 import { listAgents, parseAgentMentions, formatAgentCatalog, serializeSubagentSessions, restoreSubagentSessions, validateCustomAgent, BUILTIN_AGENTS } from '../lib/subagent.js';
 import { subagentListHtml, upsertSubagentCardEl, syncLiveTurnOrder } from '../lib/subagent-ui.js';
+import { syncInlineMedia, timelineParts } from '../lib/inline-media.js';
 import { attachScopeQuiz } from '../lib/scope-quiz.js';
 import { chartHostHtml, mountChatCharts, disposeChatCharts, appendChartInMessage, rasterizeChartOption } from '../lib/chat-charts.js';
 import { loadConnectors, saveConnectors, formatApiCatalog, API_PRESETS, executeApiCall } from '../lib/api-call.js';
@@ -99,7 +100,7 @@ function setThinkingText(text, isError) {
 
 function unmountThinkingOrb() {
   if (orbRoot) {
-    try { orbRoot.unmount(); } catch (err) { console.warn('[Citecat] orb unmount failed:', err); }
+    try { orbRoot.unmount(); } catch (err) { console.warn('[SuperCat] orb unmount failed:', err); }
     orbRoot = null;
   }
 }
@@ -124,7 +125,7 @@ function mountToolOrb(bubbleEl, state) {
 
 function unmountToolOrb() {
   if (toolOrbRoot) {
-    try { toolOrbRoot.unmount(); } catch (err) { console.warn('[Citecat] tool orb unmount failed:', err); }
+    try { toolOrbRoot.unmount(); } catch (err) { console.warn('[SuperCat] tool orb unmount failed:', err); }
     toolOrbRoot = null;
   }
   if (toolOrbEl) {
@@ -196,11 +197,12 @@ const toolCtx = {
   set pendingImages(v) { pendingImages = Array.isArray(v) ? v : []; },
   onImage: (image) => {
     const last = chatMessages[chatMessages.length - 1];
-    if (last && last.role === 'ai') {
-      last.images = [...(last.images || []).filter((x) => x.id !== image.id), image];
-    }
-    if (!activeAiBubbleEl) return;
-    appendPlacedImageInMessage(activeAiBubbleEl, image);
+    if (!last || last.role !== 'ai') return;
+    stampImageOnMessage(last, image);
+    if (!activeAiBubbleEl || !activeAiBubbleEl.isConnected) return;
+    const stream = layoutBubbleImages(activeAiBubbleEl, last.text || '', last.images || []);
+    if (stream) streamBodyEl = stream;
+    syncLiveTurnOrder(activeAiBubbleEl, 'chat');
     if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   },
   onChart: (chart) => {
@@ -338,31 +340,30 @@ function stampPendingImagesOn(msg, run) {
   }
 }
 
-function appendPlacedImageInMessage(bubbleEl, image) {
-  if (!bubbleEl || !image || !image.dataUrl) return;
-  let stack = bubbleEl.querySelector('.chat-placed-images');
-  if (!stack) {
-    stack = document.createElement('div');
-    stack.className = 'chat-placed-images';
-    const before = bubbleEl.querySelector('.chat-live-charts') || bubbleEl.querySelector('.scope-quiz-host');
-    if (before) bubbleEl.insertBefore(stack, before);
-    else bubbleEl.appendChild(stack);
-  }
-  if (stack.querySelector(`[data-placed-id="${image.id}"]`)) return;
-  const img = document.createElement('img');
-  img.dataset.placedId = image.id;
-  img.src = image.dataUrl;
-  img.alt = image.alt || '';
-  stack.appendChild(img);
+function stampImageOnMessage(msg, image) {
+  if (!msg || msg.role !== 'ai' || !image) return image;
+  const at = Number.isFinite(image.at) ? image.at : (msg.text || '').length;
+  const next = { ...image, at };
+  msg.images = [...(msg.images || []).filter((x) => x.id !== next.id), next];
+  return next;
 }
 
-function chatPlacedImagesHtml(msg) {
-  if (!msg || !msg.images || !msg.images.length) return '';
-  const imgs = msg.images
-    .filter((x) => x && x.dataUrl)
-    .map((x) => `<img data-placed-id="${escAttr(x.id)}" src="${escAttr(x.dataUrl)}" alt="${escAttr(x.alt || '')}">`)
-    .join('');
-  return imgs ? `<div class="chat-placed-images">${imgs}</div>` : '';
+function layoutBubbleImages(bubbleEl, text, images) {
+  if (!bubbleEl) return null;
+  return syncInlineMedia(bubbleEl, text || '', images || [], {
+    streamClass: 'chat-stream-body',
+    streamTag: 'div',
+    pinSelector: ':scope > .chat-ai-row',
+    renderSlice: (el, slice) => { el.innerHTML = slice ? renderChatText(slice) : ''; },
+  });
+}
+
+function chatTextWithImagesHtml(msg) {
+  return timelineParts((msg && msg.text) || '', msg && msg.images).map((part) => {
+    if (part.kind === 'text') return part.text ? renderChatText(part.text) : '';
+    const x = part.image;
+    return `<img class="chat-placed-image" data-placed-id="${escAttr(x.id)}" src="${escAttr(x.dataUrl)}" alt="${escAttr(x.alt || '')}">`;
+  }).join('');
 }
 
 /* ---- 任务清单卡（单实例：数据上只留最新一条 AI 消息的 plan 字段，DOM 上只留一张卡）---- */
@@ -442,18 +443,14 @@ function finalizeLiveAiBubble(bubbleEl, lastMsg, { fullText = '', interrupted = 
   if (!bubbleEl) return;
   const think = bubbleEl.querySelector(':scope > .chat-ai-row');
   if (think) think.remove();
-  const stream = bubbleEl.querySelector(':scope > .chat-stream-body');
-  if (stream && fullText) stream.innerHTML = renderChatText(fullText);
   stampPendingChartsOn(lastMsg);
   stampPendingImagesOn(lastMsg);
+  layoutBubbleImages(bubbleEl, (lastMsg && lastMsg.text) || fullText || '', (lastMsg && lastMsg.images) || []);
   if (lastMsg && lastMsg.charts && lastMsg.charts.length) {
     const have = new Set([...bubbleEl.querySelectorAll('[data-chart-id]')].map((el) => el.getAttribute('data-chart-id')));
     for (const chart of lastMsg.charts) {
       if (chart && chart.id && !have.has(chart.id)) appendChartInMessage(bubbleEl, chart);
     }
-  }
-  if (lastMsg && lastMsg.images && lastMsg.images.length) {
-    for (const image of lastMsg.images) appendPlacedImageInMessage(bubbleEl, image);
   }
   if (interrupted && !bubbleEl.querySelector('.msg-interrupted')) {
     bubbleEl.insertAdjacentHTML('beforeend', '<div class="msg-interrupted">(已中断)</div>');
@@ -1418,7 +1415,7 @@ async function saveChatSession(pid = currentProject) {
     }
     await chrome.storage.local.set({ [chatSessionKey(pid)]: payload });
   } catch (err) {
-    console.warn('[Citecat] save chat session failed:', err.message);
+    console.warn('[SuperCat] save chat session failed:', err.message);
   }
 }
 
@@ -1795,11 +1792,18 @@ function paintStream(run, fullText) {
   if (last && last.role === 'ai') last.text = fullText;
   if (!viewing(run)) return;
   liveTurnText = fullText;
-  const el = run.streamBodyEl;
-  if (!el || !el.isConnected) return;
-  streamBodyEl = el;
-  el.innerHTML = renderChatText(fullText);
-  if (run.bubbleEl && run.bubbleEl.isConnected) syncLiveTurnOrder(run.bubbleEl, 'chat');
+  const bubble = run.bubbleEl;
+  if (bubble && bubble.isConnected) {
+    const stream = layoutBubbleImages(bubble, fullText, (last && last.images) || []);
+    if (stream) {
+      run.streamBodyEl = stream;
+      streamBodyEl = stream;
+    }
+    syncLiveTurnOrder(bubble, 'chat');
+  } else if (run.streamBodyEl && run.streamBodyEl.isConnected) {
+    streamBodyEl = run.streamBodyEl;
+    run.streamBodyEl.innerHTML = renderChatText(fullText);
+  } else return;
   if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   const nowTs = Date.now();
   if (nowTs - (run.lastLiveMeterAt || 0) > 700) {
@@ -1835,13 +1839,13 @@ function reattachLiveTurn(run) {
     if (card) upsertSubagentCardEl(bubbleEl, card, 'chat');
   }
   run.bubbleEl = bubbleEl;
-  run.streamBodyEl = bubbleEl.querySelector('.chat-stream-body');
   run.thinkingTextEl = bubbleEl.querySelector('.chat-thinking-text');
   run.activeAiBubbleEl = bubbleEl;
-  streamBodyEl = run.streamBodyEl;
   thinkingTextEl = run.thinkingTextEl;
   activeAiBubbleEl = bubbleEl;
-  if (run.streamBodyEl && text) run.streamBodyEl.innerHTML = renderChatText(text);
+  run.streamBodyEl = layoutBubbleImages(bubbleEl, text, (last && last.images) || [])
+    || bubbleEl.querySelector('.chat-stream-body');
+  streamBodyEl = run.streamBodyEl;
   mountThinkingOrb(bubbleEl.querySelector('.chat-thinking-orb'));
   if (run.thinkingLabel) setThinkingText(run.thinkingLabel, false);
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
@@ -1907,13 +1911,17 @@ function makeRunCtx(run) {
     },
     onImage: (image) => {
       const last = run.messages[run.messages.length - 1];
-      if (last && last.role === 'ai') {
-        last.images = [...(last.images || []).filter((x) => x.id !== image.id), image];
-      }
+      if (!last || last.role !== 'ai') return;
+      stampImageOnMessage(last, image);
       if (!viewing(run)) return;
       const bubble = run.activeAiBubbleEl;
       if (!bubble || !bubble.isConnected) return;
-      appendPlacedImageInMessage(bubble, image);
+      const stream = layoutBubbleImages(bubble, last.text || '', last.images || []);
+      if (stream) {
+        run.streamBodyEl = stream;
+        streamBodyEl = stream;
+      }
+      syncLiveTurnOrder(bubble, 'chat');
       if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
     },
     onChart: (chart) => {
@@ -2781,9 +2789,9 @@ async function sendChatMessage(text, opts = {}) {
         const undos = [...run.toolUndos];
         run.toolUndos = [];
         toolUndos = run.toolUndos;
-        console.log(`[Citecat] undo toast shown: ${count} 项可撤销`);
+        console.log(`[SuperCat] undo toast shown: ${count} 项可撤销`);
         showUndoToast(`已执行 ${count} 项操作`, async () => {
-          console.log('[Citecat] undo clicked, steps:', undos.length);
+          console.log('[SuperCat] undo clicked, steps:', undos.length);
           let undoFailed = false;
           for (const fn of undos.reverse()) {
             try { await fn(); } catch (err) {
@@ -2791,7 +2799,7 @@ async function sendChatMessage(text, opts = {}) {
               console.error('undo step failed:', err);
             }
           }
-          console.log('[Citecat] undo steps done, refreshing...');
+          console.log('[SuperCat] undo steps done, refreshing...');
           try {
             const fresh = await getEntries(run.pid);
             run.entries = fresh;
@@ -2802,7 +2810,7 @@ async function sendChatMessage(text, opts = {}) {
             }
           } catch (err) {
             undoFailed = true;
-            console.error('[Citecat] undo refresh failed:', err);
+            console.error('[SuperCat] undo refresh failed:', err);
           }
           if (undoFailed) showToast('撤销部分失败', true);
         });
@@ -3081,13 +3089,13 @@ function renderChat() {
       const sg = m.subagentFollowup ? `<div class="chat-hb-tag">后台任务完成</div>` : '';
       return `<div class="chat-msg user${m.heartbeat ? ' heartbeat' : ''}${m.subagentFollowup ? ' subagent-followup' : ''}${last}" data-msg-idx="${i}">${hb}${sg}${renderMsgThumbs(m.attachments)}${escHtml(m.text)}</div>`;
     }
-    const text = renderChatText(m.text);
+    const text = chatTextWithImagesHtml(m);
     const chips = (m.suggestions && m.suggestions.actions && m.suggestions.actions.length > 0)
       ? renderSuggestionChips(m.suggestions) : '';
     const quizHost = m.scopeQuiz ? '<div class="scope-quiz-host"></div>' : '';
     const cards = subagentListHtml(m.subagents, 'chat');
     const body = m.flow === 'text-first' ? `${text}${cards}` : `${cards}${text}`;
-    return `<div class="chat-msg ai${last}" data-msg-idx="${i}">${body}${chatPlacedImagesHtml(m)}${chatChartsHtml(m)}${chatDocEditsHtml(m)}${chatPlanHtml(m)}${chips}${quizHost}${cost}</div>`;
+    return `<div class="chat-msg ai${last}" data-msg-idx="${i}">${body}${chatChartsHtml(m)}${chatDocEditsHtml(m)}${chatPlanHtml(m)}${chips}${quizHost}${cost}</div>`;
   }).join('');
   if (chatQueue.length > 0) chatQueue.forEach((q) => appendQueuedBubble(q.id, q.text));
   if (chatMessagesEl) {
@@ -3128,7 +3136,7 @@ if (chatExportBtn) {
       return;
     }
     const dump = {
-      app: 'Citecat',
+      app: 'SuperCat',
       schema: 'citecat-session/v1',
       project: currentProject,
       exportedAt: new Date().toISOString(),
@@ -3141,7 +3149,7 @@ if (chatExportBtn) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `citecat-session-${currentProject}-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `supercat-session-${currentProject}-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   });
@@ -3486,7 +3494,7 @@ async function refreshEntriesAndRender() {
     render();
   } catch (err) {
     // 刷新的任何异常都打日志：静默吞错会让"入库不显示/删除还在"无迹可查
-    console.error('[Citecat] refreshEntriesAndRender failed:', err);
+    console.error('[SuperCat] refreshEntriesAndRender failed:', err);
   }
 }
 
@@ -3593,20 +3601,20 @@ bindLicenseGate();
 
 async function init() {
   await applyLicenseGate().catch((err) => {
-    console.warn('[Citecat] license gate failed:', err);
+    console.warn('[SuperCat] license gate failed:', err);
     document.body.classList.remove('license-pending');
     document.body.classList.add('license-locked');
     const gate = document.getElementById('licenseGate');
     if (gate) gate.hidden = false;
   });
   await ensureWorkspaceMigration().catch((err) => {
-    console.error('[Citecat] workspace migration failed:', err);
+    console.error('[SuperCat] workspace migration failed:', err);
   });
   await loadProjects();
   try {
     await initWorkspaceUi();
   } catch (err) {
-    console.error('[Citecat] workspace init failed:', err);
+    console.error('[SuperCat] workspace init failed:', err);
   }
   // 渠道系统初始化：首次运行把旧配置合成「默认」渠道；聊天头部触发按钮 + 弹出菜单
   try {
@@ -3630,7 +3638,7 @@ async function init() {
         }
       });
     }
-  } catch (err) { console.warn('[Citecat] channel init failed:', err); }
+  } catch (err) { console.warn('[SuperCat] channel init failed:', err); }
   chrome.storage.local.remove(['visionConfig', 'visionProbeCache', 'visionProbeCacheVer']).catch(() => {});
   entries = await getEntries(currentProject);
   await loadChatSession(); // 恢复当前项目的对话（关面板/SW 重启不丢）
@@ -3651,7 +3659,7 @@ async function updateTemplateBadge() {
 }
 
 function render() {
-  workspaceApi?.refresh().catch((err) => console.error('[Citecat] workspace refresh failed:', err));
+  workspaceApi?.refresh().catch((err) => console.error('[SuperCat] workspace refresh failed:', err));
   updateToolbar();
 }
 
@@ -4290,6 +4298,7 @@ if (ratioObserved && typeof ResizeObserver !== 'undefined') {
 window.addEventListener('resize', () => {
   refreshSliderPosition();
   scheduleSideRatioAuto();
+  placeSettingsTabPill();
 });
 if (typeof ResizeObserver !== 'undefined') {
   const tabBarEl = document.getElementById('tabBar');
@@ -4521,7 +4530,7 @@ function renderProjects() {
       await chrome.storage.sync.set({ projects });
       // 先留快照再清（原件字节超过上限时只恢复记录，见 project-purge.js）
       const snap = await purgeProject(id).catch((err) => {
-        console.error('[Citecat] purgeProject failed:', err);
+        console.error('[SuperCat] purgeProject failed:', err);
         return null;
       });
       if (wasCurrent) {
@@ -4719,6 +4728,7 @@ async function initSettings() {
   }
 
   bindSettingsEvents();
+  requestAnimationFrame(placeSettingsTabPill);
   renderMemoryList();
   renderSubagentSettings();
 }
@@ -5169,9 +5179,19 @@ function syncApiAuthFields() {
   if (query) query.hidden = t !== 'query';
 }
 
+function parkApiEditor() {
+  const ed = document.getElementById('apiConnectorEditor');
+  const actions = document.getElementById('addApiConnectorBtn')?.closest('.form-actions');
+  if (ed && actions) actions.insertAdjacentElement('afterend', ed);
+  return ed;
+}
+
 async function renderApiConnectors() {
   const listEl = document.getElementById('apiConnectorList');
   if (!listEl) return;
+  const ed = parkApiEditor();
+  const keepOpen = !!(ed && !ed.hidden && editingApiConnectorId);
+  const keepId = editingApiConnectorId;
   const list = await loadConnectors();
   if (!list.length) {
     listEl.innerHTML = '<p style="font-size:12px;color:var(--muted);margin:0">尚未保存。免费无需 Key 的接口也可以保存，用来提醒 AI 有这条渠道。</p>';
@@ -5180,21 +5200,33 @@ async function renderApiConnectors() {
   listEl.innerHTML = list.map((c) => {
     const free = c.authType === 'none' && !c.apiKey;
     const meta = `${free ? '免费' : c.authType}${c.allowWrite ? ' · 可写' : ' · 只读'}`;
-    return `<div class="channel-row">`
+    const editing = keepOpen && c.id === keepId;
+    return `<div class="channel-row${editing ? ' active' : ''}" data-id="${escAttr(c.id)}">`
       + `<div class="channel-row-main"><span class="channel-name">${escHtml(c.name)}</span>`
       + `<span class="channel-meta">${escHtml((c.baseUrl || '').replace(/^https?:\/\//, ''))} · ${escHtml(meta)}</span></div>`
       + `<div class="channel-row-actions">`
-      + `<button class="channel-icon-btn" data-api-act="edit" data-id="${escAttr(c.id)}" title="编辑" aria-label="编辑">${PENCIL_SVG}</button>`
-      + `<button class="channel-icon-btn is-danger" data-api-act="del" data-id="${escAttr(c.id)}" data-name="${escAttr(c.name)}" title="删除" aria-label="删除">${TRASH_SVG}</button>`
+      + `<button type="button" class="channel-icon-btn" data-api-act="edit" data-id="${escAttr(c.id)}" title="编辑" aria-label="编辑">${PENCIL_SVG}</button>`
+      + `<button type="button" class="channel-icon-btn is-danger" data-api-act="del" data-id="${escAttr(c.id)}" data-name="${escAttr(c.name)}" title="删除" aria-label="删除">${TRASH_SVG}</button>`
       + '</div></div>';
   }).join('');
+  if (keepOpen && ed) {
+    const row = [...listEl.querySelectorAll('.channel-row')].find((el) => el.dataset.id === keepId);
+    if (row) row.insertAdjacentElement('afterend', ed);
+  }
 }
 
-function openApiEditor(conn) {
+function openApiEditor(conn, place) {
   const ed = document.getElementById('apiConnectorEditor');
   if (!ed) return;
   ed.hidden = false;
   editingApiConnectorId = conn && conn.id ? conn.id : null;
+  const listEl = document.getElementById('apiConnectorList');
+  const anchor = place && place.anchor;
+  if (anchor) anchor.insertAdjacentElement('afterend', ed);
+  else if (place && place.afterAdd) parkApiEditor();
+  listEl?.querySelectorAll('.channel-row').forEach((row) => {
+    row.classList.toggle('active', row === anchor);
+  });
   const nameEl = document.getElementById('apiConnName');
   const baseEl = document.getElementById('apiConnBase');
   const authEl = document.getElementById('apiConnAuth');
@@ -5220,6 +5252,10 @@ function openApiEditor(conn) {
   if (writeEl) writeEl.checked = !!conn?.allowWrite;
   if (notesEl) notesEl.value = conn?.notes || '';
   syncApiAuthFields();
+  const editStatus = document.getElementById('apiConnEditStatus');
+  if (editStatus) { editStatus.textContent = ''; editStatus.className = 'status-msg'; }
+  ed.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  nameEl?.focus({ preventScroll: true });
 }
 
 function fillApiPreset(p) {
@@ -6071,9 +6107,94 @@ async function saveCustomSubagentFromForm() {
   renderSubagentSettings();
 }
 
+const SETTINGS_TABS = [
+  { id: 'talk', label: '对话' },
+  { id: 'feed', label: '订阅' },
+  { id: 'look', label: '界面' },
+  { id: 'keep', label: '维护' },
+];
+const SETTINGS_PANE_KEY = 'citecat.settingsPane';
+const settingsPaneScroll = new Map();
+
+function readSettingsPane() {
+  try {
+    const id = sessionStorage.getItem(SETTINGS_PANE_KEY);
+    if (SETTINGS_TABS.some((t) => t.id === id)) return id;
+  } catch (_) { /* 侧栏被限制存储时退回第一页 */ }
+  return SETTINGS_TABS[0].id;
+}
+
+function placeSettingsTabPill() {
+  const bar = document.getElementById('settingsTabBar');
+  const pill = document.getElementById('settingsTabPill');
+  const active = bar && bar.querySelector('.settings-tab.active');
+  if (!bar || !pill || !active || !active.offsetWidth) return;
+  pill.style.width = active.offsetWidth + 'px';
+  pill.style.transform = 'translateX(' + active.offsetLeft + 'px)';
+}
+
+function showSettingsPane(id) {
+  if (!SETTINGS_TABS.some((t) => t.id === id)) id = SETTINGS_TABS[0].id;
+  const root = document.getElementById('panelSettings');
+  if (!root) return;
+  const scroller = root.querySelector('.settings-inner');
+  const current = root.querySelector('.settings-pane:not([hidden])');
+  const same = !!(current && current.dataset.settingsPane === id);
+  if (!same && scroller && current) {
+    settingsPaneScroll.set(current.dataset.settingsPane, scroller.scrollTop);
+  }
+  root.querySelectorAll('.settings-tab').forEach((btn) => {
+    const on = btn.dataset.settingsPane === id;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    btn.tabIndex = on ? 0 : -1;
+  });
+  root.querySelectorAll('.settings-pane').forEach((pane) => {
+    pane.hidden = pane.dataset.settingsPane !== id;
+  });
+  try { sessionStorage.setItem(SETTINGS_PANE_KEY, id); } catch (_) {}
+  if (scroller && !same) scroller.scrollTop = settingsPaneScroll.get(id) || 0;
+  placeSettingsTabPill();
+}
+
+function mountSettingsTabs() {
+  const bar = document.getElementById('settingsTabBar');
+  if (!bar || bar.dataset.ready) return;
+  bar.dataset.ready = '1';
+  bar.innerHTML = '<span class="settings-tab-pill" id="settingsTabPill" aria-hidden="true"></span>'
+    + SETTINGS_TABS.map((t) =>
+      `<button type="button" class="settings-tab" role="tab" data-settings-pane="${t.id}" aria-selected="false" tabindex="-1">${t.label}</button>`
+    ).join('');
+  bar.addEventListener('click', (e) => {
+    const tab = e.target.closest('.settings-tab');
+    if (!tab || !bar.contains(tab)) return;
+    showSettingsPane(tab.dataset.settingsPane);
+  });
+  bar.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const tabs = [...bar.querySelectorAll('.settings-tab')];
+    const i = tabs.findIndex((b) => b.classList.contains('active'));
+    if (i < 0) return;
+    const dir = e.key === 'ArrowRight' ? 1 : -1;
+    const next = tabs[(i + dir + tabs.length) % tabs.length];
+    e.preventDefault();
+    showSettingsPane(next.dataset.settingsPane);
+    next.focus();
+  });
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(placeSettingsTabPill).observe(bar);
+  }
+  showSettingsPane(readSettingsPane());
+}
+
+// 设置面板此时还是 display:none，滑块等打开后再量。先把标签画上，避免等数据时出现空轨道。
+mountSettingsTabs();
+
 function bindSettingsEvents() {
   if (settingsEventsBound) return;
   settingsEventsBound = true;
+
+  mountSettingsTabs();
 
   // AI Memory: clear all
   const clearMemBtn = document.getElementById('clearMemoryBtn');
@@ -6280,7 +6401,7 @@ function bindSettingsEvents() {
   bindSearchChannelEvents();
 
   document.getElementById('addApiConnectorBtn')?.addEventListener('click', () => {
-    openApiEditor(null);
+    openApiEditor(null, { afterAdd: true });
     showSettingsStatus('apiConnectorStatus', '', '');
   });
   document.getElementById('apiConnAuth')?.addEventListener('change', syncApiAuthFields);
@@ -6294,6 +6415,8 @@ function bindSettingsEvents() {
     const ed = document.getElementById('apiConnectorEditor');
     if (ed) ed.hidden = true;
     editingApiConnectorId = null;
+    document.getElementById('apiConnectorList')?.querySelectorAll('.channel-row.active')
+      .forEach((row) => row.classList.remove('active'));
   });
   document.getElementById('testApiConnectorBtn')?.addEventListener('click', async () => {
     const saved = await persistApiEditor();
@@ -6309,7 +6432,14 @@ function bindSettingsEvents() {
     if (!btn) return;
     const list = await loadConnectors();
     const hit = list.find((c) => c.id === btn.dataset.id);
-    if (btn.dataset.apiAct === 'edit' && hit) openApiEditor(hit);
+    if (btn.dataset.apiAct === 'edit') {
+      if (!hit) {
+        showSettingsStatus('apiConnectorStatus', '找不到这条连接', 'error');
+        return;
+      }
+      openApiEditor(hit, { anchor: btn.closest('.channel-row') });
+      return;
+    }
     if (btn.dataset.apiAct === 'del') {
       if (!confirm(`删除 API 连接「${btn.dataset.name}」？`)) return;
       await saveConnectors(list.filter((c) => c.id !== btn.dataset.id));

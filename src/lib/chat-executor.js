@@ -442,7 +442,7 @@ export async function executeBrowserAct(args, ctx = {}) {
   if (resolved.error) return resolved.error;
   const tab = resolved.tab;
   if (isReaderPage(tab.url)) {
-    return '这是 Citecat 文档阅读器（扩展内页），不能 browser_act。改已入库的 docx/xlsx 用 doc_edit；读正文用 read_current_page 或 read_tab。';
+    return '这是 SuperCat 文档阅读器（扩展内页），不能 browser_act。改已入库的 docx/xlsx 用 doc_edit；读正文用 read_current_page 或 read_tab。';
   }
   if (isBrowserInternalUrl(tab.url)) {
     return `该标签页是浏览器内部页面，无法操作。`;
@@ -455,7 +455,7 @@ export async function executeBrowserAct(args, ctx = {}) {
     await chrome.tabs.update(tab.id, { url: dest });
     await waitForTabLoad(tab.id, 15000);
     if (dest !== url) {
-      return '该链接是文档文件，已在 Citecat 阅读器打开，用 read_tab 读正文。browser_act 不能操作阅读器内页。';
+      return '该链接是文档文件，已在 SuperCat 阅读器打开，用 read_tab 读正文。browser_act 不能操作阅读器内页。';
     }
     const snap = await sendLoopMessage(tab.id, { action: 'loop_observe' });
     rememberLoopFingerprint(ctx, tab.id, snap);
@@ -832,7 +832,7 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
     const valError = tc.parseError || validateToolArgs(tc.name, tc.arguments);
     if (valError) {
       const errContent = `参数错误（未执行）: ${valError} 请修正参数后重新调用 ${tc.name}。`;
-      console.debug('[Citecat] tool arg rejected:', tc.name, valError);
+      console.debug('[SuperCat] tool arg rejected:', tc.name, valError);
       hooks.argError?.(label);
       logToolCall({ ctx, name: tc.name, args: tc.arguments, rejected: true, error: '参数错误', durationMs: Date.now() - t0 });
       return { content: errContent, history: errContent, write: false };
@@ -868,7 +868,7 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
       ctx._viewportShot = null;
       ctx._viewportShotNote = '';
     }
-    console.warn('[Citecat] tool failed:', tc.name, err);
+    console.warn('[SuperCat] tool failed:', tc.name, err);
     const errContent = `Error: ${err.message}`;
     hooks.fail?.(label);
     logToolCall({ ctx, name: tc.name, args: tc.arguments, error: err.message, durationMs: Date.now() - t0 });
@@ -967,7 +967,7 @@ export async function processRoundToolCalls({
     });
     if (slot.write) {
       try { await hooks.writeRefresh?.(slot.name || calls[i].name); }
-      catch (err) { console.warn('[Citecat] post-tool refresh failed:', calls[i].name, err); }
+      catch (err) { console.warn('[SuperCat] post-tool refresh failed:', calls[i].name, err); }
     }
   }
   commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs);
@@ -1138,7 +1138,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           }
         }
         if (isReaderPage(tab.url)) {
-          return '这是 Citecat 文档阅读器（扩展内页 chrome-extension://…/src/reader/index.html），不能 interact_page，也不用点「编辑」。改已入库的 docx/xlsx 直接 doc_edit(doc_id=库内条目 id)；读正文用 read_current_page 或 read_tab。';
+          return '这是 SuperCat 文档阅读器（扩展内页 chrome-extension://…/src/reader/index.html），不能 interact_page，也不用点「编辑」。改已入库的 docx/xlsx 直接 doc_edit(doc_id=库内条目 id)；读正文用 read_current_page 或 read_tab。';
         }
         if (!tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
           return `该标签页是浏览器内部页面，无法操作。`;
@@ -1153,7 +1153,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           await waitForTabLoad(tab.id, 15000);
           const [newTab] = await chrome.tabs.query({ active: true, currentWindow: true });
           const opened = newTab?.url || dest;
-          const hint = dest !== url ? '\n该链接是文档文件，已在 Citecat 阅读器打开，用 read_tab 读正文。' : '';
+          const hint = dest !== url ? '\n该链接是文档文件，已在 SuperCat 阅读器打开，用 read_tab 读正文。' : '';
           return `已导航到: ${opened}\n标题: ${newTab?.title || '(加载中)'}${hint}`;
         }
         if (args.action === 'go_back') {
@@ -2038,7 +2038,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           const how = tabId
             ? `用 read_tab(tab_id=${tabId}) 读全文。读完可 manage_tabs(close, tab_id=${tabId})；任务结束也会自动关掉。`
             : '现在可以用 read_tab 读取。任务结束会自动关掉这次打开的页。';
-          const note = dest !== url ? '\n该链接是文档文件，已在 Citecat 阅读器打开。' : '';
+          const note = dest !== url ? '\n该链接是文档文件，已在 SuperCat 阅读器打开。' : '';
           return `已打开${background ? '后台' : ''}标签页${tabId ? ` #${tabId}` : ''}: ${(tab && tab.title) || '(加载中)'}\nURL: ${dest}\n${how}${note}`;
         }
         if (action === 'close') {

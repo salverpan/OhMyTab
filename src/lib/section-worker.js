@@ -113,7 +113,7 @@ export async function runSectionJob(args = {}, ctx = {}) {
     {
       role: 'system',
       content:
-        '你是 Citecat 的无状态章节抽取 Worker。只处理给定原文，不得使用外部知识。'
+        '你是 SuperCat 的无状态章节抽取 Worker。只处理给定原文，不得使用外部知识。'
         + '完成时必须调用 submit_report：actions=[]；每条 claim 的 evidence 必须使用系统给定 doc_id、anchor，并从原文逐字复制 quote。'
         + '每条 claim 写 attribution（原文里最初说这话的主体）与 modality；当事方说法用 claimed、转述用 reported，不要写成 confirmed。'
         + '原文没有直接支持的内容放 unresolved。给你的原文可能只是文件中的一段，只抽取这一段，不要声称文件到此结束。不要输出长篇正文。',

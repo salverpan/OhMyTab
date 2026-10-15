@@ -881,7 +881,7 @@ const CHAT_TOOLS = [
           },
           url: {
             type: 'string',
-            description: 'open 时的目标 URL。若是 PDF / Word / Excel / CSV / Markdown / 纯文本文件链接，会在 Citecat 阅读器中打开，随后用 read_tab 读正文。',
+            description: 'open 时的目标 URL。若是 PDF / Word / Excel / CSV / Markdown / 纯文本文件链接，会在 SuperCat 阅读器中打开，随后用 read_tab 读正文。',
           },
         },
         required: ['action'],

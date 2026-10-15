@@ -432,7 +432,7 @@ export function createWorkspaceView(opts) {
         if (host) mountChart(host, c.option);
       }
       const tlHost = els.previewBody.querySelector('#wsTimeline');
-      if (tlHost) timeline.mount(tlHost).catch((err) => console.warn('[Citecat] timeline render failed:', err));
+      if (tlHost) timeline.mount(tlHost).catch((err) => console.warn('[SuperCat] timeline render failed:', err));
       return;
     }
 
@@ -669,7 +669,7 @@ export function createWorkspaceView(opts) {
           note: r.kind === 'note' ? r.note : undefined,
         })),
       };
-      downloadText(JSON.stringify(payload, null, 2), `Citecat_工作区_${stamp}.json`, 'application/json;charset=utf-8');
+      downloadText(JSON.stringify(payload, null, 2), `SuperCat_工作区_${stamp}.json`, 'application/json;charset=utf-8');
       return;
     }
 
@@ -682,7 +682,7 @@ export function createWorkspaceView(opts) {
           r.title, r.badge, r.subtitle || '', rowSourceText(r), formatTime(r.updatedAt),
         ].map(quote).join(','));
       }
-      downloadText(`\uFEFF${lines.join('\n')}`, `Citecat_摘要清单_${stamp}.csv`, 'text/csv;charset=utf-8');
+      downloadText(`\uFEFF${lines.join('\n')}`, `SuperCat_摘要清单_${stamp}.csv`, 'text/csv;charset=utf-8');
       return;
     }
 
@@ -696,7 +696,7 @@ export function createWorkspaceView(opts) {
         sections.push(`## ${r.title}\n\n${source ? `来源：${source}\n\n` : ''}${rowBody(r)}`);
       }
     }
-    downloadText(sections.join('\n\n---\n\n'), `Citecat_工作区_${stamp}.md`, 'text/markdown;charset=utf-8');
+    downloadText(sections.join('\n\n---\n\n'), `SuperCat_工作区_${stamp}.md`, 'text/markdown;charset=utf-8');
   }
 
   function closeExportMenus() {

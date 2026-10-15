@@ -1,6 +1,6 @@
 /**
  * 子代理运行时 —— 对齐 OpenCode Task / Claude Code Agent / Codex spawn / Pi AgentSession
- * 的共识，收口到 Citecat 浏览器场景：
+ * 的共识，收口到 SuperCat 浏览器场景：
  *
  * - 父代理通过 `task` 工具派活；子代理独立消息数组，只把摘要交回父上下文
  * - 内置 explore（只读调研）/ general（可写多步）/ browser（页面自动化）
@@ -143,7 +143,7 @@ async function memoriesBlockForChild(prompt, ctx) {
 
 function childSystemPrompt(agent, maxTabs = SUBAGENT_MAX_TABS) {
   return [
-    `你是 Citecat 的「${agent.name}」子代理。不要扮演对用户说话的主助手。`,
+    `你是 SuperCat 的「${agent.name}」子代理。不要扮演对用户说话的主助手。`,
     '禁止调用 task。禁止 clear_context / suggest_actions / ask_research_scope / manage_heartbeat / save_memory。',
     '经验记忆只读：系统会按当前页与任务自动注入相关条目（如有）。不要调用 save_memory；值得记的经验写进给父代理的报告即可。',
     `标签预算：同时最多打开 ${maxTabs} 个标签页。读完不需要的先 manage_tabs(close, tab_id) 关掉再开新的——读过的内容仍在你的上下文里，不必为留着标签而占额度。`,

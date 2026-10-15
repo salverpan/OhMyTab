@@ -5,7 +5,7 @@
  *   解压后只改 word/document.xml 的目标节点，其余条目（styles/numbering/页眉页脚/
  *   媒体/设置）字节原样保留，未动区域 100% 保真（字体/字号/颜色/版式/图片全在）。
  *
- * 审阅修订直接生成 OOXML 原生痕迹（w:ins / w:del，作者 "Citecat AI"），
+ * 审阅修订直接生成 OOXML 原生痕迹（w:ins / w:del，作者 "SuperCat"），
  * 保存后用 Word/WPS 打开即进入修订模式逐条接受/拒绝；note 以原生批注
  * （comments.xml）锚定在修订处，Word 侧可见。
  *
@@ -27,7 +27,7 @@ const XmlSerializer = typeof XMLSerializer !== 'undefined' ? XMLSerializer : Xml
 const docRef = typeof document !== 'undefined' ? document : null;
 
 const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-const AUTHOR = 'Citecat';
+const AUTHOR = 'SuperCat';
 const INITIALS = 'CC';
 const XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 const UNDO_CAP = 30;

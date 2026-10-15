@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Citecat</title>
+  <title>SuperCat</title>
   <link rel="icon" href="../../icon/logo.png" type="image/png">
   <script src="../lib/theme-boot.js"></script>
   <link rel="stylesheet" href="style.css">
@@ -48,7 +48,7 @@
           <div id="commandBar" class="command-bar">
             <div class="cmd-input-wrap">
               <div id="cmdAttachChips" class="cmd-attach-chips" hidden></div>
-              <textarea id="cmdInput" rows="1" placeholder="戳戳 Citecat，说说想干嘛…" aria-label="指令输入框"></textarea>
+              <textarea id="cmdInput" rows="1" placeholder="戳戳 SuperCat，说说想干嘛…" aria-label="指令输入框"></textarea>
               <div id="cmdMentionMenu" class="cmd-mention-menu" hidden></div>
               <div class="cmd-composer-foot">
                 <div class="cmd-foot-left">
@@ -279,11 +279,12 @@
         </div>
       </section>
 
-      <!-- Panel 2: 设置 -->
+      <!-- Panel 2: 设置。四组：对话 / 订阅 / 界面 / 维护 -->
       <section id="panelSettings" class="panel" style="display:none" role="tabpanel" aria-labelledby="tab-btn-3">
-        <div class="settings-inner">
-          <!-- 层级原则：常开=日常高频（渠道切换/外观）；折叠=低频高级配置 -->
-          <div class="settings-section">
+        <div class="settings-tabs" id="settingsTabBar" role="tablist" aria-label="设置分类"></div>
+                <div class="settings-inner">
+          <div class="settings-pane" data-settings-pane="talk">
+<div class="settings-section">
             <h3>接入渠道</h3>
             <div id="channelList" class="channel-list"></div>
             <div class="form-actions">
@@ -330,36 +331,41 @@
               </div>
             </div>
           </div>
-
           <div class="settings-section">
-            <h3>外观</h3>
-            <div class="form-group">
-              <label for="colorSchemeSelect">颜色</label>
-              <select id="colorSchemeSelect">
-                <option value="light">白天</option>
-                <option value="dark">黑夜</option>
-                <option value="auto">自动</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="uiScaleSelect">界面缩放</label>
-              <select id="uiScaleSelect">
-                <option value="auto">自动</option>
-                <option value="0.25">25%</option><option value="0.3">30%</option><option value="0.4">40%</option>
-                <option value="0.5">50%</option><option value="0.6">60%</option><option value="0.7">70%</option>
-                <option value="0.8">80%</option><option value="0.85">85%</option><option value="0.9">90%</option>
-                <option value="0.95">95%</option><option value="1">100%</option><option value="1.05">105%</option>
-                <option value="1.1">110%</option><option value="1.15">115%</option><option value="1.2">120%</option>
-                <option value="1.3">130%</option><option value="1.4">140%</option><option value="1.5">150%</option>
-              </select>
-            </div>
-            <div class="form-actions"><span id="colorSchemeStatus" class="status-msg"></span><span id="uiScaleStatus" class="status-msg"></span></div>
-          </div>
-
-          <details class="settings-fold">
-            <summary>外部 API</summary>
-            <div class="fold-body">
-              <p style="font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 12px">保存后会出现在对话上下文里，提醒 AI 有这条渠道可调。免费、无需 Key 的也可以保存（鉴权选「无」）。有密钥的只留在本机，调用时自动注入。</p>
+            <h3>搜索</h3>
+              <div id="searchChannelList" class="channel-list"></div>
+              <div class="form-actions">
+                <button type="button" id="addSearchChannelBtn" class="btn btn-primary btn-sm">新增搜索</button>
+                <span id="searchChannelStatus" class="status-msg"></span>
+              </div>
+              <div id="searchChannelEditor" hidden>
+                <div class="form-group">
+                  <label>快速填充</label>
+                  <div id="searchPresetChips" class="preset-chips"></div>
+                </div>
+                <div class="form-group">
+                  <label for="schName">名称</label>
+                  <input type="text" id="schName" placeholder="如 Tavily 主力">
+                </div>
+                <div class="form-group" id="schKeyWrap">
+                  <label for="schApiKey">API Key</label>
+                  <input type="password" id="schApiKey" placeholder="tvly-..." autocomplete="off">
+                </div>
+                <div class="form-group" id="schBaseWrap" hidden>
+                  <label for="schBaseUrl">Base URL</label>
+                  <input type="text" id="schBaseUrl" placeholder="https://searx.example" autocomplete="off">
+                </div>
+                <p id="schHint" class="ch-model-hint"></p>
+                <div class="form-actions">
+                  <button type="button" id="saveSearchChannelBtn" class="btn btn-primary btn-sm">保存</button>
+                  <button type="button" id="testSearchChannelBtn" class="btn btn-sm">测试搜索</button>
+                  <button type="button" id="cancelSearchChannelBtn" class="btn btn-sm">取消</button>
+                  <span id="schStatus" class="status-msg"></span>
+                </div>
+              </div>
+                        </div>
+          <div class="settings-section">
+            <h3>外部 API</h3>
               <div id="apiConnectorList" class="channel-list"></div>
               <div class="form-actions">
                 <button type="button" id="addApiConnectorBtn" class="btn btn-primary btn-sm">新增连接</button>
@@ -422,54 +428,73 @@
                   <span id="apiConnEditStatus" class="status-msg"></span>
                 </div>
               </div>
-            </div>
-          </details>
-
-          <details class="settings-fold">
-            <summary>搜索与提示词</summary>
-            <div class="fold-body">
-              <p style="font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 12px">和接入渠道一样：可以保存多家搜索，点一行就是当前使用的那家。Key 只留在本机。没填 Key 会直接告诉你；其它失败会改用网页抓取。</p>
-              <div id="searchChannelList" class="channel-list"></div>
-              <div class="form-actions">
-                <button type="button" id="addSearchChannelBtn" class="btn btn-primary btn-sm">新增搜索</button>
-                <span id="searchChannelStatus" class="status-msg"></span>
-              </div>
-              <div id="searchChannelEditor" hidden>
-                <div class="form-group">
-                  <label>快速填充</label>
-                  <div id="searchPresetChips" class="preset-chips"></div>
-                </div>
-                <div class="form-group">
-                  <label for="schName">名称</label>
-                  <input type="text" id="schName" placeholder="如 Tavily 主力">
-                </div>
-                <div class="form-group" id="schKeyWrap">
-                  <label for="schApiKey">API Key</label>
-                  <input type="password" id="schApiKey" placeholder="tvly-..." autocomplete="off">
-                </div>
-                <div class="form-group" id="schBaseWrap" hidden>
-                  <label for="schBaseUrl">Base URL</label>
-                  <input type="text" id="schBaseUrl" placeholder="https://searx.example" autocomplete="off">
-                </div>
-                <p id="schHint" class="ch-model-hint"></p>
-                <div class="form-actions">
-                  <button type="button" id="saveSearchChannelBtn" class="btn btn-primary btn-sm">保存</button>
-                  <button type="button" id="testSearchChannelBtn" class="btn btn-sm">测试搜索</button>
-                  <button type="button" id="cancelSearchChannelBtn" class="btn btn-sm">取消</button>
-                  <span id="schStatus" class="status-msg"></span>
-                </div>
+                      </div>
+          <div class="settings-section">
+            <h3>子代理</h3>
+              <div class="form-group">
+                <label for="sgMaxParallel">单一批次最多子代理个数</label>
+                <input type="number" id="sgMaxParallel" min="1" max="12" step="1" placeholder="3">
               </div>
               <div class="form-group">
+                <label for="sgMaxTabs">子代理最多打开网页个数</label>
+                <input type="number" id="sgMaxTabs" min="1" max="20" step="1" placeholder="6">
+              </div>
+              <div class="form-group">
+                <label for="sgBudgetTokens">单个子代理 token 预算（0 = 不限）</label>
+                <input type="number" id="sgBudgetTokens" min="0" max="50000000" step="100000" placeholder="2000000">
+              </div>
+              <div class="form-group">
+                <label for="sgBudgetMinutes">单个子代理耗时预算（分钟，0 = 不限）</label>
+                <input type="number" id="sgBudgetMinutes" min="0" max="240" step="1" placeholder="20">
+              </div>
+              <div class="form-group">
+                <label for="sgCheckChannel">核验审查模型</label>
+                <select id="sgCheckChannel"></select>
+              </div>
+              <div class="form-actions" style="margin-bottom:14px">
+                <button type="button" id="sgLimitsSaveBtn" class="btn btn-primary btn-sm">保存限额</button>
+                <span id="sgLimitsStatus" class="status-msg"></span>
+              </div>
+              <div id="builtinAgentList" class="sg-builtin"></div>
+              <div id="customAgentList" class="sg-custom"></div>
+              <div class="form-group" style="margin-top:12px">
+                <label for="sgName">名称</label>
+                <input type="text" id="sgName" placeholder="reviewer">
+              </div>
+              <div class="form-group">
+                <label for="sgDesc">何时委派</label>
+                <input type="text" id="sgDesc" placeholder="什么时候调用这个子代理">
+              </div>
+              <div class="form-group">
+                <label for="sgPrompt">系统说明</label>
+                <textarea id="sgPrompt" rows="4" placeholder="身份与交回格式"></textarea>
+              </div>
+              <div class="form-group">
+                <label for="sgTools">工具</label>
+                <input type="text" id="sgTools" value="*" placeholder="* 或 search_web,read_tab,fetch_entry">
+              </div>
+              <div class="form-group">
+                <label for="sgChannel">渠道</label>
+                <select id="sgChannel"><option value="">跟随当前</option></select>
+              </div>
+              <div class="form-actions">
+                <button id="sgSaveBtn" class="btn btn-primary btn-sm">保存自定义子代理</button>
+                <span id="sgStatus" class="status-msg"></span>
+              </div>
+                      </div>
+          <div class="settings-section">
+            <h3>采集摘要提示词</h3>
+            <div class="form-group">
                 <label for="promptTemplate">采集摘要提示词模板</label>
                 <textarea id="promptTemplate" rows="4" spellcheck="false"></textarea>
                 <button id="resetPromptBtn" class="btn btn-sm" style="margin-top:4px">恢复默认</button>
               </div>
-            </div>
-          </details>
+          </div>
+          </div>
+          <div class="settings-pane" data-settings-pane="feed" hidden>
+          <div class="settings-section">
+            <h3>订阅刷新</h3>
 
-          <details class="settings-fold">
-            <summary>订阅与翻译</summary>
-            <div class="fold-body">
               <div class="form-group">
                 <label for="rsshubInstance">RSSHub 实例</label>
                 <input type="url" id="rsshubInstance" placeholder="https://rsshub.app 或 rsshub:twitter/user/xxx">
@@ -486,7 +511,10 @@
                 <button id="saveRefreshIntervalBtn" class="btn btn-sm">保存间隔</button>
                 <span id="refreshIntervalStatus" class="status-msg"></span>
               </div>
-              <div class="form-group">
+                        </div>
+          <div class="settings-section">
+            <h3>翻译</h3>
+<div class="form-group">
                 <label class="checkbox-label">
                   <input type="checkbox" id="feedAutoTranslate">
                   <span>新订阅源默认启用自动翻译</span>
@@ -547,23 +575,52 @@
                 <button id="retryFailedTranslationsBtn" class="btn btn-sm">重试失败条目</button>
                 <span id="feedPrefsStatus" class="status-msg"></span>
               </div>
-              <div class="form-group" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
-                <label>全文搜索索引维护</label>
-                <div class="form-actions">
-                  <button id="feedRebuildIndexBtn" class="btn btn-sm">重建全文索引</button>
-                  <span id="feedIndexStatus" class="status-msg"></span>
-                </div>
-              </div>
               <div id="translateProgressArea" class="translate-progress-area" hidden>
                 <div class="translate-progress-label" id="translateProgressLabel">准备翻译…</div>
                 <div class="translate-progress-bar"><div id="translateProgressFill" class="translate-progress-fill"></div></div>
               </div>
+                      </div>
+          <div class="settings-section">
+            <h3>采集黑名单</h3>
+              <div class="input-row">
+                <input type="text" id="newDomainInput" placeholder="example.com 或 *.example.com" aria-label="输入域名">
+                <button id="addDomainBtn" class="btn btn-primary btn-sm">添加</button>
+                <button id="addCurrentBtn" class="btn btn-sm">当前网站</button>
+              </div>
+              <textarea id="blacklistTextarea" rows="8" spellcheck="false" placeholder="每行一个域名"></textarea>
+              <div class="textarea-actions">
+                <button id="saveBlacklistBtn" class="btn btn-primary btn-sm">保存黑名单</button>
+                <span id="blacklistStatus" class="status-msg"></span>
+              </div>
+                      </div>
+          </div>
+          <div class="settings-pane" data-settings-pane="look" hidden>
+<div class="settings-section">
+            <h3>外观</h3>
+            <div class="form-group">
+              <label for="colorSchemeSelect">颜色</label>
+              <select id="colorSchemeSelect">
+                <option value="light">白天</option>
+                <option value="dark">黑夜</option>
+                <option value="auto">自动</option>
+              </select>
             </div>
-          </details>
-
-          <details class="settings-fold">
-            <summary>DOCX 导出模板 <span id="templateStatusBadge" class="template-status-badge" hidden>已就绪</span></summary>
-            <div class="fold-body">
+            <div class="form-group">
+              <label for="uiScaleSelect">界面缩放</label>
+              <select id="uiScaleSelect">
+                <option value="auto">自动</option>
+                <option value="0.25">25%</option><option value="0.3">30%</option><option value="0.4">40%</option>
+                <option value="0.5">50%</option><option value="0.6">60%</option><option value="0.7">70%</option>
+                <option value="0.8">80%</option><option value="0.85">85%</option><option value="0.9">90%</option>
+                <option value="0.95">95%</option><option value="1">100%</option><option value="1.05">105%</option>
+                <option value="1.1">110%</option><option value="1.15">115%</option><option value="1.2">120%</option>
+                <option value="1.3">130%</option><option value="1.4">140%</option><option value="1.5">150%</option>
+              </select>
+            </div>
+            <div class="form-actions"><span id="colorSchemeStatus" class="status-msg"></span><span id="uiScaleStatus" class="status-msg"></span></div>
+          </div>
+          <div class="settings-section">
+            <h3>DOCX 导出模板 <span id="templateStatusBadge" class="template-status-badge" hidden>已就绪</span></h3>
               <div id="templateDrop" class="template-drop">
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 <p>拖入或选择 DOCX</p>
@@ -585,117 +642,36 @@
                 </div>
               </div>
               <div style="margin-top:4px"><span id="templateStatus" class="status-msg"></span></div>
-            </div>
-          </details>
-
-          <details class="settings-fold">
-            <summary>采集黑名单</summary>
-            <div class="fold-body">
-              <div class="input-row">
-                <input type="text" id="newDomainInput" placeholder="example.com 或 *.example.com" aria-label="输入域名">
-                <button id="addDomainBtn" class="btn btn-primary btn-sm">添加</button>
-                <button id="addCurrentBtn" class="btn btn-sm">当前网站</button>
-              </div>
-              <textarea id="blacklistTextarea" rows="8" spellcheck="false" placeholder="每行一个域名"></textarea>
-              <div class="textarea-actions">
-                <button id="saveBlacklistBtn" class="btn btn-primary btn-sm">保存黑名单</button>
-                <span id="blacklistStatus" class="status-msg"></span>
-              </div>
-            </div>
-          </details>
-
-                    <details class="settings-fold">
-            <summary>AI 记忆</summary>
-            <div class="fold-body">
+                      </div>
+          </div>
+          <div class="settings-pane" data-settings-pane="keep" hidden>
+          <div class="settings-section">
+            <h3>AI 记忆</h3>
               <div id="memoryList" style="max-height:300px;overflow:auto;"></div>
               <div class="form-actions">
                 <button id="clearMemoryBtn" class="btn btn-sm btn-secondary">清空全部记忆</button>
                 <span id="memoryCount" class="status-msg"></span>
               </div>
+                      </div>
+          <div class="settings-section">
+            <h3>全文索引</h3>
+            <div class="form-actions">
+              <button id="feedRebuildIndexBtn" class="btn btn-sm">重建全文索引</button>
+              <span id="feedIndexStatus" class="status-msg"></span>
             </div>
-          </details>
-
-          <details class="settings-fold">
-            <summary>数据维护</summary>
-            <div class="fold-body">
-              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
+          </div>
+          <div class="settings-section is-danger">
+            <h3>清空库内容</h3>
+              <p class="settings-note">
                 清空所有项目的内容：来源、产出、文档原件、证据、笔记、标签和会话存档。保留 AI 记忆与订阅内容。清空后 4 秒内可撤销。
               </p>
               <div class="form-actions">
                 <button id="purgeAllLibraryBtn" class="btn btn-sm btn-secondary">清空所有库内容</button>
                 <span id="purgeAllStatus" class="status-msg"></span>
               </div>
-            </div>
-          </details>
-
-          <details class="settings-fold">
-            <summary>子代理</summary>
-            <div class="fold-body">
-              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
-                控制一次最多派出几个子代理，以及每个子代理同时能打开多少个网页。关掉旧页后可以再开新的。
-              </p>
-              <div class="form-group">
-                <label for="sgMaxParallel">单一批次最多子代理个数</label>
-                <input type="number" id="sgMaxParallel" min="1" max="12" step="1" placeholder="3">
-              </div>
-              <div class="form-group">
-                <label for="sgMaxTabs">子代理最多打开网页个数</label>
-                <input type="number" id="sgMaxTabs" min="1" max="20" step="1" placeholder="6">
-              </div>
-              <div class="form-group">
-                <label for="sgBudgetTokens">单个子代理 token 预算（0 = 不限）</label>
-                <input type="number" id="sgBudgetTokens" min="0" max="50000000" step="100000" placeholder="2000000">
-              </div>
-              <div class="form-group">
-                <label for="sgBudgetMinutes">单个子代理耗时预算（分钟，0 = 不限）</label>
-                <input type="number" id="sgBudgetMinutes" min="0" max="240" step="1" placeholder="20">
-              </div>
-              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
-                预算用完时子代理不会被丢弃，而是被要求立即提交已核实的结论和未查完的缺口。
-              </p>
-              <div class="form-group">
-                <label for="sgCheckChannel">核验审查模型</label>
-                <select id="sgCheckChannel"></select>
-              </div>
-              <p style="font-size:11px;color:var(--muted-soft);margin:0 0 8px">
-                建议选一个和子代理不同家的模型：同一模型审自己的报告，容易把过度推断判成“有依据”。
-              </p>
-              <div class="form-actions" style="margin-bottom:14px">
-                <button type="button" id="sgLimitsSaveBtn" class="btn btn-primary btn-sm">保存限额</button>
-                <span id="sgLimitsStatus" class="status-msg"></span>
-              </div>
-              <div id="builtinAgentList" class="sg-builtin"></div>
-              <div id="customAgentList" class="sg-custom"></div>
-              <div class="form-group" style="margin-top:12px">
-                <label for="sgName">名称</label>
-                <input type="text" id="sgName" placeholder="reviewer">
-              </div>
-              <div class="form-group">
-                <label for="sgDesc">何时委派</label>
-                <input type="text" id="sgDesc" placeholder="什么时候调用这个子代理">
-              </div>
-              <div class="form-group">
-                <label for="sgPrompt">系统说明</label>
-                <textarea id="sgPrompt" rows="4" placeholder="身份与交回格式"></textarea>
-              </div>
-              <div class="form-group">
-                <label for="sgTools">工具</label>
-                <input type="text" id="sgTools" value="*" placeholder="* 或 search_web,read_tab,fetch_entry">
-              </div>
-              <div class="form-group">
-                <label for="sgChannel">渠道</label>
-                <select id="sgChannel"><option value="">跟随当前</option></select>
-              </div>
-              <div class="form-actions">
-                <button id="sgSaveBtn" class="btn btn-primary btn-sm">保存自定义子代理</button>
-                <span id="sgStatus" class="status-msg"></span>
-              </div>
-            </div>
-          </details>
-
-<details class="settings-fold">
-            <summary>关于与更新</summary>
-            <div class="fold-body">
+                      </div>
+          <div class="settings-section">
+            <h3>关于与更新</h3>
               <div class="form-group">
                 <label>许可证</label>
                 <p id="licenseStatusLine" class="ch-model-hint">检查中…</p>
@@ -705,8 +681,8 @@
                 <button id="checkUpdateBtn" class="btn btn-sm btn-primary">检查更新</button>
                 <span id="updateStatus" class="status-msg"></span>
               </div>
-            </div>
-          </details>
+                      </div>
+          </div>
         </div>
       </section>
     </div>
@@ -730,7 +706,7 @@
 
   <div id="licenseGate" class="license-gate" hidden>
     <div class="license-card">
-      <div class="license-mark">Citecat</div>
+      <div class="license-mark">SuperCat</div>
       <h2>需要授权</h2>
       <p>此副本需要许可证才能使用。向发放人索取授权码。</p>
       <input id="licenseKeyInput" type="text" placeholder="CC-XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" aria-label="授权码">

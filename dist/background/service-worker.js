@@ -2288,7 +2288,7 @@ async function summarizeText(fullText, apiConfig, url = '', candidateDate = '', 
   const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
-    console.debug('[Citecat] summarizeText ->', apiConfig.model,
+    console.debug('[SuperCat] summarizeText ->', apiConfig.model,
       `fullText ${fullText.length} chars, prompt ${prompt.length} chars`);
     const { content, usage } = await chatComplete(apiConfig, [{ role: 'user', content: prompt }], {
       temperature: 0.3,
@@ -20763,7 +20763,7 @@ const CHAT_TOOLS = [
           },
           url: {
             type: 'string',
-            description: 'open 时的目标 URL。若是 PDF / Word / Excel / CSV / Markdown / 纯文本文件链接，会在 Citecat 阅读器中打开，随后用 read_tab 读正文。',
+            description: 'open 时的目标 URL。若是 PDF / Word / Excel / CSV / Markdown / 纯文本文件链接，会在 SuperCat 阅读器中打开，随后用 read_tab 读正文。',
           },
         },
         required: ['action'],
@@ -23455,7 +23455,7 @@ async function spillOversizedOutput(text, ctx, {
       });
     }
   } catch (err) {
-    console.warn('[Citecat] spill oversized output failed:', err);
+    console.warn('[SuperCat] spill oversized output failed:', err);
   }
   return raw;
 }
@@ -25346,7 +25346,7 @@ async function executeBrowserAct(args, ctx = {}) {
   if (resolved.error) return resolved.error;
   const tab = resolved.tab;
   if (isReaderPage(tab.url)) {
-    return '这是 Citecat 文档阅读器（扩展内页），不能 browser_act。改已入库的 docx/xlsx 用 doc_edit；读正文用 read_current_page 或 read_tab。';
+    return '这是 SuperCat 文档阅读器（扩展内页），不能 browser_act。改已入库的 docx/xlsx 用 doc_edit；读正文用 read_current_page 或 read_tab。';
   }
   if (isBrowserInternalUrl(tab.url)) {
     return `该标签页是浏览器内部页面，无法操作。`;
@@ -25359,7 +25359,7 @@ async function executeBrowserAct(args, ctx = {}) {
     await chrome.tabs.update(tab.id, { url: dest });
     await waitForTabLoad(tab.id, 15000);
     if (dest !== url) {
-      return '该链接是文档文件，已在 Citecat 阅读器打开，用 read_tab 读正文。browser_act 不能操作阅读器内页。';
+      return '该链接是文档文件，已在 SuperCat 阅读器打开，用 read_tab 读正文。browser_act 不能操作阅读器内页。';
     }
     const snap = await sendLoopMessage(tab.id, { action: 'loop_observe' });
     rememberLoopFingerprint(ctx, tab.id, snap);
@@ -25736,7 +25736,7 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
     const valError = tc.parseError || validateToolArgs(tc.name, tc.arguments);
     if (valError) {
       const errContent = `参数错误（未执行）: ${valError} 请修正参数后重新调用 ${tc.name}。`;
-      console.debug('[Citecat] tool arg rejected:', tc.name, valError);
+      console.debug('[SuperCat] tool arg rejected:', tc.name, valError);
       hooks.argError?.(label);
       logToolCall({ ctx, name: tc.name, args: tc.arguments, rejected: true, error: '参数错误', durationMs: Date.now() - t0 });
       return { content: errContent, history: errContent, write: false };
@@ -25772,7 +25772,7 @@ async function execOneToolCall(tc, ctx, signal, hooks, minAcceptDelayMs) {
       ctx._viewportShot = null;
       ctx._viewportShotNote = '';
     }
-    console.warn('[Citecat] tool failed:', tc.name, err);
+    console.warn('[SuperCat] tool failed:', tc.name, err);
     const errContent = `Error: ${err.message}`;
     hooks.fail?.(label);
     logToolCall({ ctx, name: tc.name, args: tc.arguments, error: err.message, durationMs: Date.now() - t0 });
@@ -25871,7 +25871,7 @@ async function processRoundToolCalls({
     });
     if (slot.write) {
       try { await hooks.writeRefresh?.(slot.name || calls[i].name); }
-      catch (err) { console.warn('[Citecat] post-tool refresh failed:', calls[i].name, err); }
+      catch (err) { console.warn('[SuperCat] post-tool refresh failed:', calls[i].name, err); }
     }
   }
   commitRoundToolTranscript(apiMessages, historyMessages, assistantMsg, toolPairs);
@@ -26042,7 +26042,7 @@ async function executeToolCall(name, args, ctx = {}) {
           }
         }
         if (isReaderPage(tab.url)) {
-          return '这是 Citecat 文档阅读器（扩展内页 chrome-extension://…/src/reader/index.html），不能 interact_page，也不用点「编辑」。改已入库的 docx/xlsx 直接 doc_edit(doc_id=库内条目 id)；读正文用 read_current_page 或 read_tab。';
+          return '这是 SuperCat 文档阅读器（扩展内页 chrome-extension://…/src/reader/index.html），不能 interact_page，也不用点「编辑」。改已入库的 docx/xlsx 直接 doc_edit(doc_id=库内条目 id)；读正文用 read_current_page 或 read_tab。';
         }
         if (!tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
           return `该标签页是浏览器内部页面，无法操作。`;
@@ -26057,7 +26057,7 @@ async function executeToolCall(name, args, ctx = {}) {
           await waitForTabLoad(tab.id, 15000);
           const [newTab] = await chrome.tabs.query({ active: true, currentWindow: true });
           const opened = newTab?.url || dest;
-          const hint = dest !== url ? '\n该链接是文档文件，已在 Citecat 阅读器打开，用 read_tab 读正文。' : '';
+          const hint = dest !== url ? '\n该链接是文档文件，已在 SuperCat 阅读器打开，用 read_tab 读正文。' : '';
           return `已导航到: ${opened}\n标题: ${newTab?.title || '(加载中)'}${hint}`;
         }
         if (args.action === 'go_back') {
@@ -26942,7 +26942,7 @@ async function executeToolCall(name, args, ctx = {}) {
           const how = tabId
             ? `用 read_tab(tab_id=${tabId}) 读全文。读完可 manage_tabs(close, tab_id=${tabId})；任务结束也会自动关掉。`
             : '现在可以用 read_tab 读取。任务结束会自动关掉这次打开的页。';
-          const note = dest !== url ? '\n该链接是文档文件，已在 Citecat 阅读器打开。' : '';
+          const note = dest !== url ? '\n该链接是文档文件，已在 SuperCat 阅读器打开。' : '';
           return `已打开${background ? '后台' : ''}标签页${tabId ? ` #${tabId}` : ''}: ${(tab && tab.title) || '(加载中)'}\nURL: ${dest}\n${how}${note}`;
         }
         if (action === 'close') {
@@ -27342,9 +27342,9 @@ async function executeToolCall(name, args, ctx = {}) {
 // v53: 研究与写作分离：先定问题树/假设再派 task；子代理交 findings；调研报告走 compose_report。
 // v55: 成文走 write_document。explore 交原文段落，按体裁写一稿并对照原文改一稿。
 // v54: 主代理看到的 task 结果按判断分组，不再平铺 claims；verification 只留未通过项。
-const PROMPT_PROTOCOL_VERSION = 'citecat-v58-2026-10-14';
+const PROMPT_PROTOCOL_VERSION = 'citecat-v59-2026-10-14';
 
-const STATIC_PREFIX = `你是 Citecat，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
+const STATIC_PREFIX = `你是 SuperCat，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
 
 ## 决策优先级（自上而下，冲突时上层胜出）
 P1. **上下文变化 > 一切**：若「本轮上下文变化」提示项目切换或勾选变化，忽略历史消息中冲突的 id、全文、结论；确需引用旧条目时，重新用 fetch_entry 拉取当前项目里的条目。
@@ -27858,7 +27858,7 @@ async function runSectionJob(args = {}, ctx = {}) {
     {
       role: 'system',
       content:
-        '你是 Citecat 的无状态章节抽取 Worker。只处理给定原文，不得使用外部知识。'
+        '你是 SuperCat 的无状态章节抽取 Worker。只处理给定原文，不得使用外部知识。'
         + '完成时必须调用 submit_report：actions=[]；每条 claim 的 evidence 必须使用系统给定 doc_id、anchor，并从原文逐字复制 quote。'
         + '每条 claim 写 attribution（原文里最初说这话的主体）与 modality；当事方说法用 claimed、转述用 reported，不要写成 confirmed。'
         + '原文没有直接支持的内容放 unresolved。给你的原文可能只是文件中的一段，只抽取这一段，不要声称文件到此结束。不要输出长篇正文。',
@@ -28585,7 +28585,7 @@ function revisionRequestFor(verification) {
 
 /**
  * 子代理运行时 —— 对齐 OpenCode Task / Claude Code Agent / Codex spawn / Pi AgentSession
- * 的共识，收口到 Citecat 浏览器场景：
+ * 的共识，收口到 SuperCat 浏览器场景：
  *
  * - 父代理通过 `task` 工具派活；子代理独立消息数组，只把摘要交回父上下文
  * - 内置 explore（只读调研）/ general（可写多步）/ browser（页面自动化）
@@ -28696,7 +28696,7 @@ async function memoriesBlockForChild(prompt, ctx) {
 
 function childSystemPrompt(agent, maxTabs = SUBAGENT_MAX_TABS) {
   return [
-    `你是 Citecat 的「${agent.name}」子代理。不要扮演对用户说话的主助手。`,
+    `你是 SuperCat 的「${agent.name}」子代理。不要扮演对用户说话的主助手。`,
     '禁止调用 task。禁止 clear_context / suggest_actions / ask_research_scope / manage_heartbeat / save_memory。',
     '经验记忆只读：系统会按当前页与任务自动注入相关条目（如有）。不要调用 save_memory；值得记的经验写进给父代理的报告即可。',
     `标签预算：同时最多打开 ${maxTabs} 个标签页。读完不需要的先 manage_tabs(close, tab_id) 关掉再开新的——读过的内容仍在你的上下文里，不必为留着标签而占额度。`,
@@ -37834,7 +37834,7 @@ const XmlParser$1 = typeof DOMParser !== 'undefined' ? DOMParser : libExports.DO
 const XmlSerializer$1 = typeof XMLSerializer !== 'undefined' ? XMLSerializer : libExports.XMLSerializer;
 
 const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-const AUTHOR = 'Citecat';
+const AUTHOR = 'SuperCat';
 const INITIALS = 'CC';
 const XML_DECL$1 = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 const UNDO_CAP$1 = 30;
@@ -41020,7 +41020,7 @@ const FEED_PREFS_KEY = 'feedPrefs';
 const RETRY_TAB_KEY = 'retryTabMap';
 
 ensureWorkspaceMigration().catch((err) => {
-  console.error('[Citecat] workspace migration failed:', err);
+  console.error('[SuperCat] workspace migration failed:', err);
 });
 
 /* ---- AI 工具打开的标签页追踪 ----
@@ -41281,7 +41281,7 @@ async function runPool(items, worker, concurrency) {
 async function handleTabSnapshot({ maxTabs = 20 } = {}) {
   const all = await chrome.tabs.query({});
   const candidates = all
-    // 排除浏览器内部页与其它扩展页；Citecat 阅读器页（chrome-extension://.../src/reader/index.html）
+    // 排除浏览器内部页与其它扩展页；SuperCat 阅读器页（chrome-extension://.../src/reader/index.html）
     // 例外保留——它是可读/可操作的（doc_edit/doc_review 的目标页），曾因整段排除而消失于列表
     .filter(isReadableTab)
     .slice(0, maxTabs || 20);
@@ -41420,7 +41420,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 
 /* 文档阅读器接管：浏览器内置 PDF viewer 是受保护扩展页面（content script
    无法注入）；Office / CSV 直链通常会变成下载，AI 也读不到正文。检测到
-   pdf/docx/doc/xlsx/xls/csv URL 时用 Citecat 阅读器打开。15 秒内同 URL 去重。 */
+   pdf/docx/doc/xlsx/xls/csv URL 时用 SuperCat 阅读器打开。15 秒内同 URL 去重。 */
 const READER_BASE = chrome.runtime.getURL('src/reader/index.html');
 const recentPdfOpens = new Map(); // url -> timestamp
 chrome.webNavigation.onCommitted.addListener((details) => {

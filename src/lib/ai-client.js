@@ -74,7 +74,7 @@ export async function summarizeText(fullText, apiConfig, url = '', candidateDate
   const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
-    console.debug('[Citecat] summarizeText ->', apiConfig.model,
+    console.debug('[SuperCat] summarizeText ->', apiConfig.model,
       `fullText ${fullText.length} chars, prompt ${prompt.length} chars`);
     const { content, usage } = await chatComplete(apiConfig, [{ role: 'user', content: prompt }], {
       temperature: 0.3,
