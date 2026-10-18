@@ -164,7 +164,7 @@ ok(stats.calibration[0][0] === 1 && stats.calibration[0][2] === 1 && stats.calib
 ok(stats.sourceMix[0].name === '采集' && stats.sourceMix[0].count === 2, '来源构成按数量降序');
 const charts = buildOverviewCharts(stats);
 ok(charts.map((c) => c.id).join() === 'activity,status,calibration,sourceMix', '有数据时四张图齐全');
-ok(charts.every((c) => c.option && c.option.series && c.height > 0), '每张图都有 option 与高度');
+ok(charts.every((c) => c.option && c.option.type && c.height > 0), '每张图都有 option 与高度');
 ok(buildOverviewCharts(computeOverviewStats({}, { now })).length === 0, '空项目不画图');
 
 // —— 心跳任务跟项目走 ——

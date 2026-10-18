@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>G2 plot-runtime fixture</title>
+  <style>
+    body { font: 13px/1.4 system-ui, sans-serif; background: #f4f4f5; color: #18181b; margin: 16px; }
+    h1 { font-size: 16px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; max-width: 960px; }
+    .card { background: #fff; border-radius: 8px; padding: 8px 10px; }
+    .card h2 { font-size: 12px; margin: 0 0 6px; }
+    .host { width: 100%; height: 180px; }
+    .host.tall { height: 220px; }
+    .err { color: #dc2626; }
+  </style>
+</head>
+<body>
+  <h1>G2 出图夹具</h1>
+  <div class="grid" id="grid"></div>
+  <script type="module">
+    import { renderChart } from '../dist/lib/plot-runtime.js';
+    import { buildPlotOption } from '../src/lib/plot-spec.js';
+    import { activityOption, statusOption, calibrationOption, sourceMixOption, computeOverviewStats } from '../src/lib/overview-stats.js';
+
+    const cases = [
+      {
+        title: '柱状',
+        built: buildPlotOption({
+          type: 'bar', title: '交付量',
+          data: [{ year: '2023', units: 120 }, { year: '2024', units: 180 }, { year: '2025', units: 150 }],
+          x: 'year', y: 'units',
+        }),
+      },
+      {
+        title: '面积折线 + 事件',
+        built: buildPlotOption({
+          type: 'line',
+          data: [{ name: 'A', points: [['1月', 1], ['2月', 3], ['3月', 2], ['4月', 5], ['5月', 4], ['6月', 7]] }],
+          events: [{ x: '2月', label: '制裁' }],
+        }),
+      },
+      {
+        title: '多序列面积折线',
+        built: buildPlotOption({
+          type: 'line',
+          data: [
+            { month: '1月', 甲: 12, 乙: 8 },
+            { month: '2月', 甲: 18, 乙: 11 },
+            { month: '3月', 甲: 15, 乙: 14 },
+            { month: '4月', 甲: 22, 乙: 13 },
+            { month: '5月', 甲: 19, 乙: 16 },
+          ],
+          x: 'month',
+          y: ['甲', '乙'],
+        }),
+      },
+      {
+        title: '环形',
+        built: buildPlotOption({
+          type: 'donut',
+          data: [{ name: '网页', n: 36 }, { name: '上传', n: 8 }, { name: 'RSS', n: 4 }],
+          x: 'name', y: 'n',
+        }),
+      },
+      {
+        title: '热力',
+        built: buildPlotOption({
+          type: 'heatmap',
+          data: [
+            { x: '待核实', y: '高', value: 2 },
+            { x: '已核实', y: '高', value: 1 },
+            { x: '被推翻', y: '中', value: 3 },
+          ],
+        }),
+      },
+    ];
+
+    const now = new Date(2026, 8, 30, 12).getTime();
+    const day = 86400000;
+    const stats = computeOverviewStats({
+      sources: [{ updatedAt: now, badge: '采集' }, { updatedAt: now - day, badge: '上传' }],
+      outputs: [{ entry: { createdAt: now - 2 * day } }],
+      notes: [
+        { note: { createdAt: now, status: 'open', confidence: 'high' } },
+        { note: { createdAt: now, status: 'refuted', confidence: 'high' } },
+        { note: { createdAt: now, status: 'verified', confidence: 'low' } },
+      ],
+    }, { now });
+
+    const grid = document.getElementById('grid');
+    async function mount(title, option, tall) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `<h2>${title}</h2><div class="host${tall ? ' tall' : ''}"></div>`;
+      grid.appendChild(card);
+      const host = card.querySelector('.host');
+      try {
+        await renderChart(host, option);
+      } catch (err) {
+        host.classList.add('err');
+        host.textContent = String(err && err.message || err);
+      }
+    }
+
+    for (const c of cases) {
+      if (!c.built.ok) {
+        await mount(c.title + '（编译失败）', { type: 'interval', data: [] });
+        continue;
+      }
+      await mount(c.title, c.built.chart.option);
+    }
+    await mount('概览·近 14 天', activityOption(stats), true);
+    await mount('概览·笔记状态', statusOption(stats));
+    await mount('概览·校准', calibrationOption(stats));
+    await mount('概览·来源', sourceMixOption(stats));
+  </script>
+</body>
+</html>

@@ -273,7 +273,7 @@ function validateSwBundle() {
 }
 
 /**
- * Chrome 扩展页面没有 Node 的 process。echarts/zrender 调试分支读
+ * Chrome 扩展页面没有 Node 的 process。G2 / @antv/g 调试分支可能读
  * process.env.NODE_ENV；即使 Vite define 漏掉，也把残留替换掉。
  */
 function fixPlotRuntime() {
@@ -284,11 +284,11 @@ function fixPlotRuntime() {
   if (/\bprocess\.env\b/.test(code)) {
     throw new Error('plot-runtime still references process.env (Chrome has no Node process)');
   }
-  if (!/\bexport\s*\{[^}]*renderEChart/.test(code)) {
-    throw new Error('plot-runtime missing named export renderEChart');
+  if (!/\bexport\s*\{[^}]*renderChart/.test(code) && !/\brenderChart\s+as\s+renderChart/.test(code)) {
+    throw new Error('plot-runtime missing named export renderChart');
   }
   writeFileSync(file, code);
-  console.log('  [plot] process.env stripped; renderEChart export present');
+  console.log('  [plot] process.env stripped; renderChart export present');
 }
 
 /* ---- Build ---- */
@@ -363,9 +363,9 @@ await build({
 fixServiceWorker();
 validateSwBundle();
 
-// ECharts 运行时独立入口：按需动态 import，不进 SW / content 常驻包。
+// G2 运行时独立入口：按需动态 import，不进 SW / content 常驻包。
 // 浮动窗 content script 经 chrome.runtime.getURL 加载，故需 web_accessible_resources。
-// Vite lib 模式不会注入 Node 的 process；echarts/zrender 仍读 process.env.NODE_ENV，
+// Vite lib 模式不会注入 Node 的 process；@antv/g 仍可能读 process.env.NODE_ENV，
 // 在扩展页面会变成 ReferenceError: process is not defined。
 await build({
   root,
@@ -375,6 +375,13 @@ await build({
   esbuild: {
     define: {
       'process.env.NODE_ENV': JSON.stringify('production'),
+    },
+  },
+  resolve: {
+    // 仓库根上的 tslib 被 pdf-lib 钉在 1.x，没有 __spreadArray；
+    // @antv/component 要从 2.x 取 helper。只影响这份 plot-runtime 包。
+    alias: {
+      tslib: resolve(root, 'node_modules/@antv/g-lite/node_modules/tslib/tslib.es6.js'),
     },
   },
   build: {

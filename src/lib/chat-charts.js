@@ -1,6 +1,6 @@
 /**
  * 聊天气泡里的图表挂载。DOM-only，禁止被 Service Worker 静态导入。
- * echarts 经 chrome.runtime.getURL('lib/plot-runtime.js') 按需加载。
+ * G2 经 chrome.runtime.getURL('lib/plot-runtime.js') 按需加载。
  */
 
 const registry = new Map();
@@ -44,18 +44,16 @@ function loadRuntime() {
 
 function disposeHost(el) {
   if (!el) return;
-  if (el._citecatPtrFix && typeof el.removeEventListener === 'function') {
-    for (const t of ['pointermove', 'pointerdown', 'mousemove', 'mousedown']) {
-      try { el.removeEventListener(t, el._citecatPtrFix, true); } catch (_) {}
-    }
-    el._citecatPtrFix = null;
-  }
   if (el._citecatRo) {
     try { el._citecatRo.disconnect(); } catch (_) {}
     el._citecatRo = null;
   }
   if (el._citecatChart) {
-    try { el._citecatChart.dispose(); } catch (_) {}
+    const inst = el._citecatChart;
+    try {
+      if (typeof inst.destroy === 'function') inst.destroy();
+      else if (typeof inst.dispose === 'function') inst.dispose();
+    } catch (_) {}
     el._citecatChart = null;
   }
 }
@@ -64,13 +62,13 @@ export function disposeChartHost(el) {
   disposeHost(el);
 }
 
-/** 工作区等非聊天场景：把任意 ECharts option 挂到一个 DOM 节点上。 */
+/** 工作区等非聊天场景：把任意 G2 spec 挂到一个 DOM 节点上。 */
 export async function mountChart(host, option) {
   if (!host || !option) return null;
   try {
     const runtime = await loadRuntime();
     if (!host.isConnected) return null;
-    return runtime.renderEChart(host, option);
+    return runtime.renderChart(host, option);
   } catch (err) {
     host.textContent = '图表加载失败：' + (err.message || err);
     return null;
@@ -102,7 +100,7 @@ export async function mountChatCharts(root) {
     const host = card.querySelector('.chat-chart');
     if (!host || !rec || !rec.option) continue;
     try {
-      runtime.renderEChart(host, rec.option);
+      await runtime.renderChart(host, rec.option);
     } catch (err) {
       host.textContent = '绘图失败：' + (err.message || err);
     }
@@ -149,13 +147,23 @@ export function dataUrlToBytes(dataUrl) {
   return bytes;
 }
 
+function waitPaint() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame !== 'function') {
+      setTimeout(resolve, 32);
+      return;
+    }
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+}
+
 /**
- * 光栅化：把 option 渲成一张 PNG 字节（供 docx 插图）。**必须有 DOM**
- * （ECharts 要真 DOM + canvas + 字体度量），所以只能在侧栏 / 阅读器这类页面跑；
+ * 光栅化：把 spec 渲成一张 PNG 字节（供 docx 插图）。**必须有 DOM**
+ * （G2 要真 DOM + canvas + 字体度量），所以只能在侧栏 / 阅读器这类页面跑；
  * SW 宿主没有 DOM，调用方要先判断能力再决定是否走这条路。
  *
  * 容器放视口外但**保留布局**（left:-10000px）——`display:none` 量不到宽高，
- * 渲出来是空白图。渲完立即 dispose + 摘除，不留节点。
+ * 渲出来是空白图。渲完立即 destroy + 摘除，不留节点。
  *
  * @returns {Promise<{ok:true, bytes:Uint8Array, dataUrl:string, width:number, height:number} | {ok:false, error:string}>}
  */
@@ -171,10 +179,10 @@ export async function rasterizeChartOption(option, { width = 640, height = 360, 
   host.style.cssText = `position:fixed;left:-10000px;top:0;width:${width}px;height:${height}px;`;
   document.body.appendChild(host);
   try {
-    runtime.renderEChart(host, option);
-    const inst = host._citecatChart;
+    const inst = await runtime.renderChart(host, option, { width, height, autoFit: false, pixelRatio });
     if (!inst) return { ok: false, error: '图表实例未创建' };
-    const dataUrl = inst.getDataURL({ type: 'png', pixelRatio, backgroundColor: background });
+    await waitPaint();
+    const dataUrl = runtime.chartToDataURL(inst, { background });
     const bytes = dataUrlToBytes(dataUrl);
     if (!bytes.length) return { ok: false, error: '导出得到空白图' };
     return { ok: true, bytes, dataUrl, width, height };

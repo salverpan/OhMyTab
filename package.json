@@ -10,6 +10,7 @@
     "dev": "node build.js && echo 'Load dist/ folder in chrome://extensions'"
   },
   "dependencies": {
+    "@antv/g2": "^5.4.8",
     "@mozilla/readability": "^0.6.0",
     "@tiptap/core": "^2.27.2",
     "@tiptap/extension-table": "^2.27.2",
@@ -23,7 +24,6 @@
     "defuddle": "^0.19.1",
     "docx": "^9.1.0",
     "docx-preview": "^0.4.0",
-    "echarts": "^5.6.0",
     "fast-xml-parser": "^5.9.3",
     "gsap": "^3.15.0",
     "jszip": "^3.10.1",

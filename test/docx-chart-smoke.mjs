@@ -116,16 +116,16 @@ const args = {
 const chatBuilt = buildPlotOption(args);
 const printBuilt = buildPlotOption(args, { mode: 'print' });
 ok(chatBuilt.ok && printBuilt.ok, '两种模式都能出图');
-ok(chatBuilt.chart.option.animationDuration === 280 && !chatBuilt.chart.option.backgroundColor, '聊天模式保持原有动效/透明底');
+ok(chatBuilt.chart.option.animate !== false && !chatBuilt.chart.option.backgroundColor, '聊天模式保持原有动效/透明底');
 const po = printBuilt.chart.option;
-ok(po.animation === false, '打印锁定关动画');
-ok(po.backgroundColor === '#ffffff', '打印锁定白底');
-ok(po.tooltip && po.tooltip.show === false, '打印锁定关 tooltip');
+ok(po.animate === false && po.animation === false, '打印锁定关动画');
+ok(po.backgroundColor === '#ffffff' && po.theme.view.viewFill === '#ffffff', '打印锁定白底');
+ok(po.interaction && po.interaction.tooltip === false, '打印锁定关 tooltip');
 ok(po.textStyle.fontFamily === PRINT_FONT_FAMILY && po.textStyle.color === '#18181b', '打印锁定固定字体栈与墨色');
-ok(po.xAxis.axisLabel.fontSize === 11 && po.yAxis.axisLabel.fontSize === 11, '打印锁定放大轴标签字号（印到纸上 ≥9pt）');
-ok(po.yAxis.splitLine.lineStyle.color === 'rgba(0,0,0,0.10)', '打印锁定网格线改浅灰实线');
+ok(po.axis.x.labelFontSize === 11 && po.axis.y.labelFontSize === 11, '打印锁定放大轴标签字号（印到纸上 ≥9pt）');
+ok(po.axis.y.gridStroke === 'rgba(0,0,0,0.10)', '打印锁定网格线改浅灰实线');
 ok(PRINT_CHART_WIDTH === 480 && PRINT_CHART_HEIGHT === 270, '打印逻辑尺寸 480×270（16:9）');
-ok(printLockOption(null).backgroundColor === '#ffffff' && buildPlotOption(args).chart.option.tooltip.show !== false, 'printLockOption 不改原 option 对象');
+ok(printLockOption(null).backgroundColor === '#ffffff' && buildPlotOption(args).chart.option.interaction.tooltip !== false, 'printLockOption 不改原 option 对象');
 
 /* ---------- 6) 图表登记表：题注/来源 + 上限回收 ---------- */
 const store = new Map();

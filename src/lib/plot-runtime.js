@@ -1,38 +1,22 @@
 /**
- * ECharts 运行时（按需加载）。独立打成 dist/lib/plot-runtime.js，
+ * G2 运行时（按需加载）。独立打成 dist/lib/plot-runtime.js，
  * 不进 Service Worker / 不进 content 常驻包。
  */
-import * as echarts from 'echarts/core';
-import { BarChart, LineChart, ScatterChart, HeatmapChart } from 'echarts/charts';
-import {
-  GridComponent,
-  TooltipComponent,
-  TitleComponent,
-  LegendComponent,
-  MarkLineComponent,
-  VisualMapComponent,
-} from 'echarts/components';
-import { CanvasRenderer } from 'echarts/renderers';
+import { Runtime, extend, corelib, plotlib, graphlib } from '@antv/g2';
+import { Canvas as GCanvas } from '@antv/g';
+import { Renderer as CanvasRenderer } from '@antv/g-canvas';
 
-echarts.use([
-  BarChart,
-  LineChart,
-  ScatterChart,
-  HeatmapChart,
-  GridComponent,
-  TooltipComponent,
-  TitleComponent,
-  LegendComponent,
-  MarkLineComponent,
-  VisualMapComponent,
-  CanvasRenderer,
-]);
+const Chart = extend(Runtime, { ...corelib(), ...plotlib(), ...graphlib() });
 
-function themeFrom(el) {
+function themeFrom(el, option) {
+  const printFill = option && option.theme && option.theme.view && option.theme.view.viewFill;
+  if (printFill === '#ffffff') {
+    return {
+      type: 'classic',
+      view: { viewFill: '#ffffff' },
+    };
+  }
   const cs = getComputedStyle(el || document.documentElement);
-  const ink = (cs.getPropertyValue('--ink') || '#18181b').trim() || '#18181b';
-  const muted = (cs.getPropertyValue('--muted') || '#6b6b73').trim() || '#6b6b73';
-  const hair = (cs.getPropertyValue('--hairline') || 'rgba(0,0,0,0.08)').trim() || 'rgba(0,0,0,0.08)';
   const isDark = (() => {
     const forced = document.documentElement.dataset.theme;
     if (forced === 'dark') return true;
@@ -41,113 +25,108 @@ function themeFrom(el) {
     return /#1|#0|rgb\(\s*2[0-4]/.test(bg) || matchMedia('(prefers-color-scheme: dark)').matches;
   })();
   return {
-    backgroundColor: 'transparent',
-    textStyle: { color: ink, fontFamily: 'inherit' },
-    legend: { textStyle: { color: muted } },
-    tooltip: {
-      backgroundColor: isDark ? '#27272a' : '#ffffff',
-      borderColor: hair,
-      textStyle: { color: ink, fontSize: 12 },
-      confine: true,
-      transitionDuration: 0,
-      enterable: false,
-      extraCssText: 'pointer-events:none;',
-    },
-  };
-}
-
-const PTR_EVENTS = ['pointermove', 'pointerdown', 'mousemove', 'mousedown'];
-
-/** 侧栏面板用了 CSS zoom（--ui-scale）。ZRender 默认吃 offsetX，和缩放后的 canvas 对不齐，tooltip/轴指示会跟着鼠标漂。 */
-function attachPointerFix(host) {
-  detachPointerFix(host);
-  if (!host || typeof host.addEventListener !== 'function') return;
-  const onPtr = (e) => {
-    const canvas = host.querySelector && host.querySelector('canvas');
-    if (!canvas || e.clientX == null) return;
-    const rect = canvas.getBoundingClientRect();
-    if (!(rect.width > 0 && rect.height > 0)) return;
-    e.zrX = (e.clientX - rect.left) * (canvas.clientWidth / rect.width);
-    e.zrY = (e.clientY - rect.top) * (canvas.clientHeight / rect.height);
-  };
-  for (const t of PTR_EVENTS) host.addEventListener(t, onPtr, true);
-  host._citecatPtrFix = onPtr;
-}
-
-function detachPointerFix(host) {
-  const onPtr = host && host._citecatPtrFix;
-  if (!onPtr) return;
-  for (const t of PTR_EVENTS) {
-    try { host.removeEventListener(t, onPtr, true); } catch (_) {}
-  }
-  host._citecatPtrFix = null;
-}
-
-function withStableTooltip(option, theme) {
-  const fromOpt = (option && option.tooltip) || {};
-  const axisPointer = fromOpt.trigger === 'axis'
-    ? { type: 'line', snap: true, animation: false, ...(fromOpt.axisPointer || {}) }
-    : fromOpt.axisPointer;
-  return {
-    ...(theme.tooltip || {}),
-    ...fromOpt,
-    confine: true,
-    transitionDuration: 0,
-    enterable: false,
-    extraCssText: [theme.tooltip && theme.tooltip.extraCssText, fromOpt.extraCssText, 'pointer-events:none;']
-      .filter(Boolean).join(''),
-    ...(axisPointer ? { axisPointer } : {}),
+    type: isDark ? 'classicDark' : 'classic',
+    view: { viewFill: 'transparent' },
   };
 }
 
 const observers = new WeakMap();
 
-export function renderEChart(el, option) {
-  if (!el || !option) return null;
-  detachPointerFix(el);
-  const existing = echarts.getInstanceByDom(el);
-  if (existing) existing.dispose();
-  const inst = echarts.init(el, null, { renderer: 'canvas' });
-  const theme = themeFrom(el);
-  inst.setOption({
-    ...theme,
-    ...option,
-    title: { show: false },
-    tooltip: withStableTooltip(option, theme),
-  }, { notMerge: true });
-  attachPointerFix(el);
-  if (typeof ResizeObserver !== 'undefined') {
-    const prevRo = observers.get(el) || el._citecatRo;
-    if (prevRo) {
-      try { prevRo.disconnect(); } catch (_) {}
-    }
-    const ro = new ResizeObserver(() => {
-      try { inst.resize(); } catch (_) {}
-    });
-    ro.observe(el);
-    observers.set(el, ro);
-    el._citecatRo = ro;
-  }
-  el._citecatChart = inst;
-  return inst;
+function detachRo(el) {
+  const ro = observers.get(el) || (el && el._citecatRo);
+  if (!ro) return;
+  try { ro.disconnect(); } catch (_) {}
+  observers.delete(el);
+  if (el) el._citecatRo = null;
 }
 
-export function disposeEChart(el) {
+function attachRo(el, chart) {
+  detachRo(el);
+  if (!el || typeof ResizeObserver === 'undefined') return;
+  const ro = new ResizeObserver(() => {
+    try { chart.forceFit(); } catch (_) {}
+  });
+  ro.observe(el);
+  observers.set(el, ro);
+  el._citecatRo = ro;
+}
+
+function makeCanvas(el, width, height, pixelRatio) {
+  const renderer = new CanvasRenderer();
+  return new GCanvas({
+    container: el,
+    width,
+    height,
+    renderer,
+    devicePixelRatio: pixelRatio,
+  });
+}
+
+function applyTheme(el, option) {
+  const spec = JSON.parse(JSON.stringify(option || {}));
+  spec.theme = themeFrom(el, spec);
+  return spec;
+}
+
+export function disposeChart(el) {
   if (!el) return;
-  detachPointerFix(el);
-  const ro = observers.get(el);
-  if (ro) {
-    try { ro.disconnect(); } catch (_) {}
-    observers.delete(el);
-  }
-  if (el._citecatChart) {
-    try { el._citecatChart.dispose(); } catch (_) {}
+  detachRo(el);
+  const inst = el._citecatChart;
+  if (inst) {
+    try {
+      if (typeof inst.destroy === 'function') inst.destroy();
+      else if (typeof inst.dispose === 'function') inst.dispose();
+    } catch (_) {}
     el._citecatChart = null;
-  } else {
-    const inst = echarts.getInstanceByDom(el);
-    if (inst) try { inst.dispose(); } catch (_) {}
   }
-  el._citecatRo = null;
 }
 
-export { echarts };
+/**
+ * 把 G2 spec 挂到 DOM 节点上。option 是 plot-spec 编出的声明式配置。
+ * @param {HTMLElement} el
+ * @param {object} option
+ * @param {{width?:number,height?:number,autoFit?:boolean,pixelRatio?:number}} [extra]
+ */
+export async function renderChart(el, option, extra = {}) {
+  if (!el || !option) return null;
+  disposeChart(el);
+  const width = Number(extra.width) || undefined;
+  const height = Number(extra.height) || undefined;
+  const autoFit = extra.autoFit !== false && !(width && height);
+  const opts = { container: el, autoFit };
+  if (width) opts.width = width;
+  if (height) opts.height = height;
+  if (extra.pixelRatio && width && height) {
+    opts.canvas = makeCanvas(el, width, height, extra.pixelRatio);
+    opts.autoFit = false;
+  }
+  const chart = new Chart(opts);
+  chart.options(applyTheme(el, option));
+  await chart.render();
+  el._citecatChart = chart;
+  if (opts.autoFit) attachRo(el, chart);
+  return chart;
+}
+
+/** @deprecated 兼容旧调用名 */
+export const renderEChart = renderChart;
+export const disposeEChart = disposeChart;
+
+export function chartToDataURL(chart, { background = '#ffffff' } = {}) {
+  if (!chart || typeof chart.getContext !== 'function') throw new Error('图表实例无效');
+  const gCanvas = chart.getContext().canvas;
+  const htmlCanvas = gCanvas && gCanvas.getContextService && gCanvas.getContextService().getDomElement();
+  if (!htmlCanvas || !htmlCanvas.toDataURL) throw new Error('找不到画布');
+  if (!background || background === 'transparent') return htmlCanvas.toDataURL('image/png');
+  const out = document.createElement('canvas');
+  out.width = htmlCanvas.width;
+  out.height = htmlCanvas.height;
+  const ctx = out.getContext('2d');
+  if (!ctx) throw new Error('无法创建导出画布');
+  ctx.fillStyle = background;
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(htmlCanvas, 0, 0);
+  return out.toDataURL('image/png');
+}
+
+export { Chart };

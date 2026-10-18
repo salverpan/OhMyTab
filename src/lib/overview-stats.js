@@ -1,5 +1,5 @@
 /**
- * 项目概览的统计口径与 ECharts option 构造。纯函数、无 DOM，可在 node 下冒烟。
+ * 项目概览的统计口径与 G2 spec 构造。纯函数、无 DOM，可在 node 下冒烟。
  * 行（row）结构沿用 workspace-view 的 sources / notes / outputs。
  */
 
@@ -119,132 +119,111 @@ export function computeOverviewStats(groups, { days = 14, now = Date.now() } = {
   };
 }
 
-const AXIS_TEXT = { fontSize: 10 };
-
 export function activityOption(stats) {
   const a = stats.activity;
-  const series = [
-    ['sources', '来源'],
-    ['notes', '笔记'],
-    ['outputs', '产出'],
-  ].map(([key, name]) => ({
-    name,
-    type: 'bar',
-    stack: 'total',
-    barMaxWidth: 16,
-    itemStyle: { color: TRUNK_COLOR[key] },
-    data: a[key],
-  }));
+  const data = [];
+  for (let i = 0; i < a.labels.length; i++) {
+    data.push({ day: a.labels[i], kind: '来源', count: a.sources[i] });
+    data.push({ day: a.labels[i], kind: '笔记', count: a.notes[i] });
+    data.push({ day: a.labels[i], kind: '产出', count: a.outputs[i] });
+  }
   return {
-    animation: false,
-    grid: { left: 28, right: 8, top: 26, bottom: 20 },
-    legend: { top: 0, right: 0, itemWidth: 10, itemHeight: 8, textStyle: AXIS_TEXT },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: {
-      type: 'category',
-      data: a.labels,
-      axisLabel: { ...AXIS_TEXT, interval: 'auto' },
-      axisTick: { show: false },
+    type: 'interval',
+    data,
+    encode: { x: 'day', y: 'count', color: 'kind' },
+    transform: [{ type: 'stackY' }],
+    scale: {
+      color: {
+        domain: ['来源', '笔记', '产出'],
+        range: [TRUNK_COLOR.sources, TRUNK_COLOR.notes, TRUNK_COLOR.outputs],
+      },
     },
-    yAxis: {
-      type: 'value',
-      minInterval: 1,
-      axisLabel: AXIS_TEXT,
-      splitLine: { lineStyle: { opacity: 0.35 } },
+    axis: {
+      x: { title: false, labelFontSize: 10, labelAutoHide: true },
+      y: { title: false, labelFontSize: 10, grid: true, gridStrokeOpacity: 0.35 },
     },
-    series,
+    legend: { color: { position: 'top', itemMarkerSize: 8, itemLabelFontSize: 10 } },
+    style: { maxWidth: 16 },
+    animate: false,
+    plotType: 'bar',
   };
 }
 
 export function statusOption(stats) {
-  const series = NOTE_STATUS_ORDER.map((s) => ({
-    name: NOTE_STATUS_LABEL[s],
-    type: 'bar',
-    stack: 'status',
-    itemStyle: { color: STATUS_COLOR[s] },
-    label: { show: stats.noteStatus[s] > 0, color: '#fff', fontSize: 10, formatter: '{c}' },
-    data: [stats.noteStatus[s]],
+  const data = NOTE_STATUS_ORDER.map((s) => ({
+    row: '笔记',
+    status: NOTE_STATUS_LABEL[s],
+    count: stats.noteStatus[s],
+    label: stats.noteStatus[s] > 0 ? String(stats.noteStatus[s]) : '',
   }));
   return {
-    animation: false,
-    grid: { left: 6, right: 6, top: 26, bottom: 4 },
-    legend: { top: 0, itemWidth: 10, itemHeight: 8, textStyle: AXIS_TEXT },
-    tooltip: { trigger: 'item' },
-    xAxis: { type: 'value', show: false, max: Math.max(1, stats.noteTotal) },
-    yAxis: { type: 'category', show: false, data: ['笔记'] },
-    series,
+    type: 'interval',
+    coordinate: { transform: [{ type: 'transpose' }] },
+    data,
+    encode: { x: 'row', y: 'count', color: 'status' },
+    transform: [{ type: 'stackY' }],
+    scale: {
+      color: {
+        domain: NOTE_STATUS_ORDER.map((s) => NOTE_STATUS_LABEL[s]),
+        range: NOTE_STATUS_ORDER.map((s) => STATUS_COLOR[s]),
+      },
+    },
+    axis: false,
+    legend: { color: { position: 'top', itemMarkerSize: 8, itemLabelFontSize: 10 } },
+    labels: [{ text: 'label', fill: '#fff', fontSize: 10, position: 'inside' }],
+    animate: false,
+    plotType: 'bar',
   };
 }
 
 export function calibrationOption(stats) {
   const data = [];
-  let max = 1;
-  stats.calibration.forEach((row, y) => {
-    row.forEach((v, x) => {
-      data.push([x, y, v]);
-      if (v > max) max = v;
+  stats.calibration.forEach((row, yi) => {
+    row.forEach((v, xi) => {
+      data.push({
+        status: NOTE_STATUS_LABEL[NOTE_STATUS_ORDER[xi]],
+        conf: `置信${CONFIDENCE_LABEL[CONFIDENCE_ORDER[yi]]}`,
+        count: v,
+        label: v ? String(v) : '',
+      });
     });
   });
   return {
-    animation: false,
-    grid: { left: 34, right: 8, top: 6, bottom: 22 },
-    tooltip: {
-      formatter: (p) => {
-        const [x, y, v] = p.data;
-        return `置信度 ${CONFIDENCE_LABEL[CONFIDENCE_ORDER[y]]} · ${NOTE_STATUS_LABEL[NOTE_STATUS_ORDER[x]]}：${v} 条`;
-      },
+    type: 'cell',
+    data,
+    encode: { x: 'status', y: 'conf', color: 'count' },
+    scale: {
+      y: { domain: ['置信高', '置信中', '置信低'] },
+      color: { range: ['rgba(99,102,241,0.06)', 'rgba(99,102,241,0.85)'] },
     },
-    xAxis: {
-      type: 'category',
-      data: NOTE_STATUS_ORDER.map((s) => NOTE_STATUS_LABEL[s]),
-      axisLabel: AXIS_TEXT,
-      axisTick: { show: false },
-      splitArea: { show: false },
+    legend: false,
+    axis: {
+      x: { title: false, labelFontSize: 10 },
+      y: { title: false, labelFontSize: 10 },
     },
-    yAxis: {
-      type: 'category',
-      data: CONFIDENCE_ORDER.map((c) => `置信${CONFIDENCE_LABEL[c]}`),
-      axisLabel: AXIS_TEXT,
-      axisTick: { show: false },
-      inverse: true,
-    },
-    visualMap: {
-      min: 0,
-      max,
-      show: false,
-      inRange: { color: ['rgba(99,102,241,0.06)', 'rgba(99,102,241,0.85)'] },
-    },
-    series: [{
-      type: 'heatmap',
-      data,
-      label: { show: true, fontSize: 11, formatter: (p) => (p.data[2] ? String(p.data[2]) : '') },
-      itemStyle: { borderColor: 'rgba(128,128,128,0.25)', borderWidth: 1, borderRadius: 3 },
-    }],
+    style: { inset: 1 },
+    labels: [{ text: 'label', fontSize: 11 }],
+    animate: false,
+    plotType: 'heatmap',
   };
 }
 
 export function sourceMixOption(stats) {
-  const items = stats.sourceMix;
+  const data = (stats.sourceMix || []).map((i) => ({ name: i.name, count: i.count }));
   return {
-    animation: false,
-    grid: { left: 52, right: 24, top: 4, bottom: 4 },
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: { type: 'value', show: false, minInterval: 1 },
-    yAxis: {
-      type: 'category',
-      inverse: true,
-      data: items.map((i) => i.name),
-      axisLabel: AXIS_TEXT,
-      axisTick: { show: false },
-      axisLine: { show: false },
+    type: 'interval',
+    coordinate: { transform: [{ type: 'transpose' }] },
+    data,
+    encode: { x: 'name', y: 'count' },
+    axis: {
+      y: false,
+      x: { title: false, labelFontSize: 10 },
     },
-    series: [{
-      type: 'bar',
-      barMaxWidth: 12,
-      itemStyle: { color: TRUNK_COLOR.sources, borderRadius: [0, 3, 3, 0] },
-      label: { show: true, position: 'right', fontSize: 10 },
-      data: items.map((i) => i.count),
-    }],
+    legend: false,
+    labels: [{ text: 'count', position: 'right', dx: 4, fontSize: 10 }],
+    style: { fill: TRUNK_COLOR.sources, maxWidth: 12 },
+    animate: false,
+    plotType: 'bar',
   };
 }
 
