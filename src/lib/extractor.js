@@ -6,7 +6,7 @@ import {
 } from './extract-common.js';
 import { htmlToText } from './html-utils.js';
 import { visionOcrScreen, getVisionConfig } from './vision-client.js';
-import { debuggerAttach, debuggerDetach, debuggerSend } from './cdp.js';
+import { debuggerAttach, debuggerDetach, debuggerSend, withSerialForeground } from './cdp.js';
 
 // 发往页面 Runtime.evaluate 的片段里全局名拆写（SW 包校验器禁字面 window./document.）；
 // join('') 防止打包器把相邻字符串常量折叠回字面量。
@@ -277,9 +277,19 @@ export async function fetchViaTab(url, options = {}) {
         //    handles lazy-load / SPA / virtual scroll. Fast path for normal pages.
         const scrollBudget = Math.max(8000, Math.min(25000, timeoutMs - 25000));
         let scrollResp = null;
+        const askScroll = () => chrome.tabs.sendMessage(tabId, { type: 'SCROLL_COLLECT', maxTimeMs: scrollBudget });
         try {
-          scrollResp = await chrome.tabs.sendMessage(tabId, { type: 'SCROLL_COLLECT', maxTimeMs: scrollBudget });
+          scrollResp = await askScroll();
         } catch (_) { /* content script not ready or SCROLL_COLLECT unavailable -> fall back */ }
+        // 后台滚不动、懒加载不出来：排进前台队列，一次只滚一页，避免并行抢焦点卡住。
+        if (scrollResp && scrollResp.needsForeground) {
+          try {
+            scrollResp = await withSerialForeground(tabId, async () => {
+              await new Promise((r) => setTimeout(r, 280));
+              return askScroll();
+            });
+          } catch (_) { /* 保持第一次的部分结果，后面还有网络/视觉降级 */ }
+        }
 
         // Fast path: DOM content is sufficient and not garbled
         if (scrollResp && scrollResp.content && scrollResp.content.trim().length >= 80 && !scrollResp.garbled) {

@@ -8,6 +8,7 @@ import { getEntries, saveEntry } from './storage.js';
 import { getDocFile, saveDocFile } from './doc-store.js';
 import { deleteEntryCascade } from './entry-cascade.js';
 import { findMediaRefs } from './create-docx.js';
+import { normalizeFigs } from './figure-catalog.js';
 
 export const PLACE_IMAGES_MAX = 8;
 export const PLACE_IMAGE_SOURCE = 'place';
@@ -202,7 +203,7 @@ async function fetchImageBytes(src) {
 
 async function grabFromTab(tabId, { urls, selectors }) {
   const injected = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
+    target: { tabId },
     func: ({ urls: hrefs, selectors: list } = {}) => {
       const els = [];
       const seen = new Set();
@@ -228,10 +229,15 @@ async function grabFromTab(tabId, { urls, selectors }) {
         }
       }
       if (hrefList.length) {
-        document.querySelectorAll('img').forEach((img) => {
-          const src = img.currentSrc || img.src || '';
-          if (hrefList.some((u) => src === u || src.includes(u))) push(img);
-        });
+        const norm = (u) => {
+          try { const x = new URL(u, location.href); x.hash = ''; return x.href; } catch (_) { return String(u || ''); }
+        };
+        const imgs = [...document.images];
+        for (const u of hrefList) {
+          const want = norm(u);
+          const img = imgs.find((el) => norm(el.currentSrc || el.src || '') === want);
+          if (img) push(img);
+        }
       }
       if (!sels.length && !hrefList.length) {
         document.querySelectorAll('img').forEach((img) => {
@@ -240,7 +246,6 @@ async function grabFromTab(tabId, { urls, selectors }) {
         });
       }
       return els.slice(0, 8).map((img) => {
-        try { img.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
         const r = img.getBoundingClientRect();
         return {
           src: String(img.currentSrc || img.src || '').trim(),
@@ -267,13 +272,96 @@ async function grabFromTab(tabId, { urls, selectors }) {
   return hits.slice(0, PLACE_IMAGES_MAX);
 }
 
+async function alignImageRect(tabId, src) {
+  const injected = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (url) => {
+      const norm = (u) => {
+        try { const x = new URL(u, location.href); x.hash = ''; return x.href; } catch (_) { return String(u || ''); }
+      };
+      const want = norm(url);
+      const img = [...document.images].find((el) => norm(el.currentSrc || el.src || '') === want);
+      if (!img) return null;
+      try { img.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+      const r = img.getBoundingClientRect();
+      return { x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth || 1, vh: window.innerHeight || 1 };
+    },
+    args: [src],
+  }).catch(() => []);
+  return (injected && injected[0] && injected[0].result) || null;
+}
+
 async function materializeHit(tabId, hit) {
   const fetched = await fetchImageBytes(hit.src);
   if (fetched && fetched.bytes && fetched.bytes.byteLength > 80) return fetched;
-  if (!hit.rect) return null;
+  const rect = hit.src ? await alignImageRect(tabId, hit.src) : null;
+  const box = rect || hit.rect;
+  if (!box) return null;
   const shot = await captureVisible(tabId).catch(() => null);
   if (!shot) return null;
-  return cropViewportShot(shot, hit.rect);
+  return cropViewportShot(shot, box);
+}
+
+function chromeTabsReady() {
+  return typeof chrome !== 'undefined' && !!(chrome.tabs && chrome.tabs.sendMessage);
+}
+
+function pageUrlKey(raw) {
+  try {
+    const url = new URL(String(raw || ''));
+    url.hash = '';
+    return url.href;
+  } catch (_) {
+    return String(raw || '').trim();
+  }
+}
+
+async function waitTabComplete(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || tab.status === 'complete') return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(onUp);
+      resolve();
+    }, 15000);
+    function onUp(id, info) {
+      if (id !== tabId || info.status !== 'complete') return;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUp);
+      resolve();
+    }
+    chrome.tabs.onUpdated.addListener(onUp);
+  });
+}
+
+async function openSourceTab(url) {
+  const want = pageUrlKey(url);
+  const all = await chrome.tabs.query({});
+  const hit = all.find((t) => t.url && pageUrlKey(t.url) === want);
+  if (hit) return { tab: hit, opened: false };
+  const created = await chrome.tabs.create({ url, active: false });
+  await waitTabComplete(created.id);
+  await new Promise((r) => setTimeout(r, 500));
+  return { tab: created, opened: true };
+}
+
+async function sendFigureGrab(tabId, n) {
+  for (let i = 0; i < 3; i++) {
+    const resp = await chrome.tabs.sendMessage(tabId, { type: 'GRAB_FIGURE', n }).catch(() => null);
+    if (resp) return resp;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return null;
+}
+
+async function resolveFigureTab(req) {
+  if (req.tab_id) {
+    const tab = await chrome.tabs.get(req.tab_id).catch(() => null);
+    const samePage = !req.url || (tab && pageUrlKey(tab.url) === pageUrlKey(req.url));
+    if (tab && samePage) return { tab, opened: false };
+  }
+  if (req.url) return openSourceTab(req.url);
+  return { tab: null, opened: false };
 }
 
 async function insertIntoEditor(tabId, ids, selector, projectId) {
@@ -372,12 +460,70 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
     reused.push(loaded);
   }
 
+  const figs = normalizeFigs(args.figs);
   const targeted = urls.length > 0 || selectors.length > 0;
-  const wantShot = args.screenshot === true && !targeted && !entryIds.length;
-  const needGrab = !entryIds.length || targeted;
+  const wantShot = args.screenshot === true && !figs.length && !targeted && !entryIds.length;
   let candidates = [];
+  const openedTabs = [];
 
-  if ((wantShot || needGrab) && created.length + reused.length < PLACE_IMAGES_MAX) {
+  if (figs.length) {
+    if (!chromeTabsReady()) return JSON.stringify({ ok: false, error: '当前环境不能按编号取来源图' });
+    try {
+      for (const req of figs) {
+        if (created.length + reused.length >= PLACE_IMAGES_MAX) break;
+        if (!req.tab_id && !req.url) {
+          errors.push(`图 ${req.n} 缺少 tab_id 或来源页 url`);
+          continue;
+        }
+        const { tab, opened } = await resolveFigureTab(req);
+        if (opened && tab) openedTabs.push(tab.id);
+        if (!tab) {
+          errors.push(`图 ${req.n} 的来源页打不开`);
+          continue;
+        }
+        const grabbed = await sendFigureGrab(tab.id, req.n);
+        if (!grabbed || !grabbed.ok || !grabbed.src) {
+          errors.push((grabbed && grabbed.error) || `正文里没有图 ${req.n}`);
+          continue;
+        }
+        const got = await materializeHit(tab.id, {
+          src: grabbed.src,
+          alt: grabbed.caption || '',
+          rect: grabbed.rect,
+        });
+        if (!got) {
+          errors.push(`无法读取图 ${req.n}`);
+          continue;
+        }
+        const entry = await saveImageSource(pid, {
+          url: tab.url || req.url || '',
+          title: tab.title || '',
+          imageUrl: grabbed.src,
+          bytes: got.bytes,
+          mime: got.mime,
+          alt: grabbed.caption || '',
+        });
+        created.push({ entry, bytes: got.bytes, mime: got.mime });
+      }
+    } finally {
+      for (const id of openedTabs) chrome.tabs.remove(id).catch(() => {});
+    }
+  } else if (!wantShot && !targeted && !entryIds.length) {
+    if (!chromeTabsReady()) {
+      return JSON.stringify({ ok: false, error: '要取来源里的图，请用 figs 指定编号' });
+    }
+    const srcTab = await resolveTab(args.tab_id);
+    if (!srcTab) return JSON.stringify({ ok: false, error: '找不到来源页。先读页面，再用 figs 里的 tab_id 或 url。' });
+    const cat = await chrome.tabs.sendMessage(srcTab.id, { type: 'CATALOG_FIGURES' }).catch(() => null);
+    return JSON.stringify({
+      ok: false,
+      error: '要取来源里的图，请用 figs 指定编号。编号来自 read_tab / read_current_page 的 data.figures。',
+      tab_id: srcTab.id,
+      url: srcTab.url || '',
+      figures: (cat && cat.figures) || [],
+      cover: (cat && cat.cover) || null,
+    });
+  } else if ((wantShot || targeted) && created.length + reused.length < PLACE_IMAGES_MAX) {
     const srcTab = await resolveTab(args.tab_id);
     if (!srcTab) return JSON.stringify({ ok: false, error: '找不到取图的标签页（传 tab_id 或先打开目标页）' });
 
@@ -392,7 +538,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
       created.push({ entry, bytes: parsed.bytes, mime: parsed.mime });
       const preview = await bytesToPreviewDataUrl(parsed.bytes, parsed.mime).catch(() => bytesToDataUrl(parsed.bytes, parsed.mime));
       ctx._viewportShot = preview;
-      ctx._viewportShotNote = '【视口截图】刚截的当前页。先看图理解页面；要某张原图再 place_images(urls=或 selectors=)，不要再 screenshot=true。';
+      ctx._viewportShotNote = '【视口截图】刚截的当前页。先看图理解页面；要正文原图再用 figs 指定 data.figures 的编号，不要再 screenshot=true。';
       const hits = await grabFromTab(srcTab.id, {}).catch(() => []);
       candidates = hits.map((h) => ({
         src: h.src || '',
@@ -400,7 +546,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
         width: h.width,
         height: h.height,
       }));
-    } else if (needGrab) {
+    } else if (targeted) {
       const hits = await grabFromTab(srcTab.id, { urls, selectors });
       const room = PLACE_IMAGES_MAX - created.length - reused.length;
       for (const hit of hits.slice(0, room)) {
@@ -428,7 +574,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
 
   const pack = [...reused, ...created];
   if (!pack.length) {
-    return JSON.stringify({ ok: false, error: errors[0] || '没有取到图片。指定 urls / selectors / entry_ids，或对当前页可见图取。', errors });
+    return JSON.stringify({ ok: false, error: errors[0] || '没有取到图片。用 figs 指定 data.figures 里的编号。', errors });
   }
 
   if (typeof ctx.onEntriesChanged === 'function') {
@@ -505,7 +651,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
     delivered,
     candidates,
     hint: wantShot
-      ? '截图像素已附在下一轮。看完再决定：只要这张截图就结束；要原图则用 candidates 里的 src 或 selectors 再调一次（不要再 screenshot=true）。'
+      ? '截图像素已附在下一轮。看完再决定：只要这张截图就结束；要正文原图则用 figs 指定 data.figures 的编号再调一次（不要再 screenshot=true）。'
       : undefined,
     errors,
   });

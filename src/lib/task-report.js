@@ -70,12 +70,12 @@ export const SUBMIT_REPORT_TOOL = {
     name: 'submit_report',
     description:
       '提交给父代理的最终结构化报告。只有本工具成功才算任务完成。'
-      + '阅读任务把原文放进 passages（use + doc_id + anchor + 逐字 quote），claims 传空数组，不要写 findings。'
+      + '阅读任务的 summary 写判断、关键数字和对不上的地方；原文放进 passages（use + doc_id + anchor + 逐字 quote）。claims 传空数组。'
       + '操作型任务把结果写入 actions，事实才拆成 claims。',
     parameters: {
       type: 'object',
       properties: {
-        summary: { type: 'string', description: '任务结果短摘要，不超过 800 字。先写结论，再写依据。' },
+        summary: { type: 'string', description: '不超过 800 字。阅读任务写判断、关键数字、对不上的地方。其他任务先写结论，再写依据。' },
         findings: { type: 'array', maxItems: MAX_FINDINGS, items: findingSchema },
         claims: { type: 'array', maxItems: MAX_CLAIMS, items: claimSchema },
         actions: {
@@ -245,7 +245,7 @@ function claimForMain(c) {
   };
 }
 
-const NOTE_PASSAGES = 'covered 是已有原文的要点，unresolved 是还没找到原文的要点。缺口还会改变文档做法时，只为缺口再派阅读。覆盖够了调用 write_document。不要把段落抄进对话。';
+const NOTE_PASSAGES = 'summary 是这一路的判断、数字和对不上的地方。unresolved 是会让判断反过来、但还没找到原文的点。只为这种缺口再派阅读。判断够了就调用 write_document，由它在这些判断上再推进一步。不要把段落抄进对话。';
 const NOTE_FINDINGS = '按 findings 回答：answer 是判断，写成段落；supporting / contradicting 是这条判断用到的事实，写进同一段并括注 sources，不要另起清单。用户要一份文档时调用 write_document，不要自己重写正文。';
 const NOTE_FEW = '这次没有 findings。用 summary 作答；claims 是少量事实，写进段落并括注 sources，不要逐条照抄。';
 const NOTE_PILE = '事实较多但没有 findings，这里不展开 claims。要成文就派阅读补 passages，再调用 write_document。';

@@ -150,8 +150,9 @@ function childSystemPrompt(agent, maxTabs = SUBAGENT_MAX_TABS) {
     '任务完成后必须调用 submit_report。自然语言正文、Markdown 或自称“已完成”都不算交回。',
     ...(agent.name === 'explore'
       ? [
-        '阅读交回使用 passages：每条包含 use、doc_id、anchor、逐字 quote。claims 传空数组，不要写 findings。',
-        '查过但没有原文的要点写进 unresolved。summary 只列覆盖了哪些 use，不要写文档正文。',
+        'summary 写你的判断、关键数字、对不上的地方。数字必须来自打开的原文。',
+        'passages 留下 use、doc_id、anchor、逐字 quote，供核对和挂出处。claims 传空数组。',
+        '会让判断反过来、但没找到原文的点写进 unresolved。不要写整篇研报。',
       ]
       : [
         '事实拆成 claims；每条 evidence 必须给 doc_id、锚点和来源逐字 quote。只有 URL、标签页 id 或转述的内容放 unresolved，不得伪造证据。',
@@ -245,7 +246,9 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
       childCtx.subagentBudgetForced = true;
       messages.push({
         role: 'user',
-        content: `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：已核实的写进 claims，能回答的问题写进 findings，没查完的方向和原因写进 unresolved。`,
+        content: agent.name === 'explore'
+          ? `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：summary 写你的判断、关键数字和对不上的地方；passages 留下已有原文；claims 留空；没查完的写进 unresolved。`
+          : `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：已核实的写进 claims，能回答的问题写进 findings，没查完的方向和原因写进 unresolved。`,
       });
     } else if (!warned && !forced && state.ratio >= SUBAGENT_BUDGET_WARN_RATIO) {
       warned = true;

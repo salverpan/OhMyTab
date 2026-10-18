@@ -32,6 +32,9 @@ import { attachScopeQuiz } from '../lib/scope-quiz.js';
 import { appendChartsTo, disposeChatCharts, rasterizeChartOption } from '../lib/chat-charts.js';
 import { upsertPlanCardEl } from '../lib/plan.js';
 import { upsertDocEditsCardEl } from '../lib/doc-edits.js';
+import {
+  FIGURE_MAX, absUrl, resolveImageUrl, figureCaption,
+} from '../lib/figure-catalog.js';
 
 // Alias for backwards compatibility within this file
 const extractPublishedDate = extractPublishedDateFromDoc;
@@ -139,6 +142,121 @@ function isNoiseElement(el) {
   if (/(^|[\s_-])header([\s_-]|$)/i.test(hay) && !/(card|panel|section)/i.test(hay)) return true;
   if (/(^|[\s_-])footer([\s_-]|$)/i.test(hay) && !/(card|panel|section)/i.test(hay)) return true;
   return false;
+}
+
+const FIGURE_MIN_PX = 64;
+let figureByEl = new WeakMap();
+
+function articleRoot() {
+  const selectors = ['article', 'main', '[role="main"]', '#content', '.article-body', '.article-content', '.post-content', '.entry-content'];
+  let best = null;
+  let bestScore = 0;
+  for (const sel of selectors) {
+    let nodes = [];
+    try { nodes = document.querySelectorAll(sel); } catch (_) { nodes = []; }
+    for (const el of nodes) {
+      if (isNoiseElement(el)) continue;
+      const score = (el.innerText || '').length;
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+  }
+  return bestScore >= 80 ? best : document.body;
+}
+
+function imageFields(img) {
+  const picture = img.closest('picture');
+  const source = picture && picture.querySelector('source[srcset]');
+  return {
+    currentSrc: img.currentSrc || '',
+    src: img.getAttribute('src') || '',
+    srcset: img.getAttribute('srcset') || (source && source.getAttribute('srcset')) || '',
+    dataSrc: img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy-src') || '',
+  };
+}
+
+function figureTooSmall(img) {
+  const r = img.getBoundingClientRect();
+  const w = Math.max(img.naturalWidth || 0, r.width || 0);
+  const h = Math.max(img.naturalHeight || 0, r.height || 0);
+  if (!w || !h) return false;
+  return w < FIGURE_MIN_PX || h < FIGURE_MIN_PX;
+}
+
+function nearestCaption(img) {
+  const figure = img.closest('figure');
+  if (figure) {
+    const cap = figure.querySelector('figcaption');
+    const text = cap ? (cap.innerText || '').replace(/\s+/g, ' ').trim() : '';
+    if (text) return text;
+  }
+  const next = img.nextElementSibling;
+  if (next && /caption|credit|wp-caption-text/i.test(String(next.className || ''))) {
+    return (next.innerText || '').replace(/\s+/g, ' ').trim();
+  }
+  return '';
+}
+
+function ancestorNoise(img, root) {
+  let p = img.parentElement;
+  while (p && p !== root) {
+    if (isNoiseElement(p)) return true;
+    const role = (p.getAttribute('role') || '').toLowerCase();
+    if (role === 'complementary' || p.tagName === 'ASIDE') return true;
+    p = p.parentElement;
+  }
+  return false;
+}
+
+/** 只登记正文里的图。封面（og:image）单独记，n=0，不占正文序号。 */
+function catalogPageFigures() {
+  const root = articleRoot() || document.body;
+  const figures = [];
+  const seen = new Set();
+  for (const img of root.querySelectorAll('img')) {
+    if (figures.length >= FIGURE_MAX) break;
+    if (ancestorNoise(img, root)) continue;
+    if (figureTooSmall(img)) continue;
+    const src = resolveImageUrl(imageFields(img), location.href);
+    if (!src || seen.has(src)) continue;
+    seen.add(src);
+    const caption = figureCaption({
+      figcaption: nearestCaption(img),
+      alt: img.getAttribute('alt') || '',
+    });
+    figures.push({ n: figures.length + 1, src, caption, el: img });
+  }
+  const og = (document.querySelector('meta[property="og:image"]') || {}).content
+    || (document.querySelector('meta[name="twitter:image"]') || {}).content
+    || '';
+  const coverSrc = absUrl(og, location.href);
+  const coverAlt = (document.querySelector('meta[property="og:image:alt"]') || {}).content || '';
+  const cover = coverSrc ? { n: 0, src: coverSrc, caption: figureCaption({ alt: coverAlt || '封面' }) } : null;
+  return { figures, cover };
+}
+
+function indexFigures() {
+  figureByEl = new WeakMap();
+  const cat = catalogPageFigures();
+  for (const fig of cat.figures) {
+    if (fig.el) figureByEl.set(fig.el, fig);
+  }
+  return cat;
+}
+
+function figureMarker(img) {
+  const fig = figureByEl.get(img);
+  if (!fig) return '';
+  return `【图 ${fig.n}】${fig.caption || '插图'}`;
+}
+
+function publicFigures(cat) {
+  return {
+    figures: cat.figures.map((f) => ({ n: f.n, caption: f.caption || '' })),
+    cover: cat.cover ? { n: 0, caption: cat.cover.caption || '封面' } : null,
+  };
 }
 
 function isVisibleElement(el) {
@@ -365,7 +483,7 @@ function inlineTextOf(el, depth = 0) {
       const t = node.tagName.toLowerCase();
       if (['script', 'style', 'noscript', 'template', 'svg'].includes(t)) continue;
       if (t === 'br') { out += ' '; continue; }
-      if (t === 'img') { const alt = (node.getAttribute('alt') || '').trim(); if (alt) out += ' ' + alt; continue; }
+      if (t === 'img') { const mark = figureMarker(node); if (mark) out += ' ' + mark; continue; }
       out += ' ' + inlineTextOf(node, depth + 1);
     }
   }
@@ -425,8 +543,8 @@ function renderMarkdownBlock(el, depth = 0) {
   }
   if (tag === 'input' || tag === 'select' || tag === 'textarea') return [];
   if (tag === 'img') {
-    const alt = (el.getAttribute('alt') || '').trim();
-    return alt ? [`[图片: ${alt}]`] : [];
+    const mark = figureMarker(el);
+    return mark ? [mark] : [];
   }
   if (tag === 'ul' || tag === 'ol') {
     const items = [...el.children].filter((c) => c.tagName.toLowerCase() === 'li');
@@ -467,7 +585,7 @@ function renderMarkdownBlock(el, depth = 0) {
       const t = node.tagName.toLowerCase();
       if (['script', 'style', 'noscript', 'template', 'svg'].includes(t)) continue;
       if (t === 'br') { buf += ' '; continue; }
-      if (t === 'img') { const alt = (node.getAttribute('alt') || '').trim(); if (alt) buf += ' [图片: ' + alt + ']'; continue; }
+      if (t === 'img') { const mark = figureMarker(node); if (mark) buf += ' ' + mark; continue; }
       if (INLINE_ELEMENT_TAGS.has(t)) {
         if (t === 'a') {
           const cls = typeof node.className === 'string' ? node.className : '';
@@ -539,6 +657,7 @@ function buildExtractSnapshot() {
 
 function extractStructuredMarkdown() {
   try {
+    indexFigures();
     const body = document.body;
     if (!body) return null;
     const blocks = [];
@@ -707,6 +826,57 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true; // 异步回包
   }
 
+  if (msg.type === 'CATALOG_FIGURES') {
+    try {
+      sendResponse({ ok: true, ...publicFigures(catalogPageFigures()) });
+    } catch (err) {
+      sendResponse({ ok: false, error: (err && err.message) || '无法列出正文图片' });
+    }
+    return false;
+  }
+
+  if (msg.type === 'GRAB_FIGURE') {
+    (async () => {
+      try {
+        const n = Number(msg.n);
+        const cat = catalogPageFigures();
+        if (n === 0) {
+          if (!cat.cover) { sendResponse({ ok: false, error: '这一页没有封面图' }); return; }
+          sendResponse({ ok: true, n: 0, src: cat.cover.src, caption: cat.cover.caption, rect: null });
+          return;
+        }
+        const fig = cat.figures.find((f) => f.n === n);
+        if (!fig || !fig.el) { sendResponse({ ok: false, error: `正文里没有图 ${n}` }); return; }
+        const img = fig.el;
+        try { img.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        if (!img.complete || !img.naturalWidth) {
+          await new Promise((resolve) => {
+            const done = () => resolve();
+            img.addEventListener('load', done, { once: true });
+            img.addEventListener('error', done, { once: true });
+            setTimeout(done, 1200);
+          });
+        }
+        const src = resolveImageUrl(imageFields(img), location.href) || fig.src;
+        const r = img.getBoundingClientRect();
+        sendResponse({
+          ok: true,
+          n,
+          src,
+          caption: fig.caption || '',
+          rect: {
+            x: r.x, y: r.y, w: r.width, h: r.height,
+            vw: window.innerWidth || 1,
+            vh: window.innerHeight || 1,
+          },
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: (err && err.message) || '取图失败' });
+      }
+    })();
+    return true;
+  }
+
   // SW asks us to extract content via Readability (background-tab path)
   if (msg.type === 'EXTRACT_CONTENT') {
     // format: 'text' (默认) | 'markdown' | 'auto'
@@ -729,6 +899,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (!extracted) extracted = extractPageContent();
       const resp = { ...(extracted || { title: document.title || '', content: '' }), pageType };
       resp.structured = (pageType === 'dashboard' || pageType === 'list') ? extractStructuredData() : null;
+      if (msg.format) {
+        const pub = publicFigures(indexFigures());
+        resp.figures = pub.figures;
+        resp.cover = pub.cover;
+      }
       sendResponse(resp);
     } catch (err) {
       // 不 sendResponse 时 chrome.tabs.sendMessage 永不 settle，AI 会卡在工具状态行。
@@ -2416,7 +2591,9 @@ function waitForNetworkIdle(maxMs = 1500, quietMs = 600) {
       fallback where DOM recycles nodes) -> repeat until bottom + stable + idle
    3. Scroll back to top, run extractPageContent() once on the now-fully-loaded DOM
    4. If final Readability result is suspiciously short vs accumulated (virtual
-      scroll recycled content out of DOM), return accumulated text instead */
+      scroll recycled content out of DOM), return accumulated text instead
+   后台能滚就在后台滚。只有滚动位置连续不动（页面没让后台滚）才标 needsForeground，
+   让调用方排到前台再滚一次，避免在后台空转到超时。 */
 async function scrollAndCollect(maxTimeMs = 25000) {
   const deadline = Date.now() + maxTimeMs;
 
@@ -2434,6 +2611,7 @@ async function scrollAndCollect(maxTimeMs = 25000) {
 
   let prevHeight = 0;
   let stableRounds = 0;
+  let hiddenStuck = 0;
   const MAX_ROUNDS = 60;
 
   accumulate();
@@ -2453,6 +2631,23 @@ async function scrollAndCollect(maxTimeMs = 25000) {
     accumulate();
 
     const after = capturePageState();
+    const hidden = document.visibilityState !== 'visible';
+    const moved = after.scrollY > before.scrollY + 24;
+    if (hidden && !before.atBottom && !moved) hiddenStuck++;
+    else hiddenStuck = 0;
+    if (hiddenStuck >= 2) {
+      try { window.scrollTo(0, 0); } catch (_) {}
+      const peek = extractPageContent();
+      const accumText = orderedBlocks.join('\n');
+      return {
+        title: peek?.title || document.title || '',
+        content: (accumText.length > (peek?.content || '').length ? accumText : (peek?.content || '')).slice(0, MAX_TEXT_LENGTH),
+        publishedAt: peek?.publishedAt || null,
+        needsForeground: true,
+        pageHeight: after.height,
+        garbled: false,
+      };
+    }
     if (after.height > prevHeight) stableRounds = 0;
     else stableRounds++;
     prevHeight = after.height;

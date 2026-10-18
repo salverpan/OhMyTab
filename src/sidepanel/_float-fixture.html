@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    body.license-pending #app { visibility: visible; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="panel-container">
+      <section id="panelCollect" class="panel active" style="opacity:1;pointer-events:auto;animation:none">
+        <div id="chatCol" class="chat-col">
+          <div class="chat-header"><span class="chat-title">AI 对话</span></div>
+          <div id="chatMessages" class="chat-messages">
+            <div class="chat-msg ai">
+              <p><strong>3. 联网调研</strong></p>
+              <ul>
+                <li>快速事实核查（一搜就答）</li>
+                <li>多源深读：派几路只读子代理分头读全文，我综合判断，原文段落留在工作区</li>
+                <li>查到的东西顺手记进「结论笔记」带出处，下一轮不用重读</li>
+              </ul>
+              <p><strong>4. 交付</strong></p>
+              <ul>
+                <li>出表格 / Excel（真 .xlsx 原件）、Word、Markdown 报告、JSON</li>
+                <li>对话里直接画折线/柱状/热力图，材料里已有的图也能取来嵌进文档</li>
+                <li>文档可直接改（微信编辑器、Word 都能写进去）</li>
+              </ul>
+              <p><strong>另有两样顺手的东西</strong></p>
+              <ul>
+                <li>已接 30+ 个免密钥数据接口：行情（YahooFinance/CoinGecko/东方财富）、宏观</li>
+                <li>定时任务：「每天 8 点给我一份市场简报」这种我可以真的挂上</li>
+              </ul>
+            </div>
+          </div>
+          <div class="heartbeat-shell" aria-hidden="true">
+            <div class="heartbeat-shell-clip">
+              <div class="heartbeat-drawer"><div class="hb-head"><span class="hb-title">心跳任务</span></div></div>
+            </div>
+          </div>
+          <div id="commandBar" class="command-bar" style="animation:none">
+            <div class="cmd-input-wrap">
+              <textarea id="cmdInput" rows="1" placeholder="戳戳 SuperCat，说说想干嘛…"></textarea>
+              <div class="cmd-composer-foot"><span style="font-size:12px;color:#6b6b73">deepseek</span><button type="button" class="cmd-icon-btn send"></button></div>
+            </div>
+          </div>
+        </div>
+        <div class="collect-main" style="background:#eee"><header class="header"><span>工作区</span></header></div>
+      </section>
+    </div>
+    <nav class="tab-bar"><span class="tab-slider" style="transform:translateX(80px)"></span><button class="tab-btn active">采</button></nav>
+  </div>
+  <script>
+    window.__measure = () => {
+      const col = document.getElementById('chatCol');
+      const bar = document.getElementById('commandBar');
+      const wrap = document.querySelector('.cmd-input-wrap');
+      const tab = document.querySelector('.tab-bar');
+      const app = document.getElementById('app');
+      const cr = col.getBoundingClientRect();
+      const br = bar.getBoundingClientRect();
+      const wr = wrap.getBoundingClientRect();
+      const tr = tab.getBoundingClientRect();
+      const ar = app.getBoundingClientRect();
+      return {
+        rows: getComputedStyle(col).gridTemplateRows,
+        colBottom: Math.round(cr.bottom),
+        barTop: Math.round(br.top),
+        barBottom: Math.round(br.bottom),
+        barH: Math.round(br.height),
+        wrapTop: Math.round(wr.top),
+        wrapBottom: Math.round(wr.bottom),
+        wrapH: Math.round(wr.height),
+        tabTop: Math.round(tr.top),
+        appBottom: Math.round(ar.bottom),
+        gapWrapToTab: Math.round(tr.top - wr.bottom),
+        gapBarToCol: Math.round(cr.bottom - br.bottom),
+        gapColToTab: Math.round(tr.top - cr.bottom),
+      };
+    };
+  </script>
+</body>
+</html>

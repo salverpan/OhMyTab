@@ -12,7 +12,7 @@ const OD = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 const XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
 const MAX_CHARS = 400000;
 
-/* ---------- 图表图片（ECharts 光栅化后的 PNG 嵌进 docx） ----------
+/* ---------- 图表图片（G2 光栅化后的 PNG 嵌进 docx） ----------
  * 正文里的图片引用是一行 markdown 图片语法 `![说明](chart:ID)`，ID 指向 doc-store 里
  * 光栅化时存下的 PNG（plot_chart deliver=docx）。渲染成「居中图片 + 图 N 题注 + 来源行」。 */
 

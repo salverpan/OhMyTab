@@ -1,7 +1,7 @@
 /* 研报写作阶段冒烟（node test/report-smoke.mjs）。用假模型驱动，不碰 chrome.*。 */
 
 import assert from 'node:assert/strict';
-import { collectPassages, splitDraft, writeDocument } from '../src/lib/document-writer.js';
+import { collectPassages, splitDraft, writeDocument, applyCitations } from '../src/lib/document-writer.js';
 import { validateTaskReport, reportForMain, SUBMIT_REPORT_TOOL } from '../src/lib/task-report.js';
 import { CHAT_TOOLS } from '../src/lib/tools.js';
 import { PARENT_ONLY_TOOLS } from '../src/lib/subagent-policy.js';
@@ -54,7 +54,8 @@ ok(/use/.test(validateTaskReport({
   passages: [{ doc_id: 'doc_a', anchor: 'c1', quote: 'q' }],
 }).error || ''), '缺 use 的段落被拒');
 const passageMain = reportForMain(passageReport.report);
-ok(passageMain.covered[0] === '审批' && passageMain.passage_count === 1 && !passageMain.claims, '主代理只看覆盖，不看引文');
+ok(passageMain.covered[0] === '审批' && passageMain.passage_count === 1 && !passageMain.claims, '主代理不看引文');
+ok(passageMain.summary === '覆盖了审批', '主代理能看见这一路的判断');
 ok(collectPassages([{ id: 't1', report: passageReport.report }]).length === 1, '写作阶段收集段落');
 ok(splitDraft('<<<DOC>>>\n# 方案\n正文\n<<<GAPS>>>\n- 申报时限').gaps[0] === '申报时限', '改稿分隔缺口');
 const docCalls = [];
@@ -86,5 +87,30 @@ const held = await writeDocument(
 );
 ok(!held.ok && held.need_reading[0] === '申报时限', '关键缺口不保存，退回补读');
 ok(!(await writeDocument({ genre: '策划方案', brief: 'x' }, { apiConfig: { apiKey: 'k' }, sessions: [], chat: docChat })).ok, '没有段落时拒绝成文');
+const cited = applyCitations(
+  '去掉汽油之后，别的价格也在涨。',
+  [{ doc_id: 'doc_a', anchor: 'c3', quote: '由市交通局会同军方划设', use: '审批' }],
+  '<<<CITE>>>\n别的价格也在涨\tdoc_a#c3\n这句话不在正文\tdoc_a#c3\n别的价格也在涨\tdoc_missing#c9\n',
+);
+ok(cited.includes('别的价格也在涨〔doc_a#c3〕') && cited.includes('## 出处') && !cited.includes('doc_missing'), '出处只挂在原文存在的短句后');
+ok(cited.startsWith('去掉汽油之后，别的价格也在涨〔doc_a#c3〕。'), '挂出处不改已经写好的句子');
+const reportCalls = [];
+const reported = await writeDocument(
+  { genre: '研报', brief: '这轮物价说明什么' },
+  {
+    apiConfig: { apiKey: 'k' },
+    sessions: [{ id: 't1', report: passageReport.report }],
+    chat: async (messages) => {
+      reportCalls.push(messages.map((m) => m.content).join('\n'));
+      if (reportCalls.length === 1) return { content: '核心也在涨，所以不只是汽油。', usage: { total_tokens: 1 } };
+      if (reportCalls.length === 2) return { content: '<<<DOC>>>\n核心也在涨，所以不只是汽油。\n<<<GAPS>>>\n', usage: { total_tokens: 1 } };
+      return { content: '<<<CITE>>>\n不只是汽油\tdoc_a#c3\n', usage: { total_tokens: 1 } };
+    },
+    ctx: {},
+  },
+);
+ok(reported.ok && reported.markdown.includes('不只是汽油〔doc_a#c3〕'), '研报定稿后才挂出处');
+ok(reportCalls.length === 3 && reportCalls[2].includes('<<<CITE>>>'), '出处是单独一轮，不和改稿混在一起');
+ok(reportCalls[0].includes('调查员的判断') && reportCalls[0].includes('覆盖了审批'), '写稿看得到调查员的判断');
 
 console.log(`report-smoke: ${passed} passed`);

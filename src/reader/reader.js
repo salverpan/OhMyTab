@@ -198,7 +198,7 @@ async function loadArrayBufferInner(name, ab, urlForAnnotations) {
     else if (kind === 'doc') await renderLegacyDoc(ab);
     else if (kind === 'md' || kind === 'txt') await renderPlainText(ab, kind);
     else await renderSheet(ab, kind);
-    showStatus('已加载，可以直接划词');
+    showStatus('已加载');
     announceReaderSession(editMode ? 'editing' : 'open');
     updateRevBadge(); // 只读/编辑都显示待审修订数
     return true;
@@ -220,7 +220,7 @@ async function loadRemote(url) {
     const name = decodeURIComponent(url.split('/').pop().split('?')[0]) || 'document';
     // 只在渲染成功时覆盖提示（loadArrayBuffer 失败时保留错误信息）
     const ok = await loadArrayBuffer(name, ab, url);
-    if (ok) showStatus('已加载，可以直接划词');
+    if (ok) showStatus('已加载');
   } catch (err) {
     showStatus('加载失败：' + (err.message || String(err)), 6000);
   }

@@ -96,6 +96,21 @@ export async function ensureTabForeground(tabId) {
   return tab;
 }
 
+let foregroundTail = Promise.resolve();
+
+/**
+ * 同一时刻只允许一个标签占前台。
+ * 只给「后台滚动位置不动、不拉到前台就读不到」的页面用。普通读取不走这里。
+ */
+export function withSerialForeground(tabId, fn) {
+  const job = foregroundTail.then(async () => {
+    await ensureTabForeground(tabId);
+    return fn();
+  });
+  foregroundTail = job.then(() => {}, () => {});
+  return job;
+}
+
 /**
  * 仅在 discarded/frozen 时激活以唤醒 renderer，不抢用户当前标签、不改窗口焦点。
  * browser_act 默认路径用这个；截图 / AX / 可信点击仍走 ensureTabForeground。

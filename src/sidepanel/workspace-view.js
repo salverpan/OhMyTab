@@ -403,7 +403,6 @@ export function createWorkspaceView(opts) {
     if (els.previewBack) els.previewBack.hidden = !row;
 
     if (!row) {
-      const t = cache.totals || {};
       if (els.previewTitle) els.previewTitle.textContent = '项目概览';
       if (els.previewMeta) els.previewMeta.textContent = '';
       if (els.previewActs) {
@@ -414,11 +413,6 @@ export function createWorkspaceView(opts) {
       const charts = buildOverviewCharts(computeOverviewStats(allCache));
       els.previewBody.innerHTML = `
         <div class="ws-overview">
-          <div class="ws-overview-stats">
-            <div class="ws-stat"><span class="ws-stat-n">${t.sources || 0}</span><span class="ws-stat-l">来源</span></div>
-            <div class="ws-stat"><span class="ws-stat-n">${t.notes || 0}</span><span class="ws-stat-l">笔记</span></div>
-            <div class="ws-stat"><span class="ws-stat-n">${t.outputs || 0}</span><span class="ws-stat-l">产出</span></div>
-          </div>
           ${charts.map((c) => `
             <div class="ws-chart-card">
               <div class="ws-chart-title">${escHtml(c.title)}${c.hint ? `<span class="ws-chart-hint">${escHtml(c.hint)}</span>` : ''}</div>
