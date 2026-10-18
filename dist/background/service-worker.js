@@ -8782,9 +8782,102 @@ function readAttributeStr(xmlData, i) {
 }
 
 /**
- * Select all the attributes whether valid or invalid.
+ * Walk `attrStr` once, left to right, splitting it into attribute tokens.
+ *
+ * This replaces a regex that used to do the same job
+ * (`(\s*)([^\s=]+)(\s*=)?(\s*(['"])(([\s\S])*?)\5)?`). That regex led with an
+ * optional whitespace group followed by a required "non-whitespace" group.
+ * On a long run of whitespace that never resolves into an attribute name
+ * (e.g. a tag with thousands of trailing spaces before `>`), the engine
+ * backtracks the whitespace group one character at a time before giving up
+ * and moving to the next starting position — one full backtrack per
+ * position, which is quadratic in the length of the run.
+ *
+ * A single forward-only scan can never backtrack, so it can't be made slow
+ * this way no matter how much whitespace the input contains — it's always
+ * proportional to the length of the string, once.
+ *
+ * Each returned token mirrors the shape the old regex match array had, so
+ * the validation logic below (which reads token[1]..token[6]) didn't need
+ * to change:
+ *   token.startIndex - where this token begins in attrStr
+ *   token[1]          - leading whitespace before the name
+ *   token[2]          - the attribute name
+ *   token[3]          - whitespace + '=' if present, else undefined
+ *   token[4]          - marker (any defined value) if a quoted value was found
+ *   token[5]          - the quote character used ('"' or "'")
+ *   token[6]          - the value's text, without the surrounding quotes
+ *
+ * A malformed leading character (e.g. a stray '=' with no name before it)
+ * is simply skipped over, one character at a time — the same outcome the
+ * old regex produced by failing to match at that position and retrying at
+ * the next one.
  */
-const validAttrStrRegxp = new RegExp('(\\s*)([^\\s=]+)(\\s*=)?(\\s*([\'"])(([\\s\\S])*?)\\5)?', 'g');
+function scanAttributeTokens(attrStr) {
+  const tokens = [];
+  const len = attrStr.length;
+  let i = 0;
+
+  while (i < len) {
+    const tokenStart = i;
+
+    // Leading whitespace before the name.
+    while (i < len && isWhiteSpace(attrStr[i])) i++;
+    if (i >= len) break; // trailing whitespace only — nothing left to read
+
+    if (attrStr[i] === '=') {
+      // No name before this '=' — not a valid attribute start. Move past
+      // just this one character and try again from the next position.
+      i = tokenStart + 1;
+      continue;
+    }
+
+    const leadingWs = attrStr.slice(tokenStart, i);
+
+    // Attribute name — everything up to the next whitespace or '='.
+    const nameStart = i;
+    while (i < len && !isWhiteSpace(attrStr[i]) && attrStr[i] !== '=') i++;
+    const name = attrStr.slice(nameStart, i);
+
+    // Optional whitespace + '='.
+    let equalsGroup; // whitespace + '=' text, or undefined if absent
+    let j = i;
+    while (j < len && isWhiteSpace(attrStr[j])) j++;
+    if (j < len && attrStr[j] === '=') {
+      equalsGroup = attrStr.slice(i, j + 1);
+      i = j + 1;
+    }
+
+    // Optional whitespace + quoted value.
+    let quoteChar;
+    let value;
+    let k = i;
+    while (k < len && isWhiteSpace(attrStr[k])) k++;
+    if (k < len && (attrStr[k] === '"' || attrStr[k] === "'")) {
+      const valueStart = k + 1;
+      const closeIdx = attrStr.indexOf(attrStr[k], valueStart);
+      if (closeIdx !== -1) {
+        quoteChar = attrStr[k];
+        value = attrStr.slice(valueStart, closeIdx);
+        i = closeIdx + 1;
+      }
+      // No closing quote found anywhere in the rest of the string — leave
+      // quoteChar/value undefined, same as the old regex's group failing
+      // to match a backreference-less run.
+    }
+
+    const token = { startIndex: tokenStart };
+    token[1] = leadingWs;
+    token[2] = name;
+    token[3] = equalsGroup;
+    token[4] = quoteChar !== undefined ? true : undefined;
+    token[5] = quoteChar;
+    token[6] = value;
+    tokens.push(token);
+  }
+
+  return tokens;
+}
 
 //attr, ="sd", a="amit's", a="sd"b="saf", ab  cd=""
 
@@ -8793,7 +8886,7 @@ function validateAttributeString(attrStr, options) {
 
   //if(attrStr.trim().length === 0) return true; //empty string
 
-  const matches = getAllMatches(attrStr, validAttrStrRegxp);
+  const matches = scanAttributeTokens(attrStr);
   const attrNames = {};
 
   for (let i = 0; i < matches.length; i++) {
@@ -9791,10 +9884,24 @@ class XmlNode {
       this.child.push({ [node.tagname]: node.child });
     }
     // if requested, add the startIndex
+    this.addStartIndex(startIndex);
+  }
+
+  addStartIndex(startIndex) {
     if (startIndex !== undefined) {
       // Note: for now we just overwrite the metadata. If we had more complex metadata,
       // we might need to do an object append here:  metadata = { ...metadata, startIndex }
       this.child[this.child.length - 1][METADATA_SYMBOL$1] = { startIndex };
+    }
+  }
+
+  addEndIndex(endIndex) {
+    const lastChild = this.child[this.child.length - 1];
+    // endIndex is write-once: when updateTag drops a node, the last child is a
+    // previously completed sibling whose endIndex must not be overwritten
+    if (lastChild !== undefined && lastChild[METADATA_SYMBOL$1] !== undefined
+      && lastChild[METADATA_SYMBOL$1].endIndex === undefined) {
+      lastChild[METADATA_SYMBOL$1].endIndex = endIndex;
     }
   }
   /** symbol used for metadata */
@@ -9915,16 +10022,47 @@ const buildRegexes = (startChar, char, flags = '') => {
 const regexes10 = buildRegexes(nameStartChar10, nameChar10);       // no /u — BMP only
 const regexes11 = buildRegexes(nameStartChar11, nameChar11, 'u');  // /u — enables \u{10000}-\u{EFFFF}
 
-const getRegexes = (xmlVersion = '1.0') =>
-  xmlVersion === '1.1' ? regexes11 : regexes10;
+// ---------------------------------------------------------------------------
+// ASCII-only fast path (opt-in, off by default)
+//
+// The XML 1.0 vs 1.1 NameStartChar/NameChar productions differ *only* in
+// their non-ASCII ranges (merged vs split Latin-1 ranges, \u0487, and
+// supplementary planes). Restricted to ASCII, both versions collapse to the
+// same character classes, so a single regex pair covers both xmlVersion
+// values — no /u flag needed.
+//
+// Rationale: unicode-aware regexes (the /u flag, required for XML 1.1's
+// supplementary-plane range) are measurably slower in V8 than plain
+// non-unicode regexes on the same input, even when the input is pure ASCII.
+// For the common case — HTML/SVG ids, XML tags — names are ASCII, so callers
+// who know this can opt in to skip the unicode-aware matching path entirely.
+// This is a real but *conditional* win: mainly for XML 1.1 input (avoids /u),
+// or at scale where the larger unicode character classes add engine
+// overhead. It also changes behaviour (rejects legitimate non-ASCII XML
+// 1.0/1.1 names), so it must never be silently enabled — hence off by
+// default.
+// ---------------------------------------------------------------------------
+
+const nameStartCharAscii = ':A-Za-z_';
+const nameCharAscii = nameStartCharAscii + '\\-\\.\\d';
+
+const regexesAscii = buildRegexes(nameStartCharAscii, nameCharAscii); // no /u — ASCII only
+
+const getRegexes = (xmlVersion = '1.0', asciiOnly = false) => {
+  if (asciiOnly) return regexesAscii;
+  return xmlVersion === '1.1' ? regexes11 : regexes10;
+};
 
 /**
  * Returns true if the string is a valid QName (Qualified Name).
  * Allows exactly one colon as a prefix separator: prefix:localName.
  * Used for: element and attribute names in namespace-aware XML/SVG.
+ *
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const qName = (str, { xmlVersion = '1.0' } = {}) =>
-  getRegexes(xmlVersion).qName.test(str);
+const qName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
+  getRegexes(xmlVersion, asciiOnly).qName.test(str);
 
 class DocTypeReader {
     constructor(options, xmlVersion) {
@@ -9949,8 +10087,23 @@ class DocTypeReader {
             i = i + 9;
             let angleBracketsCount = 1;
             let hasBody = false, comment = false;
+            let quoteChar = null; // tracks an open SYSTEM/PUBLIC literal before the '[' body
             let exp = "";
             for (; i < xmlData.length; i++) {
+                // Inside a quoted external-identifier literal — XML allows '<'
+                // and '>' as plain data here, so they must not be interpreted
+                // as DOCTYPE structure until the matching quote closes.
+                if (quoteChar !== null) {
+                    if (xmlData[i] === quoteChar) quoteChar = null;
+                    exp += xmlData[i];
+                    continue;
+                }
+                if (!hasBody && !comment && (xmlData[i] === '"' || xmlData[i] === "'")) {
+                    quoteChar = xmlData[i];
+                    exp += xmlData[i];
+                    continue;
+                }
+
                 if (xmlData[i] === '<' && !comment) { //Determine the tag type
                     if (hasBody && hasSeq(xmlData, "!ENTITY", i)) {
                         i += 7;
@@ -10005,7 +10158,7 @@ class DocTypeReader {
                     exp += xmlData[i];
                 }
             }
-            if (angleBracketsCount !== 0) {
+            if (quoteChar !== null || angleBracketsCount !== 0) {
                 throw new Error(`Unclosed DOCTYPE`);
             }
         } else {
@@ -10617,8 +10770,10 @@ function toNumber(str, options = {}) {
         return parse_int(trimmedStr, 2);
     } else if (options.octal && octRegex.test(trimmedStr)) {
         return parse_int(trimmedStr, 8);
-    } else if (!isFinite(trimmedStr)) { //Infinity
-        return handleInfinity(str, Number(trimmedStr), options);
+    } else if (!isFinite(trimmedStr)) { //Infinity or not a number
+        const num = Number(trimmedStr);
+        if (Number.isNaN(num)) return str; //not a number: always the original string
+        return handleInfinity(str, num, options); //only +/-Infinity reaches here
     } else if (trimmedStr.includes('e') || trimmedStr.includes('E')) { //eNotation
         return resolveEnotation(str, trimmedStr, options);
     } else {
@@ -10630,8 +10785,8 @@ function toNumber(str, options = {}) {
             const leadingZeros = match[2];
             let numTrimmedByZeros = trimZeros(match[3]); //complete num without leading zeros
             const decimalAdjacentToLeadingZeros = sign ? // 0., -00., 000.
-                str[leadingZeros.length + 1] === "."
-                : str[leadingZeros.length] === ".";
+                trimmedStr[leadingZeros.length + 1] === "."
+                : trimmedStr[leadingZeros.length] === ".";
 
             //trim ending zeros for floating number
             if (!options.leadingZeros //leading zeros are not allowed
@@ -10679,8 +10834,8 @@ function resolveEnotation(str, trimmedStr, options) {
         const eChar = notation[3].indexOf("e") === -1 ? "E" : "e";
         const leadingZeros = notation[2];
         const eAdjacentToLeadingZeros = sign ? // 0E.
-            str[leadingZeros.length + 1] === eChar
-            : str[leadingZeros.length] === eChar;
+            trimmedStr[leadingZeros.length + 1] === eChar
+            : trimmedStr[leadingZeros.length] === eChar;
 
         if (leadingZeros.length > 1 && eAdjacentToLeadingZeros) return str;
         else if (leadingZeros.length === 1
@@ -10689,8 +10844,7 @@ function resolveEnotation(str, trimmedStr, options) {
         } else if (leadingZeros.length > 0) {
             // Has leading zeros — only accept if leadingZeros option allows it
             if (options.leadingZeros && !eAdjacentToLeadingZeros) {
-                trimmedStr = (notation[1] || "") + notation[3];
-                return Number(trimmedStr);
+                return Number(trimmedStr); // Number() accepts leading zeros; stripping can leave a mantissa-less ".e0"
             } else return str;
         } else {
             // No leading zeros — always valid e-notation, parse it
@@ -10708,7 +10862,11 @@ function resolveEnotation(str, trimmedStr, options) {
  */
 function trimZeros(numStr) {
     if (numStr && numStr.indexOf(".") !== -1) {//float
-        numStr = numStr.replace(/0+$/, ""); //remove ending zeros
+        //remove ending zeros without the O(n^2) backtracking that /0+$/ hits
+        //when the string doesn't end in 0 but has a long internal zero-run
+        let end = numStr.length;
+        while (end > 0 && numStr.charCodeAt(end - 1) === 48 /* '0' */) end--;
+        numStr = numStr.slice(0, end);
         if (numStr === ".") numStr = "0";
         else if (numStr[0] === ".") numStr = "0" + numStr;
         else if (numStr[numStr.length - 1] === ".") numStr = numStr.substring(0, numStr.length - 1);
@@ -11455,26 +11613,29 @@ class Matcher {
 
     // Get or create sibling tracking for current level
     const currentLevel = this.path.length;
-    if (!this.siblingStacks[currentLevel]) {
-      this.siblingStacks[currentLevel] = new Map();
+    let level = this.siblingStacks[currentLevel];
+    if (!level) {
+      // `counts` tells same-name siblings apart (the "counter" — nth <item>
+      // among other <item>s). `total` is every child seen at this level so
+      // far, kept as a running number instead of re-added from `counts` on
+      // every push — a parent with many differently-named children would
+      // otherwise cost more per child the more distinct names it has.
+      level = { counts: new Map(), total: 0 };
+      this.siblingStacks[currentLevel] = level;
     }
-
-    const siblings = this.siblingStacks[currentLevel];
 
     // Create a unique key for sibling tracking that includes namespace
     const siblingKey = namespace ? `${namespace}:${tagName}` : tagName;
 
     // Calculate counter (how many times this tag appeared at this level)
-    const counter = siblings.get(siblingKey) || 0;
+    const counter = level.counts.get(siblingKey) || 0;
 
-    // Calculate position (total children at this level so far)
-    let position = 0;
-    for (const count of siblings.values()) {
-      position += count;
-    }
+    // Position = total children at this level seen before this one.
+    const position = level.total;
 
-    // Update sibling count for this tag
-    siblings.set(siblingKey, counter + 1);
+    // Update sibling count for this tag, and the level's running total.
+    level.counts.set(siblingKey, counter + 1);
+    level.total++;
 
     // Create new node
     const node = {
@@ -11850,7 +12011,7 @@ class Matcher {
   snapshot() {
     return {
       path: this.path.map(node => ({ ...node })),
-      siblingStacks: this.siblingStacks.map(map => new Map(map)),
+      siblingStacks: this.siblingStacks.map(level => level ? { counts: new Map(level.counts), total: level.total } : level),
       keptAttrs: this._keptAttrs.map(entry => ({ ...entry }))
     };
   }
@@ -11862,7 +12023,7 @@ class Matcher {
   restore(snapshot) {
     this._pathStringCache = null;
     this.path = snapshot.path.map(node => ({ ...node }));
-    this.siblingStacks = snapshot.siblingStacks.map(map => new Map(map));
+    this.siblingStacks = snapshot.siblingStacks.map(level => level ? { counts: new Map(level.counts), total: level.total } : level);
     this._keptAttrs = (snapshot.keptAttrs || []).map(entry => ({ ...entry }));
   }
 
@@ -12046,7 +12207,8 @@ const XML_PATTERNS = [
   {
     id: 'xml-namespace-confusion',
     description: 'xmlns: attribute injection — can redefine namespaces to confuse parsers',
-    pattern: /\bxmlns\s*(?::\w{1,40})?\s*=/i,
+    // pattern: /\bxmlns\s*(?::\w{1,40})?\s*=/i,
+    pattern: /\bxmlns(?::\w{1,40})?\s*=/i,
   },
   {
     id: 'xml-comment-injection',
@@ -12238,51 +12400,6 @@ const SQL_PATTERNS = [
     pattern: /\bINFORMATION_SCHEMA\b/i,
   },
 ];
-
-/**
- * SQL-STRICT context patterns.
- *
- * Extends the base 'SQL' context with three additional rules that are
- * effective at detecting real injections but carry a higher false-positive
- * risk on general free-text input.
- *
- * Use 'SQL-STRICT' when:
- *   - The string is specifically a SQL fragment or database identifier
- *   - You control the input domain (e.g. a dedicated SQL search field)
- *   - You can tolerate occasional false positives in exchange for broader coverage
- *
- * Use 'SQL' (not STRICT) when:
- *   - The field is general user text (names, descriptions, comments)
- *   - False positives would block legitimate content (e.g. "see note -- above")
- *
- * Rules moved here from 'SQL' due to false-positive risk:
- *
- *   sql-line-comment   — "--" fires on "see note -- above", "value--", CSS var(--primary)
- *   sql-stacked-query  — "; SELECT" fires on legitimate prose with semicolons + SQL words
- *   sql-hex-encoding   — "0xDEAD" fires on hex values in technical docs and log output
- */
-
-
-const SQL_STRICT_EXTRA = [
-  {
-    id: 'sql-line-comment',
-    description: 'SQL line comment: -- followed by whitespace or end of string',
-    pattern: /--(?:\s|$)/,
-  },
-  {
-    id: 'sql-stacked-query',
-    description: 'Stacked queries: semicolon immediately followed by a SQL keyword',
-    pattern: /;\s{0,10}(?:SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC)\b/i,
-  },
-  {
-    id: 'sql-hex-encoding',
-    description: 'Hex-encoded string injection: 0x41414141 style (MySQL)',
-    pattern: /\b0x[0-9a-f]{4,}/i,
-  },
-];
-
-// SQL-STRICT = all base SQL rules + the three noisy extras
-const SQL_STRICT_PATTERNS = [...SQL_PATTERNS, ...SQL_STRICT_EXTRA];
 
 /**
  * SHELL context patterns.
@@ -12655,66 +12772,100 @@ const LOG_PATTERNS = [
 ];
 
 /**
- * Context registry — maps context name strings to their pattern arrays.
+ * SQL-STRICT context patterns.
  *
- * Adding a new context: create a file in ./contexts/, export a default array
- * of pattern objects, and register it here.
+ * Extends the base 'SQL' context with three additional rules that are
+ * effective at detecting real injections but carry a higher false-positive
+ * risk on general free-text input.
  *
- * Context name guide:
- *   SQL        — high-precision rules; safe for general text fields
- *   SQL-STRICT — SQL + three noisier rules (line comments, stacked queries, hex);
- *                use only for SQL-specific inputs
- *   REDOS      — detects ReDoS-prone patterns when string will be compiled as RegExp
+ * Use 'SQL-STRICT' when:
+ *   - The string is specifically a SQL fragment or database identifier
+ *   - You control the input domain (e.g. a dedicated SQL search field)
+ *   - You can tolerate occasional false positives in exchange for broader coverage
+ *
+ * Use 'SQL' (not STRICT) when:
+ *   - The field is general user text (names, descriptions, comments)
+ *   - False positives would block legitimate content (e.g. "see note -- above")
+ *
+ * Rules moved here from 'SQL' due to false-positive risk:
+ *
+ *   sql-line-comment   — "--" fires on "see note -- above", "value--", CSS var(--primary)
+ *   sql-stacked-query  — "; SELECT" fires on legitimate prose with semicolons + SQL words
+ *   sql-hex-encoding   — "0xDEAD" fires on hex values in technical docs and log output
  */
 
 
-/** @type {Record<string, Array<{id: string, description: string, pattern: RegExp}>>} */
-const CONTEXT_REGISTRY = {
-  HTML: HTML_PATTERNS,
-  XML: XML_PATTERNS,
-  SVG: SVG_PATTERNS,
-  SQL: SQL_PATTERNS,
-  'SQL-STRICT': SQL_STRICT_PATTERNS,
-  SHELL: SHELL_PATTERNS,
-  REDOS: REDOS_PATTERNS,
-  NOSQL: NOSQL_PATTERNS,
-  LOG: LOG_PATTERNS,
-};
+const SQL_STRICT_EXTRA = [
+  {
+    id: 'sql-line-comment',
+    description: 'SQL line comment: -- followed by whitespace or end of string',
+    pattern: /--(?:\s|$)/,
+  },
+  {
+    id: 'sql-stacked-query',
+    description: 'Stacked queries: semicolon immediately followed by a SQL keyword',
+    pattern: /;\s{0,10}(?:SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC)\b/i,
+  },
+  {
+    id: 'sql-hex-encoding',
+    description: 'Hex-encoded string injection: 0x41414141 style (MySQL)',
+    pattern: /\b0x[0-9a-f]{4,}/i,
+  },
+];
+
+// SQL-STRICT = all base SQL rules + the three noisy extras
+const SQL_STRICT_PATTERNS = [...SQL_PATTERNS, ...SQL_STRICT_EXTRA];
 
 /**
- * Enum of valid context names — e.g. `VALID_CONTEXTS.HTML === 'HTML'`.
- * @type {Record<string, string>}
- */
-const VALID_CONTEXTS = Object.freeze(
-  Object.fromEntries(Object.keys(CONTEXT_REGISTRY).map((k) => [k, k]))
-);
-
-/**
- * is-unsafe
+ * is-unsafe v2
  *
  * Zero-dependency, DOM-free, pure predicate for detecting unsafe strings
  * across HTML, XML, SVG, SQL, SQL-STRICT, SHELL, REDOS, NOSQL, and LOG contexts.
+ *
+ * v2 change: contexts are imported as named pattern arrays rather than resolved
+ * via a string-keyed registry. This makes each context independently
+ * tree-shakeable — bundlers can drop any context you never import.
  *
  * @module is-unsafe
  */
 
 
+// ─── Attach labels to named contexts ──────────────────────────────────────
+// Each built-in PatternList carries its canonical name so matchList can read
+// list.label directly — no registry lookup needed at match time.
+// Custom PatternLists default to 'CUSTOM' unless the caller sets list.label.
+
+HTML_PATTERNS.label       = 'HTML';
+XML_PATTERNS.label        = 'XML';
+SVG_PATTERNS.label        = 'SVG';
+SQL_PATTERNS.label        = 'SQL';
+SQL_STRICT_PATTERNS.label = 'SQL-STRICT';
+SHELL_PATTERNS.label      = 'SHELL';
+REDOS_PATTERNS.label      = 'REDOS';
+NOSQL_PATTERNS.label      = 'NOSQL';
+LOG_PATTERNS.label        = 'LOG';
+
+// ─── Types ────────────────────────────────────────────────────────────────
+
 /**
- * @typedef {'HTML'|'XML'|'SVG'|'SQL'|'SQL-STRICT'|'SHELL'|'REDOS'|'NOSQL'|'LOG'} ContextName
+ * @typedef {{ id: string, description: string, pattern: RegExp }} Rule
+ */
+
+/**
+ * @typedef {Rule[]} PatternList
  */
 
 /**
  * @typedef {Object} MatchResult
- * @property {string} context   - The context in which the match was found
- * @property {string} id        - Rule identifier
+ * @property {string} context     - Label identifying which context matched ('HTML', 'CUSTOM', etc.)
+ * @property {string} id          - Rule identifier
  * @property {string} description - Human-readable description of what was matched
- * @property {RegExp} pattern   - The pattern that matched
+ * @property {RegExp} pattern     - The pattern that matched
  */
 
-// ─── Validation helpers ────────────────────────────────────────────────────
+// ─── Internal helpers ──────────────────────────────────────────────────────
 
 /**
- * Validate that `value` is a string. Throws TypeError if not.
  * @param {unknown} value
  */
 function assertString(value) {
@@ -12726,56 +12877,61 @@ function assertString(value) {
 }
 
 /**
- * Validate that `context` is a recognised context name, an array of them,
- * or a RegExp instance. Throws TypeError if not.
- * @param {ContextName|ContextName[]|RegExp} context
+ * @param {unknown} context
  */
 function assertContext(context) {
   if (context instanceof RegExp) return;
 
-  if (typeof context === 'string') {
-    if (!CONTEXT_REGISTRY[context]) {
-      throw new TypeError(
-        `is-unsafe: unknown context "${context}". Valid contexts: ${Object.keys(VALID_CONTEXTS).join(', ')}`
-      );
-    }
-    return;
-  }
-
   if (Array.isArray(context)) {
     if (context.length === 0) {
-      throw new TypeError('is-unsafe: context array must not be empty');
+      throw new TypeError('is-unsafe: context must not be an empty array');
     }
-    for (const c of context) {
-      if (typeof c !== 'string' || !CONTEXT_REGISTRY[c]) {
-        throw new TypeError(
-          `is-unsafe: unknown context "${c}" in array. Valid contexts: ${Object.keys(VALID_CONTEXTS).join(', ')}`
-        );
+    // Detect array-of-arrays vs flat pattern list
+    if (Array.isArray(context[0])) {
+      // Array of PatternLists
+      for (const list of context) {
+        if (!Array.isArray(list) || list.length === 0) {
+          throw new TypeError(
+            'is-unsafe: each context in the array must be a non-empty pattern array (PatternList)'
+          );
+        }
       }
     }
+    // else: flat PatternList — trust it, no deep validation needed
     return;
   }
 
   throw new TypeError(
-    `is-unsafe: second argument must be a context string, array of context strings, or RegExp. Got: ${typeof context}`
+    `is-unsafe: second argument must be a PatternList (e.g. HTML), ` +
+    `an array of PatternLists (e.g. [HTML, XML]), or a RegExp. Got: ${typeof context}`
   );
 }
 
-// ─── Core matching logic ───────────────────────────────────────────────────
+/**
+ * Normalise any valid context arg into an array of PatternLists.
+ *
+ * @param {Rule[]|Rule[][]|RegExp} context
+ * @returns {{ lists: Rule[][]|null, regex: RegExp|null }}
+ */
+function normalise(context) {
+  if (context instanceof RegExp) return { lists: null, regex: context };
+  // Distinguish PatternList (array of rule objects) from array of PatternLists
+  if (Array.isArray(context[0])) return { lists: context, regex: null };
+  return { lists: [context], regex: null };
+}
 
 /**
- * Test a single value against one named context's patterns.
- * Returns the first matching MatchResult, or null if nothing matched.
+ * Test value against a single PatternList. Returns the first MatchResult or null.
  *
  * @param {string} value
- * @param {string} contextName
+ * @param {Rule[]} list
  * @returns {MatchResult|null}
  */
-function matchContext(value, contextName) {
-  const patterns = CONTEXT_REGISTRY[contextName];
-  for (const rule of patterns) {
+function matchList(value, list) {
+  const label = list.label ?? 'CUSTOM';
+  for (const rule of list) {
     if (rule.pattern.test(value)) {
-      return { context: contextName, id: rule.id, description: rule.description, pattern: rule.pattern };
+      return { context: label, id: rule.id, description: rule.description, pattern: rule.pattern };
     }
   }
   return null;
@@ -12786,36 +12942,31 @@ function matchContext(value, contextName) {
 /**
  * Returns `true` if `value` is unsafe in the given context(s), `false` otherwise.
  *
- * @param {string} value           - The string to test
- * @param {ContextName|ContextName[]|RegExp} context
- *   - A named context ('HTML', 'XML', 'SVG', 'SQL', 'SQL-STRICT', 'SHELL', 'REDOS', 'NOSQL', 'LOG')
- *   - An array of named contexts — returns true if unsafe in **any** of them
+ * @param {string} value - The string to test
+ * @param {PatternList | PatternList[] | RegExp} context
+ *   - A PatternList imported from is-unsafe (e.g. `HTML`, `XML`)
+ *   - An array of PatternLists — returns true if unsafe in **any** of them
  *   - A custom RegExp — returns true if the pattern matches
  * @returns {boolean}
  *
  * @example
- * isUnsafe('<script>alert(1)</script>', 'HTML')  // true
- * isUnsafe('hello world', 'HTML')                // false
- * isUnsafe('value', ['HTML', 'SQL'])             // false
- * isUnsafe('value', /my-pattern/i)               // false
+ * import { isUnsafe, HTML, SQL } from 'is-unsafe';
+ *
+ * isUnsafe('<script>alert(1)</script>', HTML)       // true
+ * isUnsafe('hello world', HTML)                     // false
+ * isUnsafe('value', [HTML, SQL])                    // false
+ * isUnsafe('value', /my-pattern/i)                  // false
  */
 function isUnsafe(value, context) {
   assertString(value);
   assertContext(context);
 
-  // Custom RegExp — caller-supplied pattern
-  if (context instanceof RegExp) {
-    return context.test(value);
-  }
+  const { lists, regex } = normalise(context);
 
-  // Single named context
-  if (typeof context === 'string') {
-    return matchContext(value, context) !== null;
-  }
+  if (regex) return regex.test(value);
 
-  // Array of named contexts — unsafe if ANY context matches
-  for (const c of context) {
-    if (matchContext(value, c) !== null) return true;
+  for (const list of lists) {
+    if (matchList(value, list) !== null) return true;
   }
   return false;
 }
@@ -12895,6 +13046,7 @@ class OrderedObjParser {
     this.ignoreAttributesFn = getIgnoreAttributesFn(this.options.ignoreAttributes);
     this.entityExpansionCount = 0;
     this.currentExpandedLength = 0;
+    this.doctypefound = false;
     let namedEntities = { ...XML };
     if (this.options.entityDecoder) {
       this.entityDecoder = this.options.entityDecoder;
@@ -12912,8 +13064,7 @@ class OrderedObjParser {
         // onExternalEntity: (name, value) => isUnsafe(value) ? 'block' : 'allow',
         onInputEntity: (name, value) =>
           //TODO: VALID_CONTEXTS.HTML should be set only if this.options.htmlEntities
-          isUnsafe(value, [VALID_CONTEXTS.HTML, VALID_CONTEXTS.XML])
-            ? ENTITY_ACTION.BLOCK : ENTITY_ACTION.ALLOW,
+          isUnsafe(value, [HTML_PATTERNS, XML_PATTERNS]) ? ENTITY_ACTION.BLOCK : ENTITY_ACTION.ALLOW,
 
         //postCheck: resolved => resolved
       });
@@ -13103,6 +13254,7 @@ const parseXml$2 = function (xmlData) {
   // Reset entity expansion counters for this document
   this.entityExpansionCount = 0;
   this.currentExpandedLength = 0;
+  this.doctypefound = false;
   const options = this.options;
   const docTypeReader = new DocTypeReader(options.processEntities);
   const xmlLen = xmlData.length;
@@ -13143,7 +13295,12 @@ const parseXml$2 = function (xmlData) {
         this.matcher.pop();
         this.isCurrentNodeStopNode = false; // Reset flag when closing tag
 
-        currentNode = this.tagsNodeStack.pop();//avoid recursion, set the parent tag scope
+        //a closing tag with no matching opening tag leaves the stack empty
+        currentNode = this.tagsNodeStack.pop() || xmlObj;//avoid recursion, set the parent tag scope
+
+        if (options.captureMetaData && currentNode) {
+          currentNode.addEndIndex(closeIndex + 1);
+        }
         textData = "";
         i = closeIndex;
       } else if (c1 === 63) { //'?'
@@ -13167,6 +13324,11 @@ const parseXml$2 = function (xmlData) {
             childNode[":@"] = attsMap;
           }
           this.addChild(currentNode, childNode, this.readonlyMatcher, i);
+
+          if (options.captureMetaData) {
+            // closeIndex points at '?' of the closing '?>'
+            currentNode.addEndIndex(tagData.closeIndex + 2);
+          }
         }
 
 
@@ -13185,6 +13347,8 @@ const parseXml$2 = function (xmlData) {
         i = endIndex;
       } else if (c1 === 33
         && xmlData.charCodeAt(i + 2) === 68) { //'!D'
+        if (this.doctypefound) throw new Error("Multiple DOCTYPE declarations found.");
+        this.doctypefound = true;
         const result = docTypeReader.readDocType(xmlData, i);
         this.entityDecoder.addInputEntities(result.entities);
         i = result.i;
@@ -13328,6 +13492,10 @@ const parseXml$2 = function (xmlData) {
           this.isCurrentNodeStopNode = false; // Reset flag
 
           this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
+
+          if (options.captureMetaData) {
+            currentNode.addEndIndex(i + 1);
+          }
         } else {
           //selfClosing tag
           if (isSelfClosing) {
@@ -13338,6 +13506,10 @@ const parseXml$2 = function (xmlData) {
               childNode[":@"] = prefixedAttrs;
             }
             this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
+
+            if (options.captureMetaData) {
+              currentNode.addEndIndex(closeIndex + 1);
+            }
             this.matcher.pop(); // Pop self-closing tag
             this.isCurrentNodeStopNode = false; // Reset flag
           }
@@ -13347,6 +13519,10 @@ const parseXml$2 = function (xmlData) {
               childNode[":@"] = prefixedAttrs;
             }
             this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
+
+            if (options.captureMetaData) {
+              currentNode.addEndIndex(result.closeIndex + 1);
+            }
             this.matcher.pop(); // Pop unpaired tag
             this.isCurrentNodeStopNode = false; // Reset flag
             i = result.closeIndex;
@@ -13811,6 +13987,8 @@ function isLeafTag(obj, options) {
   return false;
 }
 
+/* global Uint8Array */
+
 class XMLParser {
 
     constructor(options) {
@@ -13825,7 +14003,12 @@ class XMLParser {
      */
     parse(xmlData, validationOption) {
         if (typeof xmlData !== "string" && xmlData.toString) {
-            xmlData = xmlData.toString();
+            if (xmlData instanceof Uint8Array &&
+                !(typeof Buffer !== "undefined" && Buffer.isBuffer(xmlData))) {
+                xmlData = new TextDecoder("utf-8", { ignoreBOM: true }).decode(xmlData);
+            } else {
+                xmlData = xmlData.toString();
+            }
         } else if (typeof xmlData !== "string") {
             throw new Error("XML data is accepted in String or Bytes[] form.")
         }
@@ -21925,9 +22108,9 @@ function hexToRgba(hex, alpha) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
 }
 
-/** G2 面积渐变：沿竖直方向，线附近有色、贴轴透明。 */
+/** G2 面积渐变：沿竖直方向，线附近有色、贴轴近透明。 */
 function areaGradient(hex) {
-  return `linear-gradient(-90deg, ${hexToRgba(hex, 0.02)} 0%, ${hexToRgba(hex, 0.38)} 100%)`;
+  return `linear-gradient(-90deg, ${hexToRgba(hex, 0.04)} 0%, ${hexToRgba(hex, 0.22)} 42%, ${hexToRgba(hex, 0.52)} 100%)`;
 }
 
 function formatTick(n) {
@@ -30624,10 +30807,13 @@ function requireErrors () {
 	 * @class
 	 * @param {string} message
 	 * @param {any} [locator]
+	 * @param {Error} [cause]
+	 * The error that caused this one, e.g. a `DOMException` thrown while building the DOM.
 	 */
-	function ParseError(message, locator) {
+	function ParseError(message, locator, cause) {
 		this.message = message;
 		this.locator = locator;
+		this.cause = cause;
 		if (Error.captureStackTrace) Error.captureStackTrace(this, ParseError);
 	}
 	extendError(ParseError);
@@ -30728,7 +30914,7 @@ function requireGrammar () {
 					return isStr ? part : part.source;
 				})
 				.join(''),
-			UNICODE_SUPPORT ? 'mu' : 'm'
+			UNICODE_SUPPORT ? 'u' : ''
 		);
 	}
 
@@ -30817,6 +31003,9 @@ function requireGrammar () {
 	// https://www.w3.org/TR/xml11/#NT-Name
 	// `[5] Name ::= NameStartChar (NameChar)*`
 	var Name = reg(NameStartChar, NameChar, '*');
+	// Full-string anchored matcher for requireWellFormed serializer checks
+	// https://w3c.github.io/DOM-Parsing/#xml-serializing-a-document-node
+	var Name_exact = reg('^', Name, '$');
 	/*
 	https://www.w3.org/TR/xml11/#NT-Names
 	`[6] Names ::= Name (#x20 Name)*`
@@ -30875,6 +31064,9 @@ function requireGrammar () {
 	// `[4] NCName ::= Name - (Char* ':' Char*)`
 	// An XML Name, minus the ":"
 	var NCName = reg(NCNameStartChar, NCNameChar, '*');
+	// Full-string anchored matcher for requireWellFormed serializer checks
+	// https://w3c.github.io/DOM-Parsing/#xml-serializing-a-document-node
+	var NCName_exact = reg('^', NCName, '$');
 
 	/**
 	https://www.w3.org/TR/xml-names/#ns-qualnames
@@ -31178,6 +31370,8 @@ function requireGrammar () {
 	grammar.ExternalID = ExternalID;
 	grammar.ExternalID_match = ExternalID_match;
 	grammar.Name = Name;
+	grammar.Name_exact = Name_exact;
+	grammar.NCName_exact = NCName_exact;
 	grammar.NotationDecl = NotationDecl;
 	grammar.Reference = Reference;
 	grammar.PEReference = PEReference;
@@ -31692,7 +31886,22 @@ function requireDom () {
 	 * @see https://webidl.spec.whatwg.org/#dfn-supported-property-names
 	 * @constructs NamedNodeMap
 	 */
-	function NamedNodeMap() {}
+	/**
+	 * A live collection of an element's attributes, keyed by name.
+	 *
+	 * The numbered entries and `length` are the sole authority for attribute order.
+	 * A separate two-level null-prototype membership index (`namespaceURI` ->
+	 * `localName` -> `Attr`, with the null/empty namespace held in its own bucket)
+	 * lets the parse-time de-duplication in `setNamedItem` resolve an existing
+	 * attribute in O(1) instead of scanning the list, so building an element with M
+	 * attributes costs O(M) rather than O(M^2). The index never reorders attributes.
+	 */
+	function NamedNodeMap() {
+		// namespaceURI (non-empty string) -> (localName -> Attr)
+		this._nsIndex = Object.create(null);
+		// localName -> Attr, for the null / empty-string namespace
+		this._noNsIndex = Object.create(null);
+	}
 	/**
 	 * Returns the index of a node within the list.
 	 *
@@ -31711,6 +31920,70 @@ function requireDom () {
 				return i;
 			}
 			i++;
+		}
+	}
+	/**
+	 * Returns the second-level index bucket (`localName` -> `Attr`) for a namespace,
+	 * replicating `getNamedItemNS`'s falsy-namespace normalization: `null`,
+	 * `undefined` and `''` all resolve to the dedicated null-namespace bucket, kept separate from
+	 * any real URI (so a namespace URI equal to the string `"null"`
+	 * cannot collide with the null namespace). Both levels are null-prototype objects, so an
+	 * attribute named `__proto__` or `constructor` is an ordinary key.
+	 *
+	 * @param {NamedNodeMap} map
+	 * @param {string | null | undefined} namespaceURI
+	 * @param {boolean} create
+	 * Create the bucket if it does not exist yet.
+	 * @returns {Object | undefined}
+	 * @private
+	 */
+	function _nnmBucket(map, namespaceURI, create) {
+		if (!namespaceURI) {
+			return map._noNsIndex;
+		}
+		var bucket = map._nsIndex[namespaceURI];
+		if (!bucket && create) {
+			bucket = map._nsIndex[namespaceURI] = Object.create(null);
+		}
+		return bucket;
+	}
+	/**
+	 * Looks up an attribute by namespace and local name through the membership index.
+	 *
+	 * @param {NamedNodeMap} map
+	 * @param {string | null | undefined} namespaceURI
+	 * @param {string} localName
+	 * @returns {Attr | null}
+	 * The matching attribute, or `null` when absent.
+	 * @private
+	 */
+	function _nnmIndexFind(map, namespaceURI, localName) {
+		var bucket = _nnmBucket(map, namespaceURI, false);
+		var found = bucket && bucket[localName];
+		return found ? found : null;
+	}
+	/**
+	 * Records `attr` in the membership index under its namespace and local name,
+	 * replacing any previous attribute with the same key.
+	 *
+	 * @param {NamedNodeMap} map
+	 * @param {Attr} attr
+	 * @private
+	 */
+	function _nnmIndexAdd(map, attr) {
+		_nnmBucket(map, attr.namespaceURI, true)[attr.localName] = attr;
+	}
+	/**
+	 * Removes `attr` from the membership index.
+	 *
+	 * @param {NamedNodeMap} map
+	 * @param {Attr} attr
+	 * @private
+	 */
+	function _nnmIndexRemove(map, attr) {
+		var bucket = _nnmBucket(map, attr.namespaceURI, false);
+		if (bucket) {
+			delete bucket[attr.localName];
 		}
 	}
 	/**
@@ -31734,6 +32007,10 @@ function requireDom () {
 			list[list.length] = newAttr;
 			list.length++;
 		}
+		// Keep the membership index in sync with the ordered list. On replacement
+		// `oldAttr` shares `newAttr`'s (namespace, localName) key, so this overwrites
+		// its entry; on append it adds a new one.
+		_nnmIndexAdd(list, newAttr);
 		if (el) {
 			newAttr.ownerElement = el;
 			var doc = el.ownerDocument;
@@ -31764,6 +32041,7 @@ function requireDom () {
 				list[i] = list[++i];
 			}
 			list.length = lastIndex;
+			_nnmIndexRemove(list, attr);
 			if (el) {
 				var doc = el.ownerDocument;
 				if (doc) {
@@ -31821,7 +32099,10 @@ function requireDom () {
 			if (el && el !== this._ownerElement) {
 				throw new DOMException(DOMException.INUSE_ATTRIBUTE_ERR);
 			}
-			var oldAttr = this.getNamedItemNS(attr.namespaceURI, attr.localName);
+			// Resolve any existing attribute with the same (namespace, localName)
+			// through the O(1) membership index rather than an O(M) scan — this is the
+			// parse-dedup hot path (`setAttributeNode` per attribute during parse).
+			var oldAttr = _nnmIndexFind(this, attr.namespaceURI, attr.localName);
 			if (oldAttr === attr) {
 				return attr;
 			}
@@ -32550,9 +32831,38 @@ function requireDom () {
 					while (child) {
 						var next = child.nextSibling;
 						if (next !== null && next.nodeType === TEXT_NODE && child.nodeType === TEXT_NODE) {
-							node.removeChild(next);
-							child.appendData(next.data);
-							// Do not advance child: re-check new nextSibling for another text run
+							// Merge the whole run of adjacent text nodes at once: gather the
+							// following text siblings' data, unlink them in a single pass, and
+							// re-index the child list a single time. Per-sibling `removeChild`
+							// (each an O(K) re-index) plus per-sibling `appendData` (each an O(K)
+							// string rebuild) is O(K^2) over a long run of single-character text
+							// nodes; this keeps it O(K). The first text node of the run survives
+							// and carries the concatenated data, preserving node identity and
+							// locator semantics.
+							var tail = [];
+							var sibling = next;
+							while (sibling !== null && sibling.nodeType === TEXT_NODE) {
+								tail.push(sibling.data);
+								sibling = sibling.nextSibling;
+							}
+							// `sibling` is now the first non-text node after the run, or null.
+							var removed = child.nextSibling;
+							while (removed !== sibling) {
+								var following = removed.nextSibling;
+								removed.parentNode = null;
+								removed.previousSibling = null;
+								removed.nextSibling = null;
+								removed = following;
+							}
+							child.nextSibling = sibling;
+							if (sibling !== null) {
+								sibling.previousSibling = child;
+							} else {
+								node.lastChild = child;
+							}
+							child.appendData(tail.join('')); // single O(K) string rebuild
+							_onUpdateChild(node.ownerDocument, node); // single O(K) re-index
+							child = sibling;
 						} else {
 							child = next;
 						}
@@ -33605,10 +33915,10 @@ function requireDom () {
 		 * "InvalidCharacterError".
 		 *
 		 * Note: When the resulting document is serialized with `requireWellFormed: true`, the
-		 * serializer throws `InvalidStateError` if `.target` contains `:` or is an ASCII
-		 * case-insensitive match for `"xml"`, or if `.data` contains `?>` or characters outside the
-		 * XML Char production (W3C DOM Parsing §3.2.1.7). Without that option the data is emitted
-		 * verbatim.
+		 * serializer throws `InvalidStateError` if `.target` is not a valid XML `NCName` (a `Name`
+		 * with no colon) or is an ASCII case-insensitive match for `"xml"`, or if `.data` contains
+		 * `?>` or characters outside the XML Char production (W3C DOM Parsing §3.2.1.7). Without that
+		 * option the target and data are emitted verbatim.
 		 *
 		 * @param {string} target
 		 * @param {string} data
@@ -33663,19 +33973,29 @@ function requireDom () {
 		 * The current implementation does not fill the `childNodes` with those of the corresponding
 		 * `Entity`
 		 *
+		 * The `name` is validated against the XML `Name` production at creation time; an invalid name
+		 * throws `InvalidCharacterError`. When the resulting node is serialized with
+		 * `requireWellFormed: true`, the serializer re-validates `nodeName` against the XML `Name`
+		 * production and throws `InvalidStateError` if a later `nodeName` mutation made it invalid;
+		 * without that option the name is emitted verbatim.
+		 *
+		 * __This implementation differs from the specification:__ xmldom does not expand entities —
+		 * the parser resolves entity references inline and never constructs `EntityReference` nodes,
+		 * so this method is the only producer.
+		 *
 		 * @deprecated
 		 * In DOM Level 4.
 		 * @param {string} name
 		 * The name of the entity to reference. No namespace well-formedness checks are performed.
 		 * @returns {EntityReference}
 		 * @throws {DOMException}
-		 * With code `INVALID_CHARACTER_ERR` when `name` is not valid.
+		 * With code `INVALID_CHARACTER_ERR` when `name` is not a valid XML `Name`.
 		 * @throws {DOMException}
 		 * with code `NOT_SUPPORTED_ERR` when the document is of type `html`
 		 * @see https://www.w3.org/TR/DOM-Level-3-Core/core.html#ID-392B75AE
 		 */
 		createEntityReference: function (name) {
-			if (!g.Name.test(name)) {
+			if (!g.Name_exact.test(name)) {
 				throw new DOMException(DOMException.INVALID_CHARACTER_ERR, 'not a valid xml name "' + name + '"');
 			}
 			if (this.type === 'html') {
@@ -34051,6 +34371,12 @@ function requireDom () {
 	/**
 	 * @class DocumentType
 	 * @augments Node
+	 * @property {string} name
+	 * The doctype name, stored verbatim. Declared `readonly` by the WHATWG DOM spec; xmldom does
+	 * not enforce this constraint — direct property writes succeed and the written value is
+	 * serialized verbatim. When serialized with `requireWellFormed: true`, the serializer
+	 * validates the value against the XML `Name` production and throws `InvalidStateError` if it
+	 * does not match.
 	 * @property {string} publicId
 	 * The external subset public identifier, stored verbatim (including surrounding quotes).
 	 * Declared `readonly` by the WHATWG DOM spec; xmldom does not enforce this constraint —
@@ -34069,7 +34395,7 @@ function requireDom () {
 	 * direct property writes succeed and the written value is serialized verbatim.
 	 * When serialized with `requireWellFormed: true`, the serializer throws `InvalidStateError`
 	 * if the value contains `"]>"`.
-	 * @see https://developer.mozilla.org/en-US/docs/Web/API/DocumentType MDN
+	 * @see https://developer.mozilla.org/docs/Web/API/DocumentType MDN
 	 * @see https://dom.spec.whatwg.org/#interface-documenttype WHATWG DOM
 	 * @prettierignore
 	 */
@@ -34091,6 +34417,21 @@ function requireDom () {
 	Entity.prototype.nodeType = ENTITY_NODE;
 	_extends(Entity, Node);
 
+	/**
+	 * Represents an EntityReference node, serialized as `&nodeName;`.
+	 *
+	 * `nodeName` is the referenced entity's name, stored verbatim. When serialized with
+	 * `requireWellFormed: true`, the serializer validates `nodeName` against the XML `Name`
+	 * production and throws `InvalidStateError` if it does not match; without that option the name
+	 * is emitted verbatim between `&` and `;`.
+	 *
+	 * __This implementation differs from the specification:__ xmldom does not expand entities —
+	 * the parser resolves entity references inline and never constructs `EntityReference` nodes,
+	 * so the only producer is {@link Document#createEntityReference}.
+	 *
+	 * @class
+	 * @see https://www.w3.org/TR/xml/#NT-Name
+	 */
 	function EntityReference(symbol) {
 		checkSymbol(symbol);
 	}
@@ -34160,13 +34501,16 @@ function requireDom () {
 	 * - CDATASection data contains `"]]>"`
 	 * - Text data contains characters outside the XML Char production
 	 * - a Comment node's data contains `--` anywhere or ends with `-`
-	 * - a ProcessingInstruction's target contains `:` or is an ASCII case-insensitive match for
-	 * `"xml"`, or its data contains `?>` or characters outside the XML Char production
+	 * - a ProcessingInstruction's target is not a valid XML `NCName` (a `Name` with no colon) or is
+	 * an ASCII case-insensitive match for `"xml"`, or its data contains `?>` or characters outside
+	 * the XML Char production
+	 * - a DocumentType's `name` is not a valid XML `Name` (XML 1.0 production [5])
 	 * - a DocumentType's `publicId` is non-empty and does not match the XML `PubidLiteral`
 	 * production (W3C DOM Parsing §3.2.1.3; XML 1.0 production [12])
 	 * - a DocumentType's `systemId` is non-empty and does not match the XML `SystemLiteral`
 	 * production (W3C DOM Parsing §3.2.1.3; XML 1.0 production [11])
 	 * - a DocumentType's `internalSubset` contains `"]>"`
+	 * - an EntityReference's `nodeName` is not a valid XML `Name` (XML 1.0 production [5])
 	 * - the Document has no `documentElement`
 	 * @see https://developer.mozilla.org/docs/Web/API/XMLSerializer/serializeToString
 	 * @see https://html.spec.whatwg.org/#dom-xmlserializer-serializetostring
@@ -34483,6 +34827,12 @@ function requireDom () {
 							var pubid = n.publicId;
 							var sysid = n.systemId;
 							if (requireWellFormed) {
+								if (!g.Name_exact.test(n.name)) {
+									throw new DOMException(
+										'The doctype name "' + n.name + '" is not a valid XML Name',
+										DOMExceptionName.InvalidStateError
+									);
+								}
 								if (pubid && !g.PubidLiteral_match.test(pubid)) {
 									throw new DOMException('DocumentType publicId is not a valid PubidLiteral', DOMExceptionName.InvalidStateError);
 								}
@@ -34509,8 +34859,11 @@ function requireDom () {
 							return null;
 						case PROCESSING_INSTRUCTION_NODE:
 							if (requireWellFormed) {
-								if (n.target.indexOf(':') !== -1 || n.target.toLowerCase() === 'xml') {
-									throw new DOMException('The ProcessingInstruction target is not well-formed', DOMExceptionName.InvalidStateError);
+								if (!g.NCName_exact.test(n.target) || n.target.toLowerCase() === 'xml') {
+									throw new DOMException(
+										'The processing instruction target "' + n.target + '" is not a valid XML NCName or is reserved',
+										DOMExceptionName.InvalidStateError
+									);
 								}
 								if (g.InvalidChar.test(n.data)) {
 									throw new DOMException(
@@ -34525,6 +34878,12 @@ function requireDom () {
 							buf.push('<?', n.target, ' ', n.data, '?>');
 							return null;
 						case ENTITY_REFERENCE_NODE:
+							if (requireWellFormed && !g.Name_exact.test(n.nodeName)) {
+								throw new DOMException(
+									'The entity reference name "' + n.nodeName + '" is not a valid XML Name',
+									DOMExceptionName.InvalidStateError
+								);
+							}
 							buf.push('&', n.nodeName, ';');
 							return null;
 						//case ENTITY_NODE:
@@ -37120,6 +37479,10 @@ function requireSax () {
 						var doc = domBuilder.doc;
 						var text = doc.createTextNode(source.substring(start));
 						if (doc.documentElement) {
+							// `return errorHandler.error` is not a common pattern,
+							// it is usually only used with `.fatalError`s.
+							// In this case it is intentional, because it allows to stop parsing
+							// and returning doc after reporting the extra content that will not be part of the document.
 							return errorHandler.error('Extra content at the end of the document');
 						}
 						doc.appendChild(text);
@@ -37142,9 +37505,27 @@ function requireSax () {
 						if (!tagNameRaw) {
 							return errorHandler.fatalError('end tag name missing');
 						}
-						var tagNameMatch = end > 0 && g.reg('^', g.QName_group, g.S_OPT, '$').exec(tagNameRaw);
+						var endTagNameStrict = g.reg('^', g.QName_group, g.S_OPT, '$');
+						var tagNameMatch = end > 0 && endTagNameStrict.exec(tagNameRaw);
 						if (!tagNameMatch) {
-							return errorHandler.fatalError('end tag name contains invalid characters: "' + tagNameRaw + '"');
+							var leadingTagNameMatch = end > 0 && g.reg('^', g.QName_group).exec(tagNameRaw);
+							if (isHTML && leadingTagNameMatch) {
+								errorHandler.warning('end tag name contains invalid trailing characters: "' + tagNameRaw + '"');
+								tagNameMatch = leadingTagNameMatch;
+							} else if (
+								// Backward compatibility, remove this whole `else if` arm in the next breaking release
+								// (XML then falls through to the `fatalError` below, for a clean mode split: XML fatal,
+								// HTML warning). A valid end-tag name followed by a line break and trailing content was
+								// silently accepted while `reg` still used the `m` flag; re-adding `m` here matches exactly
+								// those inputs, kept recoverable and reported.
+								leadingTagNameMatch &&
+								new RegExp(endTagNameStrict.source, endTagNameStrict.flags + 'm').test(tagNameRaw)
+							) {
+								errorHandler.error('end tag name is followed by a line break and trailing content: "' + tagNameRaw + '"');
+								tagNameMatch = leadingTagNameMatch;
+							} else {
+								return errorHandler.fatalError('end tag name contains invalid characters: "' + tagNameRaw + '"');
+							}
 						}
 						if (!domBuilder.currentElement && !domBuilder.doc.documentElement) {
 							// not enough information to provide a helpful error message,
@@ -37229,7 +37610,9 @@ function requireSax () {
 				if (e instanceof ParseError) {
 					throw e;
 				} else if (e instanceof DOMException) {
-					throw new ParseError(e.name + ': ' + e.message, domBuilder.locator, e);
+					// A DOMException raised while building the DOM is not-well-formed input,
+					// so it is wrapped into a ParseError and reported before being thrown.
+					return errorHandler.fatalError('Error constructing the DOM: ' + e.name + ': ' + e.message, e);
 				}
 				errorHandler.error('element parse error: ' + e);
 				end = -1;
@@ -37284,6 +37667,15 @@ function requireSax () {
 		var s = S_TAG; //status
 		while (true) {
 			var c = source.charAt(p);
+			if (s === S_TAG && c === '<') {
+				// A `<` can never occur inside a tag name. Without this guard the scan runs
+				// on to the next `>` (or EOF) before `setTagName` rejects the whole slice, so
+				// a document with many `<` inside a malformed tag makes each one-character
+				// recovery step re-scan to the distant `>` — O(n^2). Stopping at the `<` keeps
+				// each recovery step bounded. The candidate scanned so far is reported raw,
+				// consistent with the sibling invalid-tag-name throw below.
+				throw new Error('unexpected < in tag name: ' + source.slice(start, p));
+			}
 			switch (c) {
 				case '=':
 					if (s === S_ATTR) {
@@ -37294,7 +37686,7 @@ function requireSax () {
 						s = S_EQ;
 					} else {
 						//fatalError: equal must after attrName or space after attrName
-						throw new Error('attribute equal must after attrName'); // No known test case
+						throw new Error('attribute equal must after attrName');
 					}
 					break;
 				case "'":
@@ -37326,7 +37718,7 @@ function requireSax () {
 						s = S_ATTR_END;
 					} else {
 						//fatalError: no equal before
-						throw new Error('attribute value must after "="'); // No known test case
+						throw new Error('attribute value must after "="');
 					}
 					break;
 				case '/':
@@ -37346,7 +37738,7 @@ function requireSax () {
 							break;
 						//case S_EQ:
 						default:
-							throw new Error("attribute invalid close char('/')"); // No known test case
+							throw new Error("attribute invalid close char('/')");
 					}
 					break;
 				case '': //end document
@@ -37483,7 +37875,13 @@ function requireSax () {
 				//hack!!
 				if (localNSMap == null) {
 					localNSMap = Object.create(null);
-					_copy(currentNSMap, (currentNSMap = Object.create(null)));
+					// Derive the child scope's namespace map by prototype-chain inheritance
+					// instead of a flat copy: lookups inherit ancestor prefixes transparently,
+					// so a document nesting N scopes retains O(N) map entries rather than
+					// sum(1..N) = O(N^2). `localNSMap` stays a flat own-only record of the
+					// prefixes declared at THIS element, so own-property enumeration
+					// (endPrefixMapping below) still reports only local declarations.
+					currentNSMap = Object.create(currentNSMap);
 				}
 				currentNSMap[nsPrefix] = localNSMap[nsPrefix] = value;
 				a.uri = NAMESPACE.XMLNS;
@@ -37540,7 +37938,22 @@ function requireSax () {
 		// TODO: https://html.spec.whatwg.org/#cdata-rcdata-restrictions
 		var isEscapableRaw = isHTMLEscapableRawTextElement(tagName);
 		if (isEscapableRaw || isHTMLRawTextElement(tagName)) {
-			var elEndStart = source.indexOf('</' + tagName + '>', elStartEnd);
+			// The closing tag of a raw-text element matches case-insensitively
+			// (WHATWG HTML §13.2.5.14 RAWTEXT end tag name state). A case-sensitive
+			// search that missed the closing tag would return -1 and the `substring`
+			// below would treat -1 as a backward slice from position 0, re-emitting all
+			// prior source and amplifying output quadratically across repeated elements.
+			// The regex is anchored to `elStartEnd` via `lastIndex` so it scans forward
+			// only (O(distance), not the whole source).
+			var closeTag = new RegExp('</' + tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '>', 'ig');
+			closeTag.lastIndex = elStartEnd;
+			var match = closeTag.exec(source);
+			var elEndStart = match ? match.index : -1;
+			if (elEndStart < 0) {
+				// No closing tag: never slice with a -1 end index. Leave the element to
+				// the parse loop's normal recovery instead of back-capturing the source.
+				return elStartEnd + 1;
+			}
 			var text = source.substring(elStartEnd + 1, elEndStart);
 
 			if (isEscapableRaw) {
@@ -38130,6 +38543,9 @@ function requireDomParser () {
 	 * - Any `fatalError` throws a `ParseError` which prevents further processing.
 	 * - Any error thrown by `onError` is converted to a `ParseError` which prevents further
 	 * processing - If no `Document` was created during parsing it is reported as a `fatalError`.
+	 * - A `DOMException` raised while building the DOM (e.g. an unbound namespace prefix) is
+	 * reported as a `fatalError` and rethrown as a `ParseError` with the `DOMException` as its
+	 * `cause`.
 	 * *****Warning: By configuring a faulty DOMHandler implementation,
 	 * the specified behavior can completely be broken*****.
 	 *
@@ -38410,14 +38826,16 @@ function requireDomParser () {
 		 *
 		 * @param {string} message
 		 * - The message to be used for reporting and throwing the error.
+		 * @param {Error} [cause]
+		 * The error that caused this fatal error, preserved as the thrown `ParseError`'s `cause`.
 		 * @returns {never}
 		 * This function always throws an error and never returns a value.
 		 * @throws {ParseError}
 		 * Always throws a ParseError with the provided message.
 		 */
-		fatalError: function (message) {
+		fatalError: function (message, cause) {
 			this.reportError('fatalError', message);
-			throw new ParseError(message, this.locator);
+			throw new ParseError(message, this.locator, cause);
 		},
 	};
 

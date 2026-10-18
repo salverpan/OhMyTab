@@ -986,7 +986,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 | `docx-preview` | docx 只读渲染（阅读器） | `reader/reader.js` |
 | `xlsx` (SheetJS) | xlsx/csv 渲染 + 导入导出桥接 | `reader/reader.js`、`doc-import.js`、`doc-edit-sheets.js` |
 | `@univerjs/presets` (+`@univerjs/core`/`themes`) | xlsx 编辑模式可编辑层（Univer） | `doc-edit-sheets.js` |
-| `@tiptap/*`（已弃用） | 旧 docx WYSIWYG 编辑器；2026-08-17 引擎重写后无引用（package.json 暂留，构建已自动剔除） | 无 |
+| `@tiptap/*`（2026-10-18 已删除） | 旧 docx WYSIWYG 编辑器；2026-08-17 引擎重写后无引用，2026-10-18 从 package.json 移除（同时清掉 prosemirror-view 等一串漏洞告警） | 无 |
 | `mammoth` | docx -> 纯文本提取（仅入库导入用；编辑模式已不再走 mammoth） | `doc-import.js` |
 | `react` / `react-dom` | ThinkingOrb 动画组件渲染 | `content/global.js`、`reader/reader.js`（浮动聊天 orb） |
 | `thinking-orbs` | AI 思考加载动画指示器 | 三宿主（panel/reader/content 浮动窗） |
