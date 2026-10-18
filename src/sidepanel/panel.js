@@ -24,7 +24,7 @@ import { mountPeekCat, setPeekCatThinking, peekCatEnter } from './pixel-cat.js';
 import { getStaticSystemPrompt, buildDynamicPreamble } from './chat-prompt.js';
 import { compactHistory, estimateMessagesTokens, estimateTokens } from './history-compact.js';
 import { rollNumber } from '../lib/rolling-number.js';
-import { buildPageData, isReadableTab, formatReaderSessionNote } from '../lib/page-data.js';
+import { buildPageData, formatReaderSessionNote, getBrowsingTab, isAppPanelPage } from '../lib/page-data.js';
 import { getAnnotationsForUrl, saveAnnotation, deleteAnnotation } from '../lib/annotations.js';
 import { saveDocFile, getDocFile, deleteDocFile } from '../lib/doc-store.js';
 import { purgeProject, restoreProject, purgeProjects, restoreProjects } from '../lib/project-purge.js';
@@ -216,7 +216,7 @@ const toolCtx = {
   },
   onPlan: (plan) => applyPlanUpdate(plan, null),
   onDocEdit: (card) => applyDocEdit(card, null),
-  // 图表导出到 docx 的光栅化能力（ECharts 要真 DOM，只有侧栏/阅读器这类宿主能提供）
+  // 图表导出到 docx 的光栅化能力（G2 要真 DOM，只有侧栏/阅读器这类宿主能提供）
   rasterizeChart: (option, opts) => rasterizeChartOption(option, opts),
   get axSnapshotMap() { return axSnapshotMap; },
   set axSnapshotMap(_v) {},
@@ -656,8 +656,7 @@ function setNarrowWorkspaceView(showWs) {
   if (backBtn) backBtn.hidden = !wsShowWorkspace;
   applyLibCollapsed(!wsShowWorkspace, false, false);
   if (!wsShowWorkspace && chatCol) {
-    const w = panelCollectEl.clientWidth || window.innerWidth;
-    chatCol.style.width = w + 'px';
+    chatCol.style.width = collapsedChatWidth(panelCollectEl.clientWidth || window.innerWidth) + 'px';
   }
   syncWorkspaceToggleBtn();
 }
@@ -1257,8 +1256,8 @@ async function buildDynamicContext(userText, run = null) {
   let currentTabUrl = '';
   let currentTabInfo = '';
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (isReadableTab(tab)) {
+    const tab = await getBrowsingTab();
+    if (tab) {
       currentTabUrl = tab.url;
       currentTabInfo = `${tab.url}\n${(tab.title || '').slice(0, 100)}`;
     }
@@ -3125,6 +3124,75 @@ cmdSendBtn.addEventListener('click', () => {
   handleUserSend(val);
 });
 
+/* 侧栏 ↔ 整页。同一套界面只留一个：整页打开时关掉侧栏，回到侧栏时关掉整页。 */
+let surfaceTabId = null;
+let surfaceWindowId = null;
+
+function paintSurfaceButton() {
+  const btn = document.getElementById('surfaceToggleBtn');
+  if (!btn) return;
+  const page = surfaceTabId != null;
+  const label = page ? '回到侧栏' : '在整页打开';
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+  document.body.classList.toggle('surface-page', page);
+}
+
+async function prepareSurface() {
+  try {
+    const tab = await chrome.tabs.getCurrent();
+    if (tab?.id && isAppPanelPage(tab.url)) {
+      const listed = await chrome.tabs.query({ windowId: tab.windowId });
+      if (listed.some((t) => t.id === tab.id)) {
+        surfaceTabId = tab.id;
+        surfaceWindowId = tab.windowId;
+        document.body.classList.add('surface-page');
+      }
+    }
+    if (surfaceWindowId == null) {
+      const win = await chrome.windows.getCurrent();
+      surfaceWindowId = win?.id ?? null;
+    }
+  } catch (_) {}
+  paintSurfaceButton();
+}
+
+function bindSurfaceToggle() {
+  const btn = document.getElementById('surfaceToggleBtn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (surfaceTabId != null) {
+      const tabId = surfaceTabId;
+      const windowId = surfaceWindowId;
+      saveChatSession().catch(() => {});
+      chrome.sidePanel.open({ windowId }).then(() => {
+        chrome.tabs.remove(tabId).catch(() => {});
+      }).catch((err) => {
+        showToast(err?.message || '无法打开侧栏', true);
+      });
+      return;
+    }
+    const url = chrome.runtime.getURL('src/sidepanel/index.html');
+    const windowId = surfaceWindowId;
+    saveChatSession().finally(() => {
+      chrome.tabs.query({ url }, (found) => {
+        const closeSide = () => {
+          if (windowId == null || !chrome.sidePanel?.close) return;
+          chrome.sidePanel.close({ windowId }).catch(() => {});
+        };
+        if (found && found[0]) {
+          chrome.tabs.update(found[0].id, { active: true }, () => {
+            chrome.windows.update(found[0].windowId, { focused: true }, closeSide);
+          });
+          return;
+        }
+        chrome.tabs.create({ url, active: true }, closeSide);
+      });
+    });
+  });
+}
+bindSurfaceToggle();
+
 // 导出会话：完整 JSON（UI 气泡 + API 上下文含 tool_calls/工具结果/摘要/token），
 // 用于回放排查"它当时看到什么、为什么那么做"
 const chatExportBtn = document.getElementById('chatExportBtn');
@@ -3194,11 +3262,19 @@ chatMessagesEl?.addEventListener('click', (e) => {
   bubble.remove();
 });
 
-// textarea 高度自适应（1~5 行）
+// 输入框随内容增高。先把高度收到 0 再量 scrollHeight，避免 max-height / flex 把测量值卡住。
+// 外层卡片在列底部，消息区 min-height:0 让位，所以多出来的高度向上长。
 function autoResizeInput() {
   if (!cmdInput) return;
-  cmdInput.style.height = 'auto';
-  cmdInput.style.height = Math.min(120, cmdInput.scrollHeight) + 'px';
+  const messages = chatMessagesEl;
+  const stickToBottom = !!messages
+    && (messages.scrollHeight - messages.scrollTop - messages.clientHeight) < 48;
+  const cap = parseFloat(getComputedStyle(cmdInput).maxHeight);
+  const max = Number.isFinite(cap) ? cap : 200;
+  cmdInput.style.height = '0px';
+  const next = Math.min(max, cmdInput.scrollHeight);
+  cmdInput.style.height = next + 'px';
+  if (stickToBottom) messages.scrollTop = messages.scrollHeight;
 }
 
 function hideMentionMenu() {
@@ -3599,6 +3675,7 @@ function bindLicenseGate() {
 bindLicenseGate();
 
 async function init() {
+  await prepareSurface();
   await applyLicenseGate().catch((err) => {
     console.warn('[SuperCat] license gate failed:', err);
     document.body.classList.remove('license-pending');
@@ -4197,7 +4274,7 @@ function applyStage(stage, { animate = false, persist = false, leftover = 0, pan
     libraryWidth = 0;
     setPreviewCollapsed(true);
     applyLibCollapsed(true, animate, persist);
-    if (chatCol && panelW) chatCol.style.width = panelW + 'px';
+    if (chatCol && panelW) chatCol.style.width = collapsedChatWidth(panelW) + 'px';
   } else {
     if (openingLib || (stage >= 1 && !libraryWidth)) {
       libraryWidth = snapshotLibraryWidth(leftover, stage);
@@ -4249,7 +4326,7 @@ function applyLayoutFromWidth({ animate = false, persist = false } = {}) {
     libraryWidth = 0;
     layoutStage = wsShowWorkspace ? 1 : 0;
     syncLayoutClasses(layoutStage);
-    if (!wsShowWorkspace && chatCol) chatCol.style.width = panelW + 'px';
+    if (!wsShowWorkspace && chatCol) chatCol.style.width = collapsedChatWidth(panelW) + 'px';
     return;
   }
 
@@ -6288,7 +6365,7 @@ function bindSettingsEvents() {
 
   document.getElementById('addCurrentBtn').addEventListener('click', async () => {
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = await getBrowsingTab();
       if (tab?.url) {
         const hostname = new URL(tab.url).hostname;
         const ta = document.getElementById('blacklistTextarea');
@@ -6712,6 +6789,13 @@ const chatDivider = document.getElementById('chatDivider');
 const MIN_CHAT_W = 240;
 const DEFAULT_CHAT_W = 380;
 const MAX_CHAT_W = 560;
+const PAGE_CHAT_MAX = 800;
+
+function collapsedChatWidth(panelW) {
+  const w = panelW || window.innerWidth || MAX_CHAT_W;
+  if (document.body.classList.contains('surface-page')) return Math.min(PAGE_CHAT_MAX, w);
+  return w;
+}
 const CHANNEL_MENU_W = 280; // 与 .chat-channel-menu width 对齐
 const CHANNEL_MENU_GUTTER = 12;
 
@@ -6758,7 +6842,7 @@ function applyLibCollapsed(collapsed, animate = true, persist = true) {
     if (!animate) chatCol.style.transition = 'none';
     if (collapsed) {
       const w = panelCollectEl ? panelCollectEl.clientWidth : window.innerWidth;
-      chatCol.style.width = w + 'px';
+      chatCol.style.width = collapsedChatWidth(w) + 'px';
     } else {
       applyChatLayout(chatWidth, false);
     }

@@ -16,7 +16,7 @@ import { subscribe as subscribeFeed, refreshFeed, refreshFeeds, setDefaultsProvi
 import { parseOPML } from '../lib/feed-parser.js';
 import { runBackfill, getBackfillStatus, stopBackfill, setTranslateProvider } from '../lib/feed-backfill.js';
 import { testCloudProvider } from '../lib/translator-cloud.js';
-import { buildPageData, buildTabSnapshot, isReadableTab, tabListMeta, formatReaderSessionNote, TAB_SNAPSHOT_BUDGET_MS, TAB_SNAPSHOT_TAB_MS } from '../lib/page-data.js';
+import { buildPageData, buildTabSnapshot, isReadableTab, isAppPanelPage, tabListMeta, formatReaderSessionNote, TAB_SNAPSHOT_BUDGET_MS, TAB_SNAPSHOT_TAB_MS } from '../lib/page-data.js';
 import { isDocumentFileUrl, readerUrlForRemote, fileNameFromUrl } from '../lib/doc-kind.js';
 import { saveDocFile } from '../lib/doc-store.js';
 import { loadImageSource, bytesToDataUrl } from '../lib/place-images.js';
@@ -130,8 +130,62 @@ async function getCurrentProject() {
   return currentProject || 'default';
 }
 
-// Click extension icon - open side panel
+// 整页模式占着一个普通标签。工具栏图标只保留一个界面：已有整页就聚焦它并收起侧栏。
+let panelPageTabId = null;
+
+function notePanelPageTab(tab) {
+  if (tab?.id && isAppPanelPage(tab.url)) panelPageTabId = tab.id;
+}
+
+chrome.tabs.onUpdated.addListener((id, info, tab) => {
+  if (!(info.url || info.status === 'complete')) return;
+  if (isAppPanelPage(tab.url)) panelPageTabId = id;
+  else if (id === panelPageTabId) panelPageTabId = null;
+});
+chrome.tabs.onRemoved.addListener((id) => {
+  if (id === panelPageTabId) panelPageTabId = null;
+});
+
+const BROWSING_TAB_KEY = 'scBrowsingTab';
+let browsingWrite = Promise.resolve();
+
+function rememberBrowsingTab(tab) {
+  if (!tab?.id || tab.windowId == null) return;
+  if (!isReadableTab(tab) || isAppPanelPage(tab.url)) return;
+  const windowId = tab.windowId;
+  const tabId = tab.id;
+  browsingWrite = browsingWrite.then(async () => {
+    const data = await chrome.storage.session.get(BROWSING_TAB_KEY);
+    const map = data[BROWSING_TAB_KEY] || {};
+    if (map[String(windowId)] === tabId) return;
+    map[String(windowId)] = tabId;
+    await chrome.storage.session.set({ [BROWSING_TAB_KEY]: map });
+  }).catch(() => {});
+}
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId).then(rememberBrowsingTab).catch(() => {});
+});
+
 chrome.action.onClicked.addListener((tab) => {
+  if (panelPageTabId != null) {
+    chrome.tabs.get(panelPageTabId).then((page) => {
+      if (!page?.id) {
+        panelPageTabId = null;
+        chrome.sidePanel.open({ windowId: tab.windowId });
+        return;
+      }
+      chrome.tabs.update(page.id, { active: true });
+      chrome.windows.update(page.windowId, { focused: true });
+      if (tab?.windowId != null && chrome.sidePanel?.close) {
+        chrome.sidePanel.close({ windowId: tab.windowId }).catch(() => {});
+      }
+    }).catch(() => {
+      panelPageTabId = null;
+      chrome.sidePanel.open({ windowId: tab.windowId });
+    });
+    return;
+  }
   chrome.sidePanel.open({ windowId: tab.windowId });
 });
 
@@ -264,6 +318,12 @@ async function initOnStartup() {
       ensureHeartbeatAlarm().catch(() => {}),
       ensureLicenseAlarm().catch(() => {}),
       heartbeatLicense().catch((err) => console.warn('[SW] license startup failed:', err)),
+      chrome.tabs.query({}).then((tabs) => {
+        for (const t of tabs) {
+          notePanelPageTab(t);
+          if (t.active) rememberBrowsingTab(t);
+        }
+      }).catch(() => {}),
     ];
 
     // Step 3: kick off backfill after translate provider is settled

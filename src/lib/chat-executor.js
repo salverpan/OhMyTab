@@ -29,7 +29,7 @@ import {
 import { getActiveSearchChannel, executeSearchChannel } from './search-channels.js';
 import { compactHistory, estimateMessagesTokens, estimateTokens } from '../sidepanel/history-compact.js';
 import { emitUsage } from './usage.js';
-import { buildPageData, isReadableTab, isReaderPage, tabListMeta, withTimeout, TAB_SNAPSHOT_BUDGET_MS } from './page-data.js';
+import { buildPageData, isReadableTab, isReaderPage, getBrowsingTab, tabListMeta, withTimeout, TAB_SNAPSHOT_BUDGET_MS } from './page-data.js';
 import { detectVideoUrl, extractVideoTranscript } from './video-extractor.js';
 import { CHAT_TOOLS, TOOL_LABELS, validateToolArgs } from './tools.js';
 import { logToolCall } from './activity-log.js';
@@ -313,7 +313,7 @@ function waitForTabLoad(tabId, timeoutMs = 10000) {
   });
 }
 
-/* 目标 tab：浮动聊天固定在它所在页面（ctx.tabTarget）；侧栏用当前活跃 tab。 */
+/* 目标 tab：浮动聊天固定在它所在页面（ctx.tabTarget）；侧栏/整页用正在浏览的网页。 */
 function isBrowserInternalUrl(url) {
   if (isReaderPage(url)) return false;
   return !url || /^(chrome|edge|about|chrome-extension|devtools|brave|opera):/i.test(url);
@@ -324,13 +324,12 @@ async function getTargetTab(ctx) {
     const tab = await chrome.tabs.get(ctx.tabTarget).catch(() => null);
     if (tab && tab.id) return tab;
   }
-  const usable = (tab) => tab && tab.id && !isBrowserInternalUrl(tab.url);
-  const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (usable(cur)) return cur;
-  const [focused] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (usable(focused)) return focused;
-  const rest = await chrome.tabs.query({ lastFocusedWindow: true });
-  return rest.find((t) => t.active) || cur || focused || null;
+  return getBrowsingTab();
+}
+
+async function refreshTab(tabId) {
+  if (!tabId) return null;
+  return chrome.tabs.get(tabId).catch(() => null);
 }
 
 async function sendLoopMessage(tabId, payload) {
@@ -1151,7 +1150,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           const dest = readerUrlForRemote(url);
           await chrome.tabs.update(tab.id, { url: dest });
           await waitForTabLoad(tab.id, 15000);
-          const [newTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const newTab = await refreshTab(tab.id);
           const opened = newTab?.url || dest;
           const hint = dest !== url ? '\n该链接是文档文件，已在 SuperCat 阅读器打开，用 read_tab 读正文。' : '';
           return `已导航到: ${opened}\n标题: ${newTab?.title || '(加载中)'}${hint}`;
@@ -1159,7 +1158,7 @@ export async function executeToolCall(name, args, ctx = {}) {
         if (args.action === 'go_back') {
           await chrome.tabs.goBack(tab.id);
           await waitForTabLoad(tab.id, 10000);
-          const [newTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const newTab = await refreshTab(tab.id);
           return `已返回上一页: ${newTab?.url || '(未知)'}\n标题: ${newTab?.title || '(加载中)'}`;
         }
         if (args.action === 'screenshot') {
@@ -1349,7 +1348,7 @@ export async function executeToolCall(name, args, ctx = {}) {
               await debuggerSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 1 });
             });
             await new Promise((r) => setTimeout(r, args.wait_ms || 800));
-            const [postTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            const postTab = await refreshTab(tab.id);
             return `CDP 点击成功 (${Math.round(x)}, ${Math.round(y)})。${postTab && postTab.url !== tab.url ? '页面已跳转到: ' + postTab.url : ''}`;
           } catch (err) {
             return `CDP 点击失败: ${err.message || String(err)}`;
@@ -1453,7 +1452,7 @@ export async function executeToolCall(name, args, ctx = {}) {
               await debuggerSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 });
             });
             await new Promise((r) => setTimeout(r, args.wait_ms || 800));
-            const [postTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            const postTab = await refreshTab(tab.id);
             return `AX 点击成功 (节点 #${n}, 坐标 ${Math.round(cx)},${Math.round(cy)})。${postTab && postTab.url !== tab.url ? '页面已跳转: ' + postTab.url : ''}`;
           } catch (err) {
             return `AX 点击失败: ${err.message || String(err)}`;
@@ -1610,7 +1609,7 @@ export async function executeToolCall(name, args, ctx = {}) {
           // Content script might have been destroyed due to page navigation
           if (isClickAction) {
             await waitForTabLoad(tab.id, 15000);
-            const [newTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            const newTab = await refreshTab(tab.id);
             if (newTab && newTab.url !== beforeUrl) {
               return `点击后页面已跳转到: ${newTab.url}\n标题: ${newTab.title || '(加载中)'}\n\n可以用 read_current_page 读取新页面内容。`;
             }
@@ -1622,7 +1621,7 @@ export async function executeToolCall(name, args, ctx = {}) {
         if (!resp.ok) return `操作失败: ${resp.error || '未知错误'}`;
 
         // Check if page navigated after the click
-        const [postTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const postTab = await refreshTab(tab.id);
         if (isClickAction && postTab && postTab.url !== beforeUrl) {
           return `点击成功，页面已跳转到: ${postTab.url}\n标题: ${postTab.title || '(加载中)'}\n\n可以用 read_current_page 读取新页面内容。`;
         }
@@ -2050,7 +2049,8 @@ export async function executeToolCall(name, args, ctx = {}) {
             await chrome.tabs.remove(tabId);
             return `已关闭标签页 #${tabId}`;
           }
-          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const tab = await getBrowsingTab();
+          if (!tab?.id) return '当前没有可关闭的网页标签。';
           await chrome.tabs.remove(tab.id);
           return `已关闭当前标签页: ${tab.title || ''}`;
         }
@@ -2060,7 +2060,8 @@ export async function executeToolCall(name, args, ctx = {}) {
             await chrome.tabs.reload(tabId);
             return `已刷新标签页 #${tabId}`;
           }
-          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const tab = await getBrowsingTab();
+          if (!tab?.id) return '当前没有可刷新的网页标签。';
           await chrome.tabs.reload(tab.id);
           await new Promise((r) => setTimeout(r, 1500));
           return `已刷新当前标签页: ${tab.title || ''}`;

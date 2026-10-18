@@ -43,6 +43,38 @@ export function isReadableTab(tab) {
   return !!(tab && tab.url && !isUnreadableUrl(tab.url));
 }
 
+const PANEL_PAGE_URL = chrome.runtime.getURL('src/sidepanel/index.html');
+const BROWSING_TAB_KEY = 'scBrowsingTab';
+
+/** 侧栏整页打开时的扩展标签。它不是用户正在看的网页。 */
+export function isAppPanelPage(url) {
+  if (typeof url !== 'string') return false;
+  return url.split('?')[0].split('#')[0] === PANEL_PAGE_URL;
+}
+
+/**
+ * 用户正在浏览的网页标签。
+ * 侧栏里就是当前窗口的活跃标签；整页模式里活跃标签是扩展自己，
+ * 改记这个窗口上一次打开的可读网页（service worker 写入 session）。
+ */
+export async function getBrowsingTab() {
+  const usable = (tab) => isReadableTab(tab) && !isAppPanelPage(tab.url);
+  const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (usable(cur)) return cur;
+  const windowId = cur?.windowId ?? (await chrome.windows.getCurrent().catch(() => null))?.id;
+  if (windowId == null) return null;
+  try {
+    const data = await chrome.storage.session.get(BROWSING_TAB_KEY);
+    const id = data?.[BROWSING_TAB_KEY]?.[String(windowId)];
+    if (id != null) {
+      const remembered = await chrome.tabs.get(id).catch(() => null);
+      if (usable(remembered)) return remembered;
+    }
+  } catch (_) {}
+  const rest = await chrome.tabs.query({ windowId });
+  return rest.find(usable) || null;
+}
+
 // chrome.tabs.sendMessage 在内容脚本不 sendResponse / 页面冻结 / SW 被杀时
 // 永远不 settle。所有跨 tab 提取必须套超时，否则 AI 状态行会卡死。
 export const TAB_SNAPSHOT_TAB_MS = 1500;
@@ -249,6 +281,13 @@ export async function buildPageData(tabId, { format = 'auto', maxChars, offset =
       payload.data = { content: contentText };
     }
     if (paging) payload.data = { ...payload.data, ...paging };
+    payload.tabId = tabId;
+    if (Array.isArray(resp.figures) && resp.figures.length) {
+      payload.data.figures = resp.figures
+        .filter((f) => f && Number.isFinite(Number(f.n)))
+        .map((f) => ({ n: Number(f.n), caption: String(f.caption || '') }));
+    }
+    if (resp.cover) payload.data.cover = { n: 0, caption: String(resp.cover.caption || '封面') };
     return payload;
   } catch (err) {
     return { error: `读取失败: ${err.message || '无法访问该页面的内容脚本'}` };
