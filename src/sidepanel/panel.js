@@ -7,16 +7,29 @@ import { SEARCH_PRESETS, searchPreset, normalizeSearchChannel } from '../lib/sea
 import { entriesToMarkdownDocxBlob, markdownToDocxBlob } from '../lib/md-to-docx.js';
 import { testApiConnection, streamChatWithTools } from '../lib/ai-client.js';
 import { createExportApi } from './panel-export.js';
-import { PROVIDER_PRESETS } from '../lib/providers/presets.js';
+import { PROVIDER_PRESETS, PROVIDER_CATALOG } from '../lib/providers/presets.js';
+import { skinNativeSelect } from '../lib/native-select-skin.js';
 import { inferModelCaps, formatContextLabel, contextPresets, EFFORT_LEVELS, probeModelMeta, refreshModelCatalog, catalogSourceLabel, defaultWorkingContext, resolveEffortId } from '../lib/model-limits.js';
 import { peekEffortProbe, clearEffortProbe } from '../lib/effort-probe.js';
 import { AGENT_MAX_ROUNDS, AGENT_WRAP_HINT_ROUND } from '../lib/limits.js';
+import {
+  routeResearchMode, resolveLoopRounds, resolveWrapRound, nextResearchHold,
+  toolsForResearchStep, researchCarryFromHistory, RESEARCH_CHILD_WAIT_MS,
+} from '../lib/research-mode.js';
+import {
+  inspectTurnBudget,
+  shouldFinalizeEmptyAnswer,
+  FINALIZE_EMPTY_AFTER_TOOLS,
+  emptyToolFallbackText,
+} from '../lib/agent-finalize.js';
 import { isImageUnsupportedError } from '../lib/vision-client.js';
+import { formatNetworkError } from '../lib/net-retry.js';
+import { recoverParentLlmCall, waitForLiveChildren, abortAndSettleChildren, hasLiveChildren } from '../lib/run-settle.js';
 import {
   listHeartbeatTasks, upsertHeartbeatTask, deleteHeartbeatTask, heartbeatPresets,
-  formatCadence, heartbeatUserText, queuedHeartbeatTasks, dueHeartbeatTasks,
-  markHeartbeatRunning, markHeartbeatFinished, queuedOrDueCount, ensureHeartbeatAlarm,
-  parseEvery, normalizeSchedule, WEEKDAY_LABEL, taskBelongsToProject,
+  formatCadence, queuedOrDueCount, ensureHeartbeatAlarm, heartbeatInboxKey,
+  parseEvery, normalizeSchedule, WEEKDAY_LABEL,
+  isHeartbeatTaskRunning, runningHeartbeatProjectIds, HEARTBEAT_STALE_RUNNING_MS,
 } from '../lib/heartbeat.js';
 import { buildChatTools } from '../lib/tools.js';
 import { initFeedView, startManualIndexRebuild } from './feed-view.js';
@@ -38,7 +51,7 @@ import { getPlan, clearPlan, planCardHtml, upsertPlanCardEl } from '../lib/plan.
 import { listInsights } from '../lib/insight.js';
 import { docEditsListHtml, upsertDocEditsCardEl, mergeEditsIntoList } from '../lib/doc-edits.js';
 import { deleteArtifactsByProject, deleteArtifactsMatching } from '../lib/artifact-store.js';
-import { inferEntryType } from '../lib/source-model.js';
+import { selectEntriesForTrunkClear } from '../lib/source-model.js';
 import { deleteEntryCascade, restoreEntryCascade } from '../lib/entry-cascade.js';
 import { createWorkspaceView } from './workspace-view.js';
 import { ensureWorkspaceMigration } from '../lib/workspace-migration.js';
@@ -46,7 +59,7 @@ import { aoaToXlsxBuffer, rowsFromCreateDocumentArgs } from '../lib/create-xlsx.
 // 共享工具执行器（侧栏与浮动聊天 AI 的唯一实现，功能平价）：
 // 36 个 chat tools（含 refresh_feeds / plot_chart / call_api）；全部辅助函数已迁入 chat-executor.js，此处只保留宿主 ctx。
 import { processRoundToolCalls, buildEntriesDigest, retrieveMemories, calcRelevance, contextCompactBudget, isContextOverflowError, HISTORY_KEEP_TAIL_TOKENS } from '../lib/chat-executor.js';
-import { listAgents, parseAgentMentions, formatAgentCatalog, serializeSubagentSessions, restoreSubagentSessions, validateCustomAgent, BUILTIN_AGENTS } from '../lib/subagent.js';
+import { listAgents, parseAgentMentions, formatAgentCatalog, serializeSubagentSessions, restoreSubagentSessions, validateCustomAgent, BUILTIN_AGENTS, SUBAGENT_LLM_NETWORK_RECOVERIES } from '../lib/subagent.js';
 import { subagentListHtml, upsertSubagentCardEl, syncLiveTurnOrder } from '../lib/subagent-ui.js';
 import { syncInlineMedia, timelineParts } from '../lib/inline-media.js';
 import { attachScopeQuiz } from '../lib/scope-quiz.js';
@@ -526,6 +539,7 @@ toolCtx.onSubagentWriteRefresh = async () => {
   entries = await getEntries(currentProject);
   render();
   renderProjects();
+  if (workspaceApi) workspaceApi.refresh().catch(() => {});
 };
 toolCtx.registerBackgroundAbort = (c) => { if (c) backgroundAborts.add(c); };
 toolCtx.unregisterBackgroundAbort = (c) => { backgroundAborts.delete(c); };
@@ -1292,6 +1306,7 @@ async function buildDynamicContext(userText, run = null) {
     insights: await listInsights(pid),
     plan: await getPlan(pid),
     apiCatalog: formatApiCatalog(await loadConnectors()),
+    researchRoute: run ? run.researchRoute : null,
   });
 }
 
@@ -1442,6 +1457,12 @@ async function loadChatSession(pid = currentProject) {
       // 清单按项目存（浮动聊天与侧栏共用）：会话里没有或更旧时，用存储里的补上
       try { reconcilePlanFromStorage(run.messages, await getPlan(id)); } catch (_) {}
     }
+    // 后台心跳的 UI 气泡单独存 inbox；合并时按 hbKey 去重，避免和项目会话里的副本重复。
+    try {
+      const inboxKey = heartbeatInboxKey(id);
+      const { [inboxKey]: inbox } = await chrome.storage.local.get(inboxKey);
+      mergeHeartbeatInboxMessages(run, inbox, { render: false });
+    } catch (_) {}
   } catch (_) {}
   run.loaded = true;
   if (viewing(run)) {
@@ -1451,6 +1472,38 @@ async function loadChatSession(pid = currentProject) {
     updateSendButton();
   }
   return true;
+}
+
+function mergeHeartbeatInboxMessages(run, inbox, { render = true } = {}) {
+  if (!run || !Array.isArray(inbox) || !inbox.length) return 0;
+  const seen = new Set((run.messages || []).map((m) => m && m.hbKey).filter(Boolean));
+  let added = 0;
+  for (const msg of inbox) {
+    if (!msg || !msg.hbKey || seen.has(msg.hbKey)) continue;
+    seen.add(msg.hbKey);
+    run.messages.push({ ...msg });
+    added += 1;
+  }
+  if (added && viewing(run)) {
+    if (render && !run.inProgress) {
+      chatMessages = run.messages;
+      renderChat();
+    } else {
+      run.pendingHeartbeatInboxRefresh = true;
+    }
+  }
+  return added;
+}
+
+async function syncHeartbeatInbox(run = ensureRun(currentProject)) {
+  if (!run || run.discarded) return 0;
+  try {
+    const key = heartbeatInboxKey(run.pid);
+    const { [key]: inbox } = await chrome.storage.local.get(key);
+    return mergeHeartbeatInboxMessages(run, inbox);
+  } catch (_) {
+    return 0;
+  }
 }
 
 async function clearChatSession(pid = currentProject) {
@@ -1506,6 +1559,38 @@ function runIsBusy(run) {
     run.runningSubagents.size > 0 ||
     run.backgroundAborts.size > 0
   );
+}
+
+/** 心跳 SW 正在跑的项目。侧栏自己的 chat/子代理走 runIsBusy；两边任一为真就亮呼吸灯。 */
+let heartbeatLivePids = new Set();
+
+function projectHasActivity(pid) {
+  const id = String(pid || 'default');
+  return runIsBusy(projectRuns.get(id)) || heartbeatLivePids.has(id);
+}
+
+function renderProjectsIfIdle() {
+  const list = document.getElementById('libraryList');
+  if (!list || list.querySelector('.library-rename-input')) return;
+  renderProjects();
+}
+
+async function syncHeartbeatLivePids() {
+  let tasks;
+  try {
+    tasks = await listHeartbeatTasks();
+  } catch (_) {
+    return;
+  }
+  const next = runningHeartbeatProjectIds(tasks);
+  let changed = next.size !== heartbeatLivePids.size;
+  if (!changed) {
+    for (const id of next) {
+      if (!heartbeatLivePids.has(id)) { changed = true; break; }
+    }
+  }
+  heartbeatLivePids = next;
+  if (changed) renderProjectsIfIdle();
 }
 
 function ensureRun(pid) {
@@ -1640,13 +1725,11 @@ function bindVisibleRun(run) {
 
 function refreshProjectLiveBadges(run) {
   if (run) {
-    const busy = runIsBusy(run);
+    const busy = projectHasActivity(run.pid);
     if (run.busyBadge === busy) return;
     run.busyBadge = busy;
   }
-  const list = document.getElementById('libraryList');
-  if (!list || list.querySelector('.library-rename-input')) return;
-  renderProjects();
+  renderProjectsIfIdle();
 }
 
 /** 对话回合起止写入统一操作日志（心跳触发的回合标为 heartbeat）。 */
@@ -2027,6 +2110,7 @@ function makeRunCtx(run) {
         render();
         renderProjects();
       }
+      if (workspaceApi) workspaceApi.refresh().catch(() => {});
     },
     registerBackgroundAbort: (c) => {
       if (c) run.backgroundAborts.add(c);
@@ -2065,6 +2149,7 @@ function makeRunCtx(run) {
     set(v) {
       run.runningSubagents = v;
       if (viewing(run)) toolCtx.runningSubagents = v;
+      refreshProjectLiveBadges(run);
     },
   });
   return ctx;
@@ -2075,6 +2160,10 @@ async function continueAfterTurn(run) {
   setRunActive(run, false);
   if (viewing(run)) updateTokenMeter();
   await closeChatOpenedTabs(run);
+  if (run.pendingHeartbeatInboxRefresh) {
+    run.pendingHeartbeatInboxRefresh = false;
+    await syncHeartbeatInbox(run);
+  }
   if (run.queue.length > 0) {
     const next = run.queue.shift();
     if (viewing(run)) {
@@ -2289,7 +2378,18 @@ async function renderHeartbeatList() {
   }
   const cards = tasks.map((t) => {
     if (heartbeatEditingId === t.id) return hbFormHtml(t);
-    const st = t.lastStatus === 'running' ? '执行中' : (t.queued ? '排队等待侧栏' : formatNextRun(t.nextRunAt));
+    const running = isHeartbeatTaskRunning(t);
+    const st = running
+      ? '后台执行中'
+      : t.queued
+        ? '等待后台执行'
+        : t.lastStatus === 'error'
+          ? (`上次失败${formatNextRun(t.nextRunAt) ? ' · ' + formatNextRun(t.nextRunAt) : ''}`)
+          : formatNextRun(t.nextRunAt);
+    // 正在跑时不展示上一轮失败文案，否则会「显示失败了、任务还在进行」。
+    const lastResult = (!running && t.lastResult)
+      ? `<div class="hb-card-result">${escHtml(String(t.lastResult).replace(/\s+/g, ' ').slice(0, 220))}</div>`
+      : '';
     return `<div class="hb-card" data-id="${escAttr(t.id)}">
       <div class="hb-card-top">
         <button type="button" class="hb-toggle${t.enabled !== false ? ' on' : ''}" data-act="toggle" title="启用/暂停"></button>
@@ -2303,6 +2403,7 @@ async function renderHeartbeatList() {
         </div>
       </div>
       <div class="hb-card-prompt">${escHtml(t.prompt || '')}</div>
+      ${lastResult}
     </div>`;
   }).join('');
   heartbeatListEl.innerHTML = (heartbeatEditingId === 'new' ? hbFormHtml(null) : '') + cards;
@@ -2395,8 +2496,9 @@ heartbeatListEl?.addEventListener('click', async (e) => {
 });
 
 let activeHeartbeatTaskId = null;
-let drainingHeartbeat = false;
 
+// 心跳任务现在由 Service Worker 后台执行；侧栏只负责展示状态与结果，不再从 UI 领取队列。
+// 这里仍保留 pendingFollowups 的续跑逻辑（后台子代理完成后要回到当前对话）。
 async function drainRun(run) {
   if (!run || run.discarded || run.inProgress || run.draining) return;
   if (run.pendingFollowups.length) {
@@ -2405,77 +2507,19 @@ async function drainRun(run) {
     sendChatMessage(text, { subagentFollowup: true, attachments: [], run });
     return;
   }
-  const queued = await queuedHeartbeatTasks(run.pid);
-  const due = (await dueHeartbeatTasks()).filter((t) => taskBelongsToProject(t, run.pid));
-  const dueNow = queued[0] || due[0];
-  if (!dueNow) {
-    if (viewing(run)) refreshHeartbeatBadge();
-    return;
-  }
-  if (run.inProgress) return;
-  run.draining = true;
-  if (viewing(run)) drainingHeartbeat = true;
-  try {
-    await runHeartbeatTask(dueNow, run);
-  } finally {
-    run.draining = false;
-    if (viewing(run)) drainingHeartbeat = false;
-  }
+  if (viewing(run)) refreshHeartbeatBadge();
 }
 
-async function drainHeartbeatQueue() {
-  return drainRun(ensureRun(currentProject));
-}
-
-async function runHeartbeatTask(task, run = ensureRun(task.projectId || currentProject)) {
-  if (run.inProgress || run.discarded) return false;
-  if (!run.loaded) await loadChatSession(run.pid);
-  run.heartbeatTaskId = task.id;
-  if (viewing(run)) activeHeartbeatTaskId = task.id;
-  await markHeartbeatRunning(task.id);
-  if (viewing(run)) {
-    await renderHeartbeatList();
-    refreshHeartbeatBadge();
-  }
-  sendChatMessage(heartbeatUserText(task), {
-    heartbeat: true,
-    heartbeatName: task.name,
-    heartbeatTaskId: task.id,
-    attachments: [],
-    run,
-  });
-  return true;
-}
-
+// 兼容侧栏自己的历史气泡逻辑：后台任务已完成并已由 SW 落库，这里只清理本地标记。
 async function closeHeartbeatTurn(ok, error, run) {
   const id = run ? run.heartbeatTaskId : activeHeartbeatTaskId;
   if (run) run.heartbeatTaskId = null;
   if (!run || viewing(run)) activeHeartbeatTaskId = null;
-  if (id) {
-    await markHeartbeatFinished(id, { ok, error });
-    workspaceApi?.refresh().catch(() => {});
-    if (!run || viewing(run)) {
-      renderHeartbeatList();
-      refreshHeartbeatBadge();
-    }
+  if (id && (!run || viewing(run))) {
+    renderHeartbeatList();
+    refreshHeartbeatBadge();
   }
 }
-
-chrome.runtime.onMessage.addListener((message, _s, sendResponse) => {
-  if (!message || message.type !== 'HEARTBEAT_FIRE') return;
-  const task = message.task;
-  if (!task) {
-    sendResponse({ taken: false });
-    return;
-  }
-  const run = ensureRun(task.projectId);
-  if (run.inProgress || run.discarded) {
-    sendResponse({ taken: false });
-    return;
-  }
-  sendResponse({ taken: true });
-  runHeartbeatTask(task, run);
-});
 
 // Update button icon when input changes
 cmdInput?.addEventListener('input', () => {
@@ -2602,8 +2646,16 @@ async function sendChatMessage(text, opts = {}) {
     contextTokens: config.contextTokens,
     effort: config.effort || '',
   };
+  const researchRoute = routeResearchMode(text, {
+    selectedCount: run.selectedIds ? run.selectedIds.size : 0,
+    attachmentCount: turnAttachments.length,
+    unfinishedResearch: researchCarryFromHistory(run.history),
+  });
+  run.researchRoute = researchRoute;
   const ctx = makeRunCtx(run);
   ctx.apiConfig = apiCfg;
+  ctx.researchMode = researchRoute.mode;
+  ctx.researchPolicy = researchRoute.policy;
   if (viewing(run)) toolCtx.apiConfig = apiCfg;
   run.abort = new AbortController();
   const { signal } = run.abort;
@@ -2649,8 +2701,9 @@ async function sendChatMessage(text, opts = {}) {
   run.toolUndos = [];
   if (viewing(run)) toolUndos = run.toolUndos;
   // 轮数口径统一来自 lib/limits.js（与 SW 浮动聊天同一来源，不再两边手抄）
-  const MAX_ROUNDS = AGENT_MAX_ROUNDS;
-  const WRAP_HINT_ROUND = AGENT_WRAP_HINT_ROUND;
+  const MAX_ROUNDS = resolveLoopRounds(researchRoute.policy, AGENT_MAX_ROUNDS);
+  const WRAP_HINT_ROUND = resolveWrapRound(researchRoute.policy, AGENT_WRAP_HINT_ROUND);
+  const turnStartedAt = Date.now();
   const turnMessages = []; // assistant+tool messages from this turn, saved to chatHistory after
   let overflowRecovered = false; // 上下文超限自动恢复只做一次，防死循环
 
@@ -2672,16 +2725,33 @@ async function sendChatMessage(text, opts = {}) {
     activeAiBubbleEl = bubbleEl;
   }
 
+  let turnHadTools = false;
+  let alreadyFinalized = false;
+  let llmRecoveries = 0;
+  let researchHoldStep = '';
+  let researchHoldCount = 0;
+  let researchTools = null;
   try {
     for (let round = 0; round < MAX_ROUNDS; round++) {
+      const rp = researchRoute.policy || {};
       if (signal.aborted || run.discarded) break;
       while (run.pendingFollowups.length) {
         const notice = run.pendingFollowups.shift();
         messages.push({ role: 'user', content: notice });
         turnMessages.push({ role: 'user', content: notice });
       }
-      // 接近工具调用上限：注入收尾提示，引导模型用已有信息给最终回答（不进 turnMessages/历史）
-      if (round === WRAP_HINT_ROUND) {
+      const budget = inspectTurnBudget(rp, {
+        round,
+        maxRounds: MAX_ROUNDS,
+        turnUsageSum,
+        turnStartedAt,
+      });
+      // 预算用尽时必须再打一轮（去掉工具），不能把收尾提示推进 messages 后直接 break。
+      if (budget.finalize && !alreadyFinalized) {
+        messages.push({ role: 'system', content: budget.reason });
+        alreadyFinalized = true;
+        paintThinking(run, '正在根据已有材料写回答');
+      } else if (!alreadyFinalized && WRAP_HINT_ROUND > 0 && round === WRAP_HINT_ROUND) {
         messages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
       }
       // 每轮复位：让本轮首 chunk 能清文字+设 orb。
@@ -2689,9 +2759,9 @@ async function sendChatMessage(text, opts = {}) {
       // 文字卡在 "Thinking" 不清--用户看到"明明操作了 tools 还是 thinking"。
       firstChunkReceived = false;
       let result;
-      try {
-        result = await streamChatWithTools(
-          messages, chatTools, apiCfg,
+      const rec = await recoverParentLlmCall(
+        () => streamChatWithTools(
+          messages, alreadyFinalized ? [] : (researchTools || chatTools), apiCfg,
           (chunk) => {
             if (!firstChunkReceived) {
               firstChunkReceived = true;
@@ -2705,11 +2775,21 @@ async function sendChatMessage(text, opts = {}) {
             paintStream(run, fullText);
           },
           signal
-        );
-      } catch (err) {
+        ),
+        {
+          signal,
+          hasProgress: turnHadTools,
+          recoveries: llmRecoveries,
+          onRetry: (d) => {
+            llmRecoveries = d.recoveries;
+            paintThinking(run, `网络中断，正在重试（${d.recoveries}/${SUBAGENT_LLM_NETWORK_RECOVERIES}）`);
+          },
+        },
+      );
+      if (rec.action !== 'ok') {
         // 上下文超限自动恢复（仅一次）：压缩更早的历史，本轮 read 结果保持完整重试。
         // 不折叠/截断本轮工具结果（read 在源头已分页，AI 可用 offset 续拉）。
-        if (!signal.aborted && !overflowRecovered && isContextOverflowError(err)) {
+        if (!signal.aborted && !overflowRecovered && isContextOverflowError(rec.error)) {
           overflowRecovered = true;
           const turnMsgs = messages.slice(turnStart); // 本轮已发生消息（含完整 read 结果）
           await compactChatHistoryIfNeeded(apiCfg, { force: true, run }).catch(() => {});
@@ -2723,16 +2803,91 @@ async function sendChatMessage(text, opts = {}) {
           round--; // for 循环 continue 会自增，先减一保持轮次不变
           continue;
         }
-        throw err;
+        if (rec.action === 'salvage' && !alreadyFinalized) {
+          paintThinking(run, '网络中断，正在根据已有材料写回答');
+          await waitForLiveChildren({
+            runningSubagents: run.runningSubagents,
+            backgroundAborts: run.backgroundAborts,
+          }, { timeoutMs: HEARTBEAT_STALE_RUNNING_MS, signal });
+          messages.push({ role: 'system', content: FINALIZE_EMPTY_AFTER_TOOLS });
+          alreadyFinalized = true;
+          paintThinking(run, '正在根据已有材料写回答');
+          round -= 1;
+          continue;
+        }
+        throw rec.error;
       }
+      llmRecoveries = 0;
+      result = rec.result;
 
       if (result.usage) {
         finalUsage = result.usage;
         turnUsageSum += usageTotalTokens(result.usage);
       }
 
-      // No tool calls - model is done
-      if (result.toolCalls.length === 0) break;
+      if (!String(fullText).trim() && result.content) {
+        fullText = result.content;
+        paintStream(run, fullText);
+      }
+
+      if (alreadyFinalized) break;
+
+      // 没调工具 ≠ 调研做完。成文和核验之前留在本轮里接着做，不要等用户说「继续」。
+      if (result.toolCalls.length === 0) {
+        if (hasLiveChildren({ runningSubagents: run.runningSubagents, backgroundAborts: run.backgroundAborts })) {
+          paintThinking(run, '子任务还在跑，完成后继续');
+          await waitForLiveChildren({
+            runningSubagents: run.runningSubagents,
+            backgroundAborts: run.backgroundAborts,
+          }, { timeoutMs: RESEARCH_CHILD_WAIT_MS, signal });
+          if (signal.aborted || run.discarded) break;
+          if (run.pendingFollowups.length) {
+            fullText = '';
+            paintStream(run, '');
+            round -= 1;
+            continue;
+          }
+        }
+        const held = nextResearchHold(messages.slice(turnStart), researchRoute.policy, {
+          holdStep: researchHoldStep,
+          holdCount: researchHoldCount,
+          waitingForUser: !!(run.pendingScopeQuiz || run.pendingSuggestions),
+        });
+        researchHoldStep = held.holdStep;
+        researchHoldCount = held.holdCount;
+        if (held.action === 'continue') {
+          messages.push({ role: 'system', content: held.gap.prompt });
+          researchTools = held.gap.step === 'gather' ? null : toolsForResearchStep(chatTools, held.gap.step);
+          fullText = '';
+          paintStream(run, '');
+          paintThinking(run, held.gap.label);
+          round -= 1;
+          continue;
+        }
+        if (held.action === 'stuck') {
+          fullText = held.text;
+          paintStream(run, fullText);
+          researchTools = null;
+          break;
+        }
+        researchTools = null;
+        if (shouldFinalizeEmptyAnswer({
+          turnHadTools,
+          toolCalls: result.toolCalls,
+          content: fullText,
+          alreadyFinalized,
+        })) {
+          messages.push({ role: 'system', content: FINALIZE_EMPTY_AFTER_TOOLS });
+          alreadyFinalized = true;
+          paintThinking(run, '正在根据已有材料写回答');
+          round -= 1;
+          continue;
+        }
+        break;
+      }
+      researchHoldStep = '';
+      researchHoldCount = 0;
+      researchTools = null;
       if (signal.aborted) break;
 
       // 一轮工具调用：骨架在 chat-executor.processRoundToolCalls（与 SW 浮动聊天共用），
@@ -2777,6 +2932,7 @@ async function sendChatMessage(text, opts = {}) {
               render();
               renderProjects();
             }
+            if (workspaceApi) workspaceApi.refresh().catch(() => {});
           },
         },
       });
@@ -2813,6 +2969,7 @@ async function sendChatMessage(text, opts = {}) {
           if (undoFailed) showToast('撤销部分失败', true);
         });
       }
+      turnHadTools = true;
       if (run.pendingScopeQuiz) break;
     }
 
@@ -2861,6 +3018,11 @@ async function sendChatMessage(text, opts = {}) {
       run.liveTurnText = '';
       mirrorScalars(run);
     } else {
+      await abortAndSettleChildren(run.abort, {
+        runningSubagents: run.runningSubagents,
+        backgroundAborts: run.backgroundAborts,
+      });
+      refreshProjectLiveBadges(run);
       if (viewing(run)) {
         unmountThinkingOrb();
         unmountToolOrb();
@@ -2869,7 +3031,7 @@ async function sendChatMessage(text, opts = {}) {
       }
       run.cost = null;
       run.toolUndos = [];
-      const msg = `请求失败: ${err.message || '网络错误'}。请检查网络连接和 API 地址。`;
+      const msg = `请求失败: ${formatNetworkError(err)}。请检查网络连接和 API 地址。`;
       run.totalUsedTokens += turnUsageSum;
       run.pendingUserText = '';
       run.liveTurnText = '';
@@ -2901,7 +3063,7 @@ async function sendChatMessage(text, opts = {}) {
       const toolNames = turnMessages
         .filter((m) => m.role === 'assistant' && m.tool_calls)
         .flatMap((m) => m.tool_calls.map((tc) => tc.function.name));
-      const summary = `已执行操作：${toolNames.join('、')}。`;
+      const summary = emptyToolFallbackText(toolNames);
       run.history.push({ role: 'user', content: composeUserContent(text, turnAttachments) });
       for (const m of turnMessages) run.history.push(m);
       run.history.push({ role: 'assistant', content: summary });
@@ -3577,6 +3739,9 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message && message.type === 'COLLECTION_STATUS_CHANGED') {
     refreshEntriesAndRender();
   }
+  if (message && (message.type === 'HEARTBEAT_RUN_FINISHED' || message.type === 'HEARTBEAT_RUN_STARTED')) {
+    syncHeartbeatLivePids().catch(() => {});
+  }
 });
 
 // Chromium 已知问题：side panel 隐藏/不可见时 storage.onChanged 事件可能不
@@ -3586,7 +3751,10 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     refreshEntriesAndRender();
     drainIdleWork();
+    syncHeartbeatInbox(ensureRun(currentProject)).catch(() => {});
     refreshHeartbeatBadge();
+    syncHeartbeatLivePids().catch(() => {});
+    if (workspaceApi) workspaceApi.refresh().catch(() => {});
   }
 });
 
@@ -3605,84 +3773,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.heartbeatTasks) {
     renderHeartbeatList();
     refreshHeartbeatBadge();
+    syncHeartbeatLivePids().catch(() => {});
+  }
+  const inboxKey = heartbeatInboxKey(currentProject);
+  if (changes[inboxKey]) {
+    const run = ensureRun(currentProject);
+    if (!run.loaded) return;
+    if (run.inProgress || run.draining) run.pendingHeartbeatInboxRefresh = true;
+    else syncHeartbeatInbox(run).catch(() => {});
   }
 });
 
-async function applyLicenseGate(view) {
-  if (!view) {
-    view = await chrome.runtime.sendMessage({ type: 'GET_LICENSE_STATE' }).catch(() => ({ ok: false }));
-  }
-  const ok = !!(view && view.ok);
-  document.body.classList.remove('license-pending');
-  document.body.classList.toggle('license-locked', !ok);
-  document.body.classList.toggle('license-ok', ok);
-  const gate = document.getElementById('licenseGate');
-  if (gate) gate.hidden = ok;
-  const statusEl = document.getElementById('licenseStatusLine');
-  if (statusEl) {
-    if (ok) {
-      const exp = view.exp ? new Date(Number(view.exp) * 1000).toLocaleDateString() : '';
-      const bits = ['已激活'];
-      if (view.note) bits.push(view.note);
-      if (exp) bits.push('有效至 ' + exp);
-      statusEl.textContent = bits.join(' · ');
-    } else {
-      statusEl.textContent = (view && view.error) || '未激活';
-    }
-  }
-}
-
-function bindLicenseGate() {
-  const btn = document.getElementById('licenseActivateBtn');
-  const input = document.getElementById('licenseKeyInput');
-  const gateStatus = document.getElementById('licenseGateStatus');
-  const run = async () => {
-    const key = (input?.value || '').trim();
-    if (!key) {
-      if (gateStatus) { gateStatus.textContent = '请输入授权码'; gateStatus.className = 'status-msg error'; }
-      return;
-    }
-    if (btn) btn.disabled = true;
-    if (gateStatus) { gateStatus.textContent = '激活中…'; gateStatus.className = 'status-msg'; }
-    const resp = await chrome.runtime.sendMessage({
-      type: 'ACTIVATE_LICENSE',
-      data: { key },
-    }).catch((err) => ({ ok: false, error: err.message }));
-    if (btn) btn.disabled = false;
-    if (resp && resp.ok) {
-      if (input) input.value = '';
-      if (gateStatus) { gateStatus.textContent = '已激活'; gateStatus.className = 'status-msg success'; }
-      await applyLicenseGate(resp);
-    } else {
-      if (gateStatus) {
-        gateStatus.textContent = (resp && resp.error) || '激活失败';
-        gateStatus.className = 'status-msg error';
-      }
-    }
-  };
-  btn?.addEventListener('click', run);
-  input?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      run();
-    }
-  });
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message && message.type === 'LICENSE_STATE_CHANGED') applyLicenseGate(message.data);
-  });
-}
-
-bindLicenseGate();
-
 async function init() {
   await prepareSurface();
-  await applyLicenseGate().catch((err) => {
-    console.warn('[SuperCat] license gate failed:', err);
-    document.body.classList.remove('license-pending');
-    document.body.classList.add('license-locked');
-    const gate = document.getElementById('licenseGate');
-    if (gate) gate.hidden = false;
-  });
   await ensureWorkspaceMigration().catch((err) => {
     console.error('[SuperCat] workspace migration failed:', err);
   });
@@ -3723,6 +3826,7 @@ async function init() {
   updateTokenMeter();
   await ensureHeartbeatAlarm();
   refreshHeartbeatBadge();
+  await syncHeartbeatLivePids().catch(() => {});
   drainIdleWork();
 }
 
@@ -3733,12 +3837,8 @@ function render() {
 
 async function clearWorkspaceTrunk(trunk = 'all') {
   const clearSources = trunk === 'sources' || trunk === 'all';
-  const clearOutputs = trunk === 'outputs' || trunk === 'all';
   const clearNotebook = trunk === 'notes' || trunk === 'all';
-  const removed = entries.filter((entry) => {
-    const type = inferEntryType(entry);
-    return (clearSources && type === 'source') || (clearOutputs && type === 'output');
-  });
+  const removed = selectEntriesForTrunkClear(entries, trunk);
   const keep = entries.filter((entry) => !removed.includes(entry));
 
   if (removed.length) {
@@ -4550,7 +4650,7 @@ function renderProjects() {
   list.innerHTML = projects.map((p) => `
     <div class="library-card${p.id === currentProject ? ' current' : ''}" data-id="${p.id}">
       <div class="library-card-main">
-        <div class="library-card-name">${runIsBusy(projectRuns.get(p.id)) ? '<span class="library-card-live" title="进行中"></span>' : ''}${escHtml(p.name)}</div>
+        <div class="library-card-name">${projectHasActivity(p.id) ? '<span class="library-card-live" title="进行中"></span>' : ''}${escHtml(p.name)}</div>
       </div>
       <div class="library-card-actions">
         <button class="library-rename-btn" data-rename="${p.id}" title="重命名" aria-label="重命名">
@@ -6086,12 +6186,10 @@ async function renderSubagentSettings() {
   const pEl = document.getElementById('sgMaxParallel');
   const tEl = document.getElementById('sgMaxTabs');
   const btEl = document.getElementById('sgBudgetTokens');
-  const bmEl = document.getElementById('sgBudgetMinutes');
   const ckSel = document.getElementById('sgCheckChannel');
   if (pEl && limits) pEl.value = limits.maxParallel;
   if (tEl && limits) tEl.value = limits.maxTabs;
   if (btEl && limits) btEl.value = limits.budgetTokens;
-  if (bmEl && limits) bmEl.value = limits.budgetMinutes;
   if (ckSel) {
     const chans = await getAiChannels().catch(() => []);
     ckSel.innerHTML = '<option value="">跟随子代理所用模型（不推荐）</option>' +
@@ -6294,17 +6392,14 @@ function bindSettingsEvents() {
         maxParallel: document.getElementById('sgMaxParallel')?.value,
         maxTabs: document.getElementById('sgMaxTabs')?.value,
         budgetTokens: document.getElementById('sgBudgetTokens')?.value,
-        budgetMinutes: document.getElementById('sgBudgetMinutes')?.value,
         checkChannelId: document.getElementById('sgCheckChannel')?.value ?? undefined,
       });
       const pEl = document.getElementById('sgMaxParallel');
       const tEl = document.getElementById('sgMaxTabs');
       const btEl = document.getElementById('sgBudgetTokens');
-      const bmEl = document.getElementById('sgBudgetMinutes');
       if (pEl) pEl.value = next.maxParallel;
       if (tEl) tEl.value = next.maxTabs;
       if (btEl) btEl.value = next.budgetTokens;
-      if (bmEl) bmEl.value = next.budgetMinutes;
       showSettingsStatus('sgLimitsStatus', '已保存', 'success');
     });
   }
@@ -6402,6 +6497,115 @@ function bindSettingsEvents() {
       showSettingsStatus('chStatus', `已填入 ${preset.label.split('（')[0]}`, 'success');
     });
   }
+  // 全部厂商目录：复用系统 .export-dropdown 弹层，保证与其它下拉样式一致
+  const catalogSearchEl = document.getElementById('chCatalogSearch');
+  const catalogWrapEl = catalogSearchEl?.closest('.preset-catalog-wrap');
+  if (catalogSearchEl && catalogWrapEl) {
+    let catalogHits = [];
+    let catalogActive = -1;
+    let catalogPicked = '';
+
+    const closeCatalogMenu = () => {
+      catalogWrapEl.querySelector('.preset-catalog-menu')?.remove();
+      catalogActive = -1;
+      catalogSearchEl.setAttribute('aria-expanded', 'false');
+    };
+
+    const applyCatalogPreset = (preset) => {
+      if (!preset) return;
+      if (preset.baseUrl) document.getElementById('chBaseUrl').value = preset.baseUrl;
+      if (preset.protocol) document.getElementById('chProtocol').value = preset.protocol;
+      fillChannelModelsFromPreset(preset);
+      const nameEl = document.getElementById('chName');
+      if (!nameEl.value.trim()) nameEl.value = preset.label;
+      showSettingsStatus('chStatus', `已从目录填入 ${preset.label}`, 'success');
+      catalogSearchEl.value = preset.label;
+      catalogPicked = preset.label;
+      closeCatalogMenu();
+    };
+
+    const hostOfBase = (url) => {
+      try { return new URL(url).host; } catch (_) { return String(url || ''); }
+    };
+
+    const renderCatalogMenu = () => {
+      const raw = catalogSearchEl.value.trim();
+      const q = raw && raw !== catalogPicked ? raw.toLowerCase() : '';
+      catalogHits = (q
+        ? PROVIDER_CATALOG.filter((p) => `${p.id} ${p.label} ${p.baseUrl} ${p.protocol}`.toLowerCase().includes(q))
+        : PROVIDER_CATALOG
+      ).slice(0, 40);
+      let menu = catalogWrapEl.querySelector('.preset-catalog-menu');
+      const firstOpen = !menu;
+      if (!menu) {
+        menu = document.createElement('div');
+        menu.className = 'export-dropdown preset-catalog-menu';
+      }
+      menu.textContent = '';
+      if (!catalogHits.length) {
+        const empty = document.createElement('div');
+        empty.className = 'preset-catalog-empty';
+        empty.textContent = '没有匹配的厂商';
+        menu.appendChild(empty);
+      } else {
+        catalogHits.forEach((preset, idx) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'export-dropdown-item';
+          const label = document.createElement('span');
+          label.className = 'pc-label';
+          label.textContent = preset.label;
+          const proto = document.createElement('span');
+          proto.className = 'pc-proto';
+          proto.textContent = preset.protocol;
+          label.appendChild(proto);
+          const host = document.createElement('span');
+          host.className = 'pc-host';
+          host.textContent = hostOfBase(preset.baseUrl);
+          btn.append(label, host);
+          btn.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            applyCatalogPreset(preset);
+          });
+          menu.appendChild(btn);
+        });
+      }
+      if (firstOpen) catalogWrapEl.appendChild(menu);
+      catalogSearchEl.setAttribute('aria-expanded', 'true');
+      catalogActive = -1;
+    };
+
+    const moveCatalogActive = (step) => {
+      const n = catalogHits.length;
+      if (!n) return;
+      catalogActive = (catalogActive + step + n) % n;
+      catalogWrapEl.querySelectorAll('.export-dropdown-item').forEach((el, idx) => {
+        el.classList.toggle('is-active', idx === catalogActive);
+      });
+      catalogWrapEl.querySelector('.export-dropdown-item.is-active')?.scrollIntoView({ block: 'nearest' });
+    };
+
+    catalogSearchEl.addEventListener('focus', renderCatalogMenu);
+    catalogSearchEl.addEventListener('input', renderCatalogMenu);
+    catalogSearchEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { closeCatalogMenu(); return; }
+      if (e.key === 'Enter') {
+        if (catalogActive >= 0) {
+          e.preventDefault();
+          applyCatalogPreset(catalogHits[catalogActive]);
+        }
+        return;
+      }
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveCatalogActive(1); }
+      if (e.key === 'ArrowUp') { e.preventDefault(); moveCatalogActive(-1); }
+    });
+    document.addEventListener('mousedown', (e) => {
+      if (!catalogWrapEl.querySelector('.preset-catalog-menu')) return;
+      if (!catalogWrapEl.contains(e.target)) closeCatalogMenu();
+    });
+  }
+  // 原生 select 统一套皮：颜色 / 界面缩放 / 协议 / 鉴权 / 翻译 / 语言 / 子代理渠道
+  document.querySelectorAll('select').forEach((el) => skinNativeSelect(el));
   document.getElementById('saveChannelBtn')?.addEventListener('click', () => submitChannelForm({ asNew: false }));
   document.getElementById('saveAsNewChannelBtn')?.addEventListener('click', () => submitChannelForm({ asNew: true }));
   document.getElementById('cancelChannelBtn')?.addEventListener('click', closeChannelEditor);
@@ -6972,4 +7176,8 @@ function attachWheelScrollFallback() {
 }
 
 attachWheelScrollFallback();
+
+
+
+
 

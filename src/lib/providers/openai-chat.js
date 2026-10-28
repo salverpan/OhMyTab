@@ -24,11 +24,51 @@ export function resolveEndpoint(baseUrl) {
   return u + '/chat/completions';
 }
 
-function headers(cfg) {
-  return {
+/* 思维链字段各家命名不一：DeepSeek / 智谱 / Kimi 用 reasoning_content，
+ * OpenRouter 与部分中转发 reasoning。取到哪个用哪个，都没有则空串。 */
+function pickReasoning(obj) {
+  if (!obj) return '';
+  const v = obj.reasoning_content ?? obj.reasoning;
+  return typeof v === 'string' ? v : '';
+}
+
+/* OpenCode 网关（/zen、/zen/go）要求每会话一个路由头 x-opencode-session，
+ * 缺失直接 400 MissingSessionID。其它厂商不需要，故仅对 opencode.ai 附带。
+ * Worker 内固定复用同一个值，保留服务端路由亲和性（对前缀缓存友好）。 */
+let opencodeSessionId = '';
+
+function isOpenCodeHost(url) {
+  try {
+    return /(^|\.)opencode\.ai$/i.test(new URL(url).hostname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function opencodeSession(url) {
+  if (!isOpenCodeHost(url)) return '';
+  if (!opencodeSessionId) {
+    opencodeSessionId =
+      globalThis.crypto?.randomUUID?.() ||
+      `oc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+  return opencodeSessionId;
+}
+
+function headers(cfg, url) {
+  const h = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${cfg.apiKey}`,
   };
+  const sid = cfg.sessionId || opencodeSession(url);
+  if (sid) h['x-opencode-session'] = sid;
+  // 逃生口：任意自定义头（个别中转要 X-Api-Key、HTTP-Referer 之类）
+  if (cfg.extraHeaders && typeof cfg.extraHeaders === 'object') {
+    for (const [k, v] of Object.entries(cfg.extraHeaders)) {
+      if (v != null) h[k] = String(v);
+    }
+  }
+  return h;
 }
 
 /* o 系列与 gpt-5 推理模型：拒收 temperature，且上限参数叫 max_completion_tokens */
@@ -67,9 +107,11 @@ async function raiseResponseError(response) {
  * opts.retryWithoutResponseFormat: 带 response_format 的请求遇 400 时去掉该字段重试一次
  * （个别 OpenAI 兼容服务不支持 response_format 会报 400）。 */
 export async function chatComplete(cfg, messages, opts = {}) {
-  const doFetch = (body) => fetch(resolveEndpoint(cfg.baseUrl), {
+  const endpoint = resolveEndpoint(cfg.baseUrl);
+  const reqHeaders = headers(cfg, endpoint);
+  const doFetch = (body) => fetch(endpoint, {
     method: 'POST',
-    headers: headers(cfg),
+    headers: reqHeaders,
     body: JSON.stringify(body),
     signal: opts.signal,
   });
@@ -85,8 +127,10 @@ export async function chatComplete(cfg, messages, opts = {}) {
 
   const data = await response.json();
   const choice = data.choices?.[0];
+  const msg = choice?.message;
   return {
-    content: choice?.message?.content?.trim() || '',
+    content: msg?.content?.trim() || '',
+    reasoning: pickReasoning(msg).trim(),
     usage: data.usage || null,
     finishReason: normalizeFinishReason(choice?.finish_reason),
   };
@@ -95,15 +139,17 @@ export async function chatComplete(cfg, messages, opts = {}) {
 /** 流式对话 + 工具调用。onChunk 逐段回调文本增量。
  * 返回 { content, toolCalls: [{id,name,arguments,parseError}], usage }。 */
 export async function chatStream(cfg, messages, tools, onChunk, signal, opts = {}) {
-  const response = await fetch(resolveEndpoint(cfg.baseUrl), {
+  const endpoint = resolveEndpoint(cfg.baseUrl);
+  const response = await fetch(endpoint, {
     method: 'POST',
-    headers: headers(cfg),
+    headers: headers(cfg, endpoint),
     body: JSON.stringify(buildBody(cfg, messages, tools, { ...opts, stream: true })),
     signal,
   });
   if (!response.ok) await raiseResponseError(response);
 
   let content = '';
+  let reasoning = '';
   let usage = null;
   const tcByIndex = {};
 
@@ -114,6 +160,14 @@ export async function chatStream(cfg, messages, tools, onChunk, signal, opts = {
 
     const delta = json.choices?.[0]?.delta;
     if (!delta) return;
+
+    /* 思维链：与 anthropic-messages.js 的 thinking_delta 约定一致 —— 不进正文，
+     * 单独累积；宿主想展示时用 opts.onReasoning 接增量。 */
+    const thought = pickReasoning(delta);
+    if (thought) {
+      reasoning += thought;
+      if (opts.onReasoning) opts.onReasoning(thought);
+    }
 
     if (delta.content) {
       content += delta.content;
@@ -133,7 +187,7 @@ export async function chatStream(cfg, messages, tools, onChunk, signal, opts = {
     }
   });
 
-  return { content: content.trim(), toolCalls: finalizeToolCalls(tcByIndex), usage };
+  return { content: content.trim(), reasoning: reasoning.trim(), toolCalls: finalizeToolCalls(tcByIndex), usage };
 }
 
 /* arguments 解析失败不再静默吞成 {}：带原始片段上抛（parseError），

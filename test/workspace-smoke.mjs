@@ -9,6 +9,7 @@ import {
 } from '../src/lib/notebook.js';
 import {
   inferEntryType, normalizeEntryRecord, inferArtifactProvenance, isCitationEligibleArtifact,
+  isResearchNoteArtifact, researchNoteBadge,
 } from '../src/lib/source-model.js';
 import { migrateEntryArrays, WORKSPACE_SCHEMA_VERSION } from '../src/lib/workspace-migration.js';
 import { artifactMatchesEntry, noteReferencesEntry } from '../src/lib/entry-cascade.js';
@@ -92,6 +93,11 @@ const derivedArtifact = { kind: 'text', chars: 10 };
 ok(inferArtifactProvenance(sourceArtifact).trustClass === 'source', '网页 artifact 是来源');
 ok(isCitationEligibleArtifact(sourceArtifact), '来源 artifact 可引用');
 ok(!isCitationEligibleArtifact(derivedArtifact), '自由文本不可作为合格证据');
+ok(isResearchNoteArtifact({ via: 'research-artifact', title: '中韩半导体产业对比' }), '子代理研究笔记算笔记');
+ok(isResearchNoteArtifact({ url: 'artifact://research/abc/xyz' }), '按 artifact://research URL 识别');
+ok(isResearchNoteArtifact({ via: 'analyst-memo' }) && researchNoteBadge({ via: 'analyst-memo' }) === '分析备忘', '分析备忘也进笔记');
+ok(!isResearchNoteArtifact({ trustClass: 'source', url: 'https://a.com' }), '网页来源不算研究笔记');
+ok(!isResearchNoteArtifact({ kind: 'text', trustClass: 'derived' }), '无 via 的自由文本不误判');
 ok(artifactMatchesEntry({ docId: 'd1' }, { id: 'e1', docId: 'd1' }), '级联按 docId 匹配 artifact');
 ok(artifactMatchesEntry({ sourceEntryId: 'e1' }, { id: 'e1' }), '级联按 sourceEntryId 匹配 artifact');
 ok(noteReferencesEntry({ sources: [{ doc_id: 'd1', anchor: 'c0' }] }, { id: 'e1' }, ['d1']), '级联识别笔记引用');

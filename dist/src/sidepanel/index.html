@@ -8,7 +8,7 @@
   <script src="../lib/theme-boot.js"></script>
   <link rel="stylesheet" href="style.css">
 </head>
-<body class="license-pending">
+<body>
   <div id="app">
     <!-- Panel container with slide animation -->
     <div id="panelContainer" class="panel-container">
@@ -153,6 +153,10 @@
                 </button>
               </div>
             </div>
+            <button id="feedCreateWebBtn" class="feed-create-web-btn" type="button" title="从当前网页可视化创建订阅源">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+              <span>从当前网页创建</span>
+            </button>
             <div id="feedIndexProgress" class="feed-index-progress" hidden>
               <div class="feed-index-progress-track"><div class="feed-index-progress-bar"></div></div>
               <div class="feed-index-progress-label">正在构建搜索索引…</div>
@@ -225,6 +229,104 @@
           </div>
         </div>
 
+
+        <!-- Visual webpage -> feed builder -->
+        <div id="webFeedDialog" class="feed-dialog-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="webFeedDialogTitle">
+          <div class="feed-dialog web-feed-dialog">
+            <div class="feed-dialog-header">
+              <span id="webFeedDialogTitle">从当前网页创建订阅源</span>
+              <button id="webFeedDialogCloseBtn" class="feed-dialog-close" aria-label="关闭">&times;</button>
+            </div>
+            <div class="feed-dialog-body">
+              <div class="web-feed-page-card">
+                <div class="web-feed-page-icon">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                </div>
+                <div class="web-feed-page-text">
+                  <div id="webFeedPageTitle" class="web-feed-page-title">正在读取当前页面…</div>
+                  <div id="webFeedPageUrl" class="web-feed-page-url"></div>
+                </div>
+              </div>
+
+              <div id="webFeedPickStatus" class="web-feed-pick-status">
+                <span class="web-feed-pulse"></span>
+                <span id="webFeedPickStatusText">正在页面中识别重复内容…</span>
+              </div>
+              <div id="webFeedCandidates" class="web-feed-candidates" hidden></div>
+
+              <div id="webFeedRecipePanel" class="web-feed-recipe-panel" hidden>
+                <div class="web-feed-section-head">
+                  <span class="web-feed-section-title">1. 条目模板</span>
+                  <button id="webFeedRepickBtn" class="btn btn-sm" type="button">重新框选</button>
+                </div>
+                <div id="webFeedTemplateInfo" class="web-feed-template-info"></div>
+
+                <div class="web-feed-section-head">
+                  <span class="web-feed-section-title">2. 字段确认</span>
+                  <span class="web-feed-section-hint">点“改选”后在网页中点击元素</span>
+                </div>
+                <div id="webFeedFieldList" class="web-feed-field-list"></div>
+
+                <div class="web-feed-section-head">
+                  <span class="web-feed-section-title">3. 预览</span>
+                  <button id="webFeedPreviewBtn" class="btn btn-sm" type="button">刷新预览</button>
+                </div>
+                <div id="webFeedPreviewWarnings" class="web-feed-warnings" hidden></div>
+                <div id="webFeedPreviewList" class="web-feed-preview-list">
+                  <div class="web-feed-preview-empty">完成字段确认后自动预览</div>
+                </div>
+
+                <div class="web-feed-section-head">
+                  <span class="web-feed-section-title">4. 订阅设置</span>
+                </div>
+                <div class="feed-dialog-field">
+                  <label for="webFeedTitleInput">源名称</label>
+                  <input id="webFeedTitleInput" type="text" maxlength="200" placeholder="例如：某站今日头条">
+                </div>
+                <div class="feed-dialog-row">
+                  <div class="feed-dialog-field">
+                    <label for="webFeedIntervalSelect">刷新频率</label>
+                    <select id="webFeedIntervalSelect">
+                      <option value="15">每 15 分钟</option>
+                      <option value="30" selected>每 30 分钟</option>
+                      <option value="60">每小时</option>
+                      <option value="180">每 3 小时</option>
+                      <option value="360">每 6 小时</option>
+                      <option value="720">每 12 小时</option>
+                    </select>
+                  </div>
+                  <div class="feed-dialog-field">
+                    <label for="webFeedMaxInput">最多条数</label>
+                    <input id="webFeedMaxInput" type="number" min="1" max="500" value="100" placeholder="100">
+                  </div>
+                </div>
+                <div class="feed-dialog-field">
+                  <label for="webFeedRefreshModeSelect">刷新方式</label>
+                  <select id="webFeedRefreshModeSelect">
+                    <option value="auto" selected>自动（HTTP 优先，失败回退渲染）</option>
+                    <option value="http">快速 HTTP（不创建标签页）</option>
+                    <option value="tab">兼容渲染（隐藏标签页）</option>
+                  </select>
+                  <div class="feed-dialog-hint" style="margin-top:5px">自动模式适合大多数网站；动态渲染或登录后页面会自动改用隐藏标签页。</div>
+                </div>
+                <div class="feed-dialog-field">
+                  <label>作用域</label>
+                  <div class="feed-dialog-radio-group web-feed-scope-group">
+                    <label><input type="radio" name="webFeedScope" value="global" checked> 全局（所有项目可见）</label>
+                    <label><input type="radio" name="webFeedScope" value="project"> 当前项目专属</label>
+                  </div>
+                </div>
+              </div>
+
+              <div id="webFeedStatus" class="feed-dialog-status"></div>
+            </div>
+            <div class="feed-dialog-actions web-feed-actions">
+              <button id="webFeedSaveBtn" class="btn btn-primary" type="button" disabled>保存为订阅源</button>
+              <button id="webFeedCancelBtn" class="btn" type="button">取消</button>
+            </div>
+          </div>
+        </div>
+
         <!-- Edit feed dialog -->
         <div id="feedEditDialog" class="feed-dialog-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="feedEditDialogTitle">
           <div class="feed-dialog">
@@ -233,13 +335,34 @@
               <button id="feedEditCloseBtn" class="feed-dialog-close" aria-label="关闭">&times;</button>
             </div>
             <div class="feed-dialog-body">
+              <div id="feedEditKindHint" class="feed-dialog-hint" hidden></div>
               <div class="feed-dialog-field">
                 <label for="feedEditTitle">名称</label>
                 <input type="text" id="feedEditTitle" placeholder="显示名称">
               </div>
               <div class="feed-dialog-field">
-                <label for="feedEditUrl">URL</label>
+                <label id="feedEditUrlLabel" for="feedEditUrl">URL</label>
                 <input type="url" id="feedEditUrl" placeholder="https://...">
+              </div>
+              <div class="feed-dialog-field">
+                <label for="feedEditInterval">刷新频率</label>
+                <select id="feedEditInterval">
+                  <option value="0">使用全局设置</option>
+                  <option value="15">每 15 分钟</option>
+                  <option value="30">每 30 分钟</option>
+                  <option value="60">每小时</option>
+                  <option value="180">每 3 小时</option>
+                  <option value="360">每 6 小时</option>
+                  <option value="720">每 12 小时</option>
+                </select>
+              </div>
+              <div class="feed-dialog-field" id="feedEditRefreshModeField">
+                <label for="feedEditRefreshMode">网页刷新方式</label>
+                <select id="feedEditRefreshMode">
+                  <option value="auto">自动（HTTP 优先，失败回退渲染）</option>
+                  <option value="http">快速 HTTP（不创建标签页）</option>
+                  <option value="tab">兼容渲染（隐藏标签页）</option>
+                </select>
               </div>
               <div class="feed-dialog-field">
                 <label for="feedEditMax">每次拉取最多条数</label>
@@ -300,6 +423,9 @@
               <div class="form-group">
                 <label>快速填充</label>
                 <div id="chPresetChips" class="preset-chips"></div>
+<div class="preset-catalog-wrap">
+  <input type="text" id="chCatalogSearch" placeholder="或搜索全部厂商（名称 / 域名）…" autocomplete="off" aria-expanded="false">
+</div>
               </div>
               <div class="form-group">
                 <label for="chName">名称</label>
@@ -445,11 +571,7 @@
               </div>
               <div class="form-group">
                 <label for="sgBudgetTokens">单个子代理 token 预算（0 = 不限）</label>
-                <input type="number" id="sgBudgetTokens" min="0" max="50000000" step="100000" placeholder="2000000">
-              </div>
-              <div class="form-group">
-                <label for="sgBudgetMinutes">单个子代理耗时预算（分钟，0 = 不限）</label>
-                <input type="number" id="sgBudgetMinutes" min="0" max="240" step="1" placeholder="20">
+                <input type="number" id="sgBudgetTokens" min="0" max="50000000" step="100000" placeholder="0">
               </div>
               <div class="form-group">
                 <label for="sgCheckChannel">核验审查模型</label>
@@ -644,10 +766,6 @@
                       </div>
           <div class="settings-section">
             <h3>关于与更新</h3>
-              <div class="form-group">
-                <label>许可证</label>
-                <p id="licenseStatusLine" class="ch-model-hint">检查中…</p>
-              </div>
               <div class="form-actions">
                 <span>v<span id="extVersion">0.1.0</span></span>
                 <button id="checkUpdateBtn" class="btn btn-sm btn-primary">检查更新</button>
@@ -674,17 +792,6 @@
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
     </nav>
-  </div>
-
-  <div id="licenseGate" class="license-gate" hidden>
-    <div class="license-card">
-      <div class="license-mark">SuperCat</div>
-      <h2>需要授权</h2>
-      <p>此副本需要许可证才能使用。向发放人索取授权码。</p>
-      <input id="licenseKeyInput" type="text" placeholder="CC-XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" aria-label="授权码">
-      <button id="licenseActivateBtn" class="btn btn-primary" type="button">激活</button>
-      <span id="licenseGateStatus" class="status-msg"></span>
-    </div>
   </div>
 
   

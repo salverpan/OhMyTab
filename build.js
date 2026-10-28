@@ -122,6 +122,29 @@ function fixServiceWorker() {
   }
 }
 
+/**
+ * Chrome's content-script loader rejects some bundles containing raw
+ * non-ASCII UTF-8 (observed with Chromium on Windows: "该文件采用的不是 UTF-8
+ * 编码"). Keep the content script byte-for-byte ASCII while preserving all
+ * Chinese UI strings by emitting JavaScript \uXXXX escapes.
+ */
+function forceAsciiJs(file) {
+  const code = readFileSync(file, 'utf-8');
+  let out = '';
+  let changed = false;
+  for (let i = 0; i < code.length; i += 1) {
+    const cp = code.charCodeAt(i);
+    if (cp <= 0x7F) {
+      out += code[i];
+    } else {
+      out += String.fromCharCode(92) + 'u' + cp.toString(16).padStart(4, '0');
+      changed = true;
+    }
+  }
+  if (changed) writeFileSync(file, out, 'utf-8');
+  return changed;
+}
+
 /* ---- Post-build validation ---- */
 
 /**
@@ -337,6 +360,13 @@ await build({
     modulePreload: { polyfill: false },
   },
 });
+const contentBundle = resolve(dist, 'content/global.js');
+if (forceAsciiJs(contentBundle)) {
+  console.log('  [content] escaped non-ASCII UTF-8 to ASCII JS');
+}
+if (readFileSync(contentBundle).some((byte) => byte > 0x7F)) {
+  throw new Error('content script bundle still contains non-ASCII bytes');
+}
 
 // Build side panel (browser target)
 await build({
@@ -348,6 +378,7 @@ await build({
       input: {
         'sidepanel/panel': resolve(root, 'src/sidepanel/panel.js'),
         'reader/reader': resolve(root, 'src/reader/reader.js'),
+        'offscreen/offscreen': resolve(root, 'src/offscreen/offscreen.js'),
       },
       output: {
         entryFileNames: '[name].js',
@@ -430,6 +461,13 @@ copyHtml(
   resolve(root, 'src/reader/index.html'),
   resolve(dist, 'src/reader/index.html'),
   ['../../reader/reader.js']
+);
+
+// Offscreen document: direct-HTTP webpage feed parsing without opening tabs.
+copyHtml(
+  resolve(root, 'src/offscreen/index.html'),
+  resolve(dist, 'src/offscreen/index.html'),
+  ['../../offscreen/offscreen.js']
 );
 
 // Copy CSS files

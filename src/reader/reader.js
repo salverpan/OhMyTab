@@ -468,10 +468,6 @@ function removeAnnotationHighlight(id) {
 
 /* 侧栏删除/恢复 snippet 的联动消息（panel 会同时通知 content 页面与本标签页） */
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === 'LICENSE_STATE_CHANGED' && msg.data && !msg.data.ok) {
-    if (chatWin) chatWin.classList.remove('show');
-    return;
-  }
   if (msg && msg.type === 'DELETE_ANNOTATION_MARK' && msg.data && msg.data.id) {
     removeAnnotationHighlight(msg.data.id);
     return { ok: true };
@@ -505,12 +501,9 @@ function createFloatUi() {
     const range = lastRange;
     if (!range) return;
     if (act === 'collect') {
-      requireLicense().then((ok) => {
-        if (!ok) return;
-        collectTextSnippet(range, docUrl, docTitle).then((r) => {
-          if (r && r.ok) showStatus('已加入来源');
-          else showStatus('收藏失败: ' + ((r && r.error) || '未知错误'));
-        });
+      collectTextSnippet(range, docUrl, docTitle).then((r) => {
+        if (r && r.ok) showStatus('已加入来源');
+        else showStatus('收藏失败: ' + ((r && r.error) || '未知错误'));
       });
     }
     window.getSelection()?.removeAllRanges();
@@ -563,17 +556,6 @@ function showMiniToast(msg) {
   toastEl.classList.add('show');
   clearTimeout(toastEl._t);
   toastEl._t = setTimeout(() => toastEl.classList.remove('show'), 2400);
-}
-
-async function requireLicense() {
-  try {
-    const r = await chrome.runtime.sendMessage({ type: 'GET_LICENSE_STATE' });
-    if (r && r.ok) return true;
-    showMiniToast((r && r.error) || '未激活许可证，请在侧栏输入授权码');
-  } catch (_) {
-    showMiniToast('未激活许可证，请在侧栏输入授权码');
-  }
-  return false;
 }
 
 function showSelectionBarAtRect(r) {
@@ -751,7 +733,7 @@ function buildChatContext(opts) {
   }
   const sel = window.getSelection();
   let text = sel && !sel.isCollapsed ? sel.toString().trim() : '';
-  // 点工具条会先等许可证，这段时间选区可能被清掉；划词入口用已克隆的 range
+  // 划词入口记录的是点击工具条前的 range，优先保留用户当时的选区
   if (!text && preferRange && lastRange) {
     try { text = lastRange.toString().trim(); } catch (_) { text = ''; }
   }
@@ -767,10 +749,7 @@ function buildChatContext(opts) {
 }
 
 async function openChatWindow(opts) {
-  // 先于 await 抓住选区：许可证往返期间焦点变化会把 window.getSelection() 清掉
-  const captured = buildChatContext(opts);
-  if (!(await requireLicense())) return;
-  chatContext = captured || buildChatContext();
+  chatContext = buildChatContext(opts);
   // 编辑模式允许无选区打开：xlsx 是 canvas 没有 DOM 选区，用户直接在
   // 输入框描述需求即可（有选中区域时会自动带上区域内容）
   if (!chatContext && !editMode) return;
@@ -815,7 +794,10 @@ async function openChatWindow(opts) {
 
 /* SW 端口消息统一处理（openChatWindow 注册 + 断线后 sendChatMessage 自动重连共用） */
 function handleChatPortMessage(m) {
-  if (m.type === 'chunk') appendAiChunk(m.text);
+  if (m.type === 'stream-reset') {
+    chatStreamText = '';
+    if (chatStreamEl) chatStreamEl.textContent = '';
+  } else if (m.type === 'chunk') appendAiChunk(m.text);
   else if (m.type === 'done') {
     if (m.aborted && chatStreamText && !/\(已中断\)\s*$/.test(chatStreamText)) {
       chatStreamText += '\n\n(已中断)';

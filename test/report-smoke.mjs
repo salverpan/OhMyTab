@@ -37,7 +37,7 @@ ok(!validateTaskReport({ ...base, claims: threeClaims.slice(0, 2) }, { requireFi
 ok(SUBMIT_REPORT_TOOL.function.parameters.properties.findings.items.required.includes('answer'), 'submit_report schema 含 findings');
 
 // ---------- 工具注册 ----------
-ok(CHAT_TOOLS.some((t) => t.function.name === 'compose_report'), 'CHAT_TOOLS 含 compose_report');
+ok(!CHAT_TOOLS.some((t) => t.function.name === 'compose_report'), 'compose_report 不再暴露给模型');
 ok(PARENT_ONLY_TOOLS.has('compose_report'), 'compose_report 父级专属');
 ok(CHAT_TOOLS.some((t) => t.function.name === 'write_document'), 'CHAT_TOOLS 含 write_document');
 
@@ -86,7 +86,31 @@ const held = await writeDocument(
   },
 );
 ok(!held.ok && held.need_reading[0] === '申报时限', '关键缺口不保存，退回补读');
-ok(!(await writeDocument({ genre: '策划方案', brief: 'x' }, { apiConfig: { apiKey: 'k' }, sessions: [], chat: docChat })).ok, '没有段落时拒绝成文');
+ok(!(await writeDocument({ genre: '策划方案', brief: 'x' }, { apiConfig: { apiKey: 'k' }, sessions: [], chat: docChat })).ok, '没有段落也没有笔记时拒绝成文');
+const fromClaims = collectPassages([{
+  id: 't1',
+  report: {
+    passages: [],
+    claims: [{ claim: '库存上升', evidence: [{ doc_id: 'doc_b', anchor: 'c2', quote: '渠道库存连续两季上升' }] }],
+  },
+}]);
+ok(fromClaims.length === 1 && fromClaims[0].anchor === 'c2', 'claims 里的逐字引文可以当原文');
+const noteCalls = [];
+const noted = await writeDocument(
+  { genre: '研报', brief: '写成判断', artifact_ids: ['doc_note'] },
+  {
+    apiConfig: { apiKey: 'k' },
+    sessions: [{ id: 't9', report: { summary: '韩国盈利领先', artifact_id: 'doc_note', passages: [], claims: [] } }],
+    loadArtifact: async () => ({ title: '笔记', fullText: '2026 年韩国存储营业利润高于中国厂商。' }),
+    chat: async (messages) => {
+      noteCalls.push(messages.map((m) => m.content).join('\n'));
+      return { content: '# 对比\n韩国存储盈利领先。', usage: { total_tokens: 1 } };
+    },
+    ctx: {},
+  },
+);
+ok(noted.ok && /盈利领先/.test(noted.markdown), '只有研究笔记时也能成文');
+ok(noteCalls[0].includes('韩国存储营业利润') && noteCalls.length === 2, '笔记送进写作，没有逐字引文就不挂出处');
 const cited = applyCitations(
   '去掉汽油之后，别的价格也在涨。',
   [{ doc_id: 'doc_a', anchor: 'c3', quote: '由市交通局会同军方划设', use: '审批' }],
@@ -113,4 +137,31 @@ ok(reported.ok && reported.markdown.includes('不只是汽油〔doc_a#c3〕'), '
 ok(reportCalls.length === 3 && reportCalls[2].includes('<<<CITE>>>'), '出处是单独一轮，不和改稿混在一起');
 ok(reportCalls[0].includes('调查员的判断') && reportCalls[0].includes('覆盖了审批'), '写稿看得到调查员的判断');
 
+const analysis = {
+  bottom_line: '我判断这个试点应继续推进，但必须缩小首期范围。',
+  stance: { direction: 'conditional-support', confidence: 0.68, reason: '需求明确，但执行资源不足。' },
+  framework: { id: 'cost-benefit', name: '成本收益与执行可行性', why: '同时约束价值与落地。', limitation: '无法覆盖长期政策变化。' },
+  key_judgments: [{ id: 'j1', statement: '首期缩小到单区更稳。', basis: '资源约束', confidence: 'medium', falsifier: '如果单区无法验证核心假设。' }],
+  strongest_countercase: { argument: '范围太小看不出规模效应。', response: '首期目标是验证流程，不是验证规模。' },
+  recommendation: { action: '先做单区试点。', conditions: '三个月内拿到关键流程数据。', upside: '快速验证并控制风险。', downside: '规模效应暂不可见。', stop_condition: '两个月仍无关键数据则停止。', leading_indicators: ['审批时长', '参与率'] },
+  unresolved: ['长期预算'],
+};
+const analysisCalls = [];
+const withAnalysis = await writeDocument(
+  { genre: '策划方案', brief: '给管委会的三月试点方案', analysis },
+  {
+    apiConfig: { apiKey: 'k' },
+    sessions: [{ id: 't1', report: passageReport.report }],
+    chat: async (messages) => {
+      analysisCalls.push(messages.map((m) => m.content).join('\n'));
+      if (analysisCalls.length === 1) return { content: '# 试点方案\n核心判断：继续推进。', usage: { total_tokens: 1 } };
+      return { content: '<<<DOC>>>\n# 试点方案\n核心判断：继续推进。\n<<<GAPS>>>\n', usage: { total_tokens: 1 } };
+    },
+    ctx: {},
+  },
+);
+ok(withAnalysis.ok && withAnalysis.analysis.bottom_line.includes('试点'), '观点契约进入写作文档');
+ok(analysisCalls[0].includes('必守观点契约') && analysisCalls[0].includes('最强反方'), 'Writer 收到观点契约与反方');
 console.log(`report-smoke: ${passed} passed`);
+
+

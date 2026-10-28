@@ -12,17 +12,18 @@ import {
   deleteAllItemsForFeeds, reorderFeeds,
   buildTokenIndexBatch, isIndexBuilt, getIndexBuildStatus, resetTokenIndex,
 } from '../lib/feed-db.js';
-import { subscribe as subscribeFeed, refreshFeed, refreshFeeds, setDefaultsProvider } from '../lib/feed-fetcher.js';
+import { subscribe as subscribeFeed, subscribeWebpage, refreshFeed, refreshFeeds, setDefaultsProvider } from '../lib/feed-fetcher.js';
 import { parseOPML } from '../lib/feed-parser.js';
 import { runBackfill, getBackfillStatus, stopBackfill, setTranslateProvider } from '../lib/feed-backfill.js';
 import { testCloudProvider } from '../lib/translator-cloud.js';
-import { buildPageData, buildTabSnapshot, isReadableTab, isAppPanelPage, tabListMeta, formatReaderSessionNote, TAB_SNAPSHOT_BUDGET_MS, TAB_SNAPSHOT_TAB_MS } from '../lib/page-data.js';
+import { buildPageData, buildTabSnapshot, isReadableTab, isAppPanelPage, tabListMeta, formatReaderSessionNote, getBrowsingTab, TAB_SNAPSHOT_BUDGET_MS, TAB_SNAPSHOT_TAB_MS } from '../lib/page-data.js';
 import { isDocumentFileUrl, readerUrlForRemote, fileNameFromUrl } from '../lib/doc-kind.js';
 import { saveDocFile } from '../lib/doc-store.js';
 import { loadImageSource, bytesToDataUrl } from '../lib/place-images.js';
 import { sessionPool, initDebuggerDispatch } from '../lib/tab-session.js';
 // 浮动聊天与侧栏 AI 平价：共用同一执行器（38 工具含 task/plan）与同一提示词/动态前言
 import { processRoundToolCalls, buildEntriesDigest, retrieveMemories, HISTORY_KEEP_TAIL_TOKENS, contextCompactBudget } from '../lib/chat-executor.js';
+import { stripViewportShotsForStorage } from '../lib/tool-round-messages.js';
 import { compactHistory, estimateMessagesTokens, estimateTokens } from '../sidepanel/history-compact.js';
 import { getStaticSystemPrompt, buildDynamicPreamble } from '../sidepanel/chat-prompt.js';
 import { getPlan } from '../lib/plan.js';
@@ -30,19 +31,29 @@ import { listNotes } from '../lib/notebook.js';
 import { listInsights } from '../lib/insight.js';
 import { buildChatTools } from '../lib/tools.js';
 import { listAgents, formatAgentCatalog, parseAgentMentions } from '../lib/subagent.js';
+import { recoverParentLlmCall, waitForLiveChildren, abortAndSettleChildren, hasLiveChildren } from '../lib/run-settle.js';
 import { loadConnectors, formatApiCatalog } from '../lib/api-call.js';
 import { AGENT_MAX_ROUNDS, AGENT_WRAP_HINT_ROUND } from '../lib/limits.js';
+import {
+  routeResearchMode, resolveLoopRounds, resolveWrapRound, nextResearchHold,
+  toolsForResearchStep, researchCarryFromHistory, RESEARCH_CHILD_WAIT_MS,
+} from '../lib/research-mode.js';
+import {
+  inspectTurnBudget,
+  shouldFinalizeEmptyAnswer,
+  FINALIZE_EMPTY_AFTER_TOOLS,
+  emptyToolFallbackText,
+} from '../lib/agent-finalize.js';
+import { usageTotalTokens } from '../lib/usage.js';
+import { withNetworkRetry, formatNetworkError } from '../lib/net-retry.js';
 import { ensureWorkspaceMigration } from '../lib/workspace-migration.js';
 // docx 编辑引擎服务（SW 无头跑 OOXML 手术，doc_edit 不再依赖阅读器编辑模式）
 import * as docEditService from './doc-edit-service.js';
 import {
-  HEARTBEAT_ALARM, dueHeartbeatTasks, markHeartbeatQueued, ensureHeartbeatAlarm, queuedOrDueCount,
+  HEARTBEAT_ALARM, HEARTBEAT_STALE_RUNNING_MS, claimDueHeartbeatTasks, ensureHeartbeatAlarm, queuedOrDueCount,
+  heartbeatUserText, heartbeatProjectId, heartbeatSessionsKey, heartbeatInboxKey,
+  markHeartbeatFinished, getHeartbeatTask,
 } from '../lib/heartbeat.js';
-import {
-  LICENSE_ALARM, LICENSE_DENIED,
-  getLicenseView, activateLicense, heartbeatLicense,
-  isRuntimeLicensed, ensureLicenseAlarm,
-} from '../lib/license.js';
 
 const FEED_REFRESH_ALARM = 'citecat-feed-refresh';
 const INDEX_BUILD_ALARM = 'citecat-index-build';
@@ -226,32 +237,491 @@ async function syncTranslateProvider() {
 
 async function scheduleFeedAlarm() {
   const prefs = await getFeedPrefs();
+  // Per-feed intervalMin (webpage feeds / future RSS overrides) means one
+  // global period is insufficient. Wake at the smallest configured interval
+  // and only refresh feeds whose own deadline has elapsed.
+  const feeds = await listFeeds().catch(() => []);
+  const globalMin = Math.max(1, Number(prefs.intervalMin) || 30);
+  const intervals = feeds
+    .map((f) => Number(f.intervalMin) > 0 ? Number(f.intervalMin) : globalMin)
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const checkEvery = Math.max(1, Math.min(globalMin, ...intervals));
   await chrome.alarms.clear(FEED_REFRESH_ALARM);
   chrome.alarms.create(FEED_REFRESH_ALARM, {
-    periodInMinutes: prefs.intervalMin,
+    periodInMinutes: checkEvery,
   });
-  console.log(`[SW] Feed alarm set: every ${prefs.intervalMin} min`);
+  console.log(`[SW] Feed alarm set: check every ${checkEvery} min (global ${globalMin} min)`);
 }
 
-async function tickHeartbeats() {
-  const due = await dueHeartbeatTasks();
-  if (!due.length) return;
-  const leftover = [];
-  for (const t of due) {
-    const taken = await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'HEARTBEAT_FIRE', task: t }, (r) => {
-        if (chrome.runtime.lastError) resolve(false);
-        else resolve(!!(r && r.taken));
-      });
-    });
-    if (!taken) leftover.push(t.id);
-  }
-  if (leftover.length) await markHeartbeatQueued(leftover);
+function feedRefreshDue(feed, globalMin, now = Date.now()) {
+  const interval = Number(feed.intervalMin) > 0
+    ? Number(feed.intervalMin)
+    : globalMin;
+  if (!Number.isFinite(interval) || interval <= 0) return false;
+  const last = Number(feed.lastFetchedAt) || 0;
+  // Alarms can fire a few seconds early; allow a small tolerance.
+  return !last || now - last >= interval * 60000 - 30000;
+}
+
+const heartbeatStoreQueues = new Map();
+
+/** 同一项目的任务线程映射写操作串行化，避免并行心跳完成时互相覆盖。 */
+function withHeartbeatStoreLock(pid, fn) {
+  const key = String(pid || 'default');
+  const prev = heartbeatStoreQueues.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  heartbeatStoreQueues.set(key, next.then(() => undefined, () => undefined));
+  return next;
+}
+
+async function updateHeartbeatBadge() {
   try {
     const n = await queuedOrDueCount();
     await chrome.action.setBadgeText({ text: n > 0 ? String(n) : '' });
     await chrome.action.setBadgeBackgroundColor({ color: '#4e75df' });
   } catch (_) {}
+}
+
+async function readHeartbeatThread(pid, taskId) {
+  try {
+    const key = heartbeatSessionsKey(pid);
+    const data = await chrome.storage.local.get(key);
+    const sessions = data[key];
+    const thread = sessions && typeof sessions === 'object' ? sessions[taskId] : null;
+    return thread && typeof thread === 'object'
+      ? { history: Array.isArray(thread.history) ? thread.history : [], summary: String(thread.summary || '') }
+      : { history: [], summary: '' };
+  } catch (_) {
+    return { history: [], summary: '' };
+  }
+}
+
+/**
+ * 收尾：把任务线程和侧栏 UI 气泡分开写。
+ * - heartbeatSessions_<pid>：每个任务独立 API 历史，并行任务不会互相踩。
+ * - heartbeatInbox_<pid>：项目聊天里可见的「用户心跳消息 + AI 结果」，sidepanel 只读合并。
+ * 两个写操作在同一把项目锁里完成，任务线程 map 是读改写，不能并发写丢条目。
+ */
+async function persistHeartbeatRun({
+  pid, task, runId, history, summary, userText, assistantText,
+  startedAt, endedAt, ok, error, charts, images, docEdits,
+}) {
+  const sessionsKey = heartbeatSessionsKey(pid);
+  const inboxKey = heartbeatInboxKey(pid);
+  const now = endedAt || Date.now();
+  const userMsg = {
+    role: 'user',
+    text: userText,
+    heartbeat: true,
+    heartbeatName: task.name || '定时任务',
+    taskId: task.id,
+    hbKey: `${runId}:user`,
+    ts: startedAt || now,
+    attachments: [],
+  };
+  const aiMsg = {
+    role: 'ai',
+    text: assistantText,
+    taskId: task.id,
+    hbKey: `${runId}:ai`,
+    ts: now,
+  };
+  if (charts && charts.length) aiMsg.charts = charts;
+  if (images && images.length) aiMsg.images = images;
+  if (docEdits && docEdits.length) aiMsg.docEdits = docEdits;
+  if (!ok) aiMsg.error = String(error || '失败').slice(0, 500);
+
+  await withHeartbeatStoreLock(pid, async () => {
+    const data = await chrome.storage.local.get([sessionsKey, inboxKey]);
+    const sessions = data[sessionsKey] && typeof data[sessionsKey] === 'object'
+      ? { ...data[sessionsKey] } : {};
+    const inbox = Array.isArray(data[inboxKey]) ? data[inboxKey].slice() : [];
+    const taskStillExists = await getHeartbeatTask(task.id).catch(() => null);
+    const patch = {};
+
+    if (taskStillExists) {
+      sessions[task.id] = {
+        history: stripViewportShotsForStorage(Array.isArray(history) ? history : []),
+        summary: String(summary || ''),
+        updatedAt: now,
+      };
+      patch[sessionsKey] = sessions;
+    }
+
+    inbox.push(userMsg, aiMsg);
+    patch[inboxKey] = inbox.slice(-200);
+    await chrome.storage.local.set(patch);
+  });
+}
+
+/**
+ * 心跳后台执行器：不依赖侧栏是否打开。
+ * 每个任务有自己的线程历史；多任务由 tickHeartbeats 并行启动。
+ */
+async function runHeartbeatTaskInBackground(task) {
+  const pid = heartbeatProjectId(task);
+  const runId = `${task.id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const owner = `heartbeat:${task.id}`;
+  const startedAt = Date.now();
+  const userText = heartbeatUserText(task);
+  const charts = [];
+  const images = [];
+  const docEdits = [];
+  let history = [];
+  let summary = '';
+  let assistantText = '';
+  let runOk = true;
+  let runError = '';
+  let controller = null;
+  let ctx = null;
+
+  // claim 到真正启动之间用户可能删了任务；删了就不要白跑一轮。
+  if (!(await getHeartbeatTask(task.id).catch(() => null))) return;
+
+  try {
+    const sent = chrome.runtime.sendMessage({
+      type: 'HEARTBEAT_RUN_STARTED',
+      taskId: task.id,
+      projectId: pid,
+    });
+    if (sent && typeof sent.catch === 'function') sent.catch(() => {});
+  } catch (_) {}
+
+  // MV3 SW 空闲 30s 可能回收；心跳只靠 alarm 事件启动，长任务期间用轻量 API 调用续命。
+  const keepAlive = setInterval(() => {
+    try { chrome.runtime.getPlatformInfo().catch(() => {}); } catch (_) {}
+  }, 20000);
+
+  try {
+    const apiConfig = await getProjectConfig(pid);
+    if (!apiConfig || !apiConfig.apiKey) throw new Error('未配置 API Key，请先在设置中填写');
+
+    const thread = await readHeartbeatThread(pid, task.id);
+    history = thread.history.slice();
+    summary = thread.summary;
+
+    // 任务线程过长时先压缩，避免每次心跳都撞上下文上限。
+    try {
+      if (estimateMessagesTokens(history) + estimateTokens(summary) > contextCompactBudget(apiConfig)) {
+        const r = await compactHistory({
+          history,
+          priorSummary: summary,
+          apiCfg: apiConfig,
+          budgetTokens: 0,
+          keepTailTokens: HISTORY_KEEP_TAIL_TOKENS,
+        });
+        if (r.compacted) {
+          history = r.history;
+          summary = r.summary;
+        }
+      }
+    } catch (_) {}
+
+    const lastUser = { role: 'user', content: userText };
+    history.push(lastUser);
+
+    const browsing = await getBrowsingTab().catch(() => null);
+    const currentTabInfo = browsing && isReadableTab(browsing)
+      ? `${browsing.url || ''}\n${String(browsing.title || '').slice(0, 100)}`
+      : '';
+    const { maxParallel } = await getSubagentLimits().catch(() => ({ maxParallel: undefined }));
+    const agents = await listAgents().catch(() => []);
+    const mentionedAgents = parseAgentMentions(userText, agents.map((a) => a.name));
+    const memories = await retrieveMemories(userText, { currentUrl: (browsing && browsing.url) || '' });
+    const now = new Date();
+    const tzOffset = -now.getTimezoneOffset() / 60;
+    const tzLabel = `UTC${tzOffset >= 0 ? '+' : ''}${tzOffset}`;
+    const dateStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')} ${tzLabel}`;
+    let entries = await getEntries(pid);
+    const researchRoute = routeResearchMode(userText, {
+      unfinishedResearch: researchCarryFromHistory(history.slice(0, -1)),
+    });
+    const preamble = buildDynamicPreamble({
+      entryDigest: buildEntriesDigest(entries, new Set(), 40),
+      selectedIdList: '',
+      selectedPreview: '',
+      deltas: [`定时心跳「${task.name}」已到期并由后台执行`],
+      currentProject: pid,
+      dateStr,
+      currentTabInfo: currentTabInfo + sessionReaderNote(),
+      memories,
+      agentCatalog: formatAgentCatalog(agents),
+      mentionedAgents,
+      notebookNotes: await listNotes(pid),
+      insights: await listInsights(pid),
+      plan: await getPlan(pid),
+      apiCatalog: formatApiCatalog(await loadConnectors()),
+      researchRoute,
+    });
+
+    controller = new AbortController();
+    const { signal } = controller;
+    let pendingCollect = null;
+    let pendingSuggestions = null;
+    let pendingScopeQuiz = null;
+    let pendingCharts = [];
+    let pendingImages = [];
+    const backgroundAborts = new Set();
+    ctx = {
+      projectId: pid,
+      get entries() { return entries; },
+      set entries(v) { entries = Array.isArray(v) ? v : []; },
+      selectedIds: new Set(),
+      previewId: null,
+      get pendingCollect() { return pendingCollect; },
+      set pendingCollect(v) { pendingCollect = v; },
+      toolUndos: [],
+      get pendingSuggestions() { return pendingSuggestions; },
+      set pendingSuggestions(v) { pendingSuggestions = v; },
+      get pendingScopeQuiz() { return pendingScopeQuiz; },
+      set pendingScopeQuiz(v) { pendingScopeQuiz = v; },
+      get pendingCharts() { return pendingCharts; },
+      set pendingCharts(v) { pendingCharts = Array.isArray(v) ? v : []; },
+      get pendingImages() { return pendingImages; },
+      set pendingImages(v) { pendingImages = Array.isArray(v) ? v : []; },
+      axSnapshotMap: new Map(),
+      tabTarget: null,
+      allowBackground: false,
+      openTabsInBackground: true,
+      tabOwner: owner,
+      subagentSessions: new Map(),
+      runningSubagents: new Set(),
+      backgroundAborts,
+      registerBackgroundAbort: (c) => { if (c) backgroundAborts.add(c); },
+      unregisterBackgroundAbort: (c) => { backgroundAborts.delete(c); },
+      apiConfig,
+      currentTabInfo,
+      subagentParentSignal: signal,
+      bridge: makeSwBridge(),
+      closeOwnedAiTabs: (o, ids) => closeAiTabs(o, ids),
+      getActiveHeartbeatTaskId: () => task.id,
+      getTraceThreadId: () => task.id,
+      getTraceTurnId: () => runId,
+      showToast: () => {},
+      onChart: (chart) => { if (chart) charts.push(chart); },
+      onImage: (image) => { if (image) images.push(image); },
+      onPlan: () => {},
+      onDocEdit: (card) => { if (card) docEdits.push(card); },
+      onSubagentEvent: () => {},
+      onSubagentWriteRefresh: async () => { entries = await getEntries(pid); },
+      ui: {
+        clearContextState: () => {},
+        clearMessages: () => {},
+        onHeartbeatChanged: () => {},
+      },
+    };
+    Object.defineProperty(ctx, 'chatHistory', {
+      get() { return history; },
+      set(v) { history = Array.isArray(v) ? v : []; },
+    });
+    Object.defineProperty(ctx, 'chatHistorySummary', {
+      get() { return summary; },
+      set(v) { summary = String(v || ''); },
+    });
+
+    const callMessages = [{ role: 'system', content: getStaticSystemPrompt({ maxParallel }) }];
+    if (summary) {
+      callMessages.push({
+        role: 'system',
+        content: `## 前情摘要（早期对话已压缩，仅供参考，如有冲突以最新上下文为准）\n${summary}`,
+      });
+    }
+    callMessages.push(...history.slice(0, -1));
+    callMessages.push({ role: 'user', content: preamble });
+    callMessages.push(lastUser);
+
+    const chatTools = buildChatTools(agents, { maxParallel });
+    const hbMaxRounds = resolveLoopRounds(researchRoute.policy, AGENT_MAX_ROUNDS);
+    const hbWrapRound = resolveWrapRound(researchRoute.policy, AGENT_WRAP_HINT_ROUND);
+    const hbTurnStart = callMessages.length;
+    let turnDone = false;
+    let alreadyFinalized = false;
+    let llmRecoveries = 0;
+    let researchHoldStep = '';
+    let researchHoldCount = 0;
+    let researchTools = null;
+    for (let round = 0; round < hbMaxRounds; round++) {
+      if (signal.aborted) throw new Error('已中断');
+      const budget = inspectTurnBudget(researchRoute.policy, { round, maxRounds: hbMaxRounds });
+      if (budget.finalize && !alreadyFinalized) {
+        callMessages.push({ role: 'system', content: budget.reason });
+        alreadyFinalized = true;
+      } else if (!alreadyFinalized && hbWrapRound > 0 && round === hbWrapRound) {
+        callMessages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
+      }
+      let roundText = '';
+      const rec = await recoverParentLlmCall(
+        () => streamChatWithTools(
+          callMessages,
+          alreadyFinalized ? [] : (researchTools || chatTools),
+          apiConfig,
+          (chunk) => { roundText += chunk; },
+          signal,
+        ),
+        { signal, hasProgress: turnDone, recoveries: llmRecoveries },
+      );
+      if (rec.action !== 'ok') {
+        if (rec.action === 'salvage' && !alreadyFinalized) {
+          await waitForLiveChildren(ctx, { timeoutMs: HEARTBEAT_STALE_RUNNING_MS, signal });
+          callMessages.push({ role: 'system', content: FINALIZE_EMPTY_AFTER_TOOLS });
+          alreadyFinalized = true;
+          round -= 1;
+          continue;
+        }
+        throw rec.error;
+      }
+      llmRecoveries = 0;
+      const result = rec.result;
+      const roundAnswer = String(result.content || roundText || '').trim();
+      if (alreadyFinalized) {
+        assistantText = roundAnswer;
+        if (assistantText) history.push({ role: 'assistant', content: assistantText });
+        break;
+      }
+      if (result.toolCalls.length === 0) {
+        if (hasLiveChildren(ctx)) {
+          await waitForLiveChildren(ctx, { timeoutMs: RESEARCH_CHILD_WAIT_MS, signal });
+          if (signal.aborted) throw new Error('已中断');
+        }
+        const held = nextResearchHold(callMessages.slice(hbTurnStart), researchRoute.policy, {
+          holdStep: researchHoldStep,
+          holdCount: researchHoldCount,
+          waitingForUser: !!(pendingScopeQuiz || pendingSuggestions),
+        });
+        researchHoldStep = held.holdStep;
+        researchHoldCount = held.holdCount;
+        if (held.action === 'continue') {
+          callMessages.push({ role: 'system', content: held.gap.prompt });
+          researchTools = held.gap.step === 'gather' ? null : toolsForResearchStep(chatTools, held.gap.step);
+          round -= 1;
+          continue;
+        }
+        if (held.action === 'stuck') {
+          assistantText = held.text;
+          history.push({ role: 'assistant', content: assistantText });
+          break;
+        }
+        researchTools = null;
+        if (shouldFinalizeEmptyAnswer({
+          turnHadTools: turnDone,
+          toolCalls: result.toolCalls,
+          content: roundAnswer,
+          alreadyFinalized,
+        })) {
+          callMessages.push({ role: 'system', content: FINALIZE_EMPTY_AFTER_TOOLS });
+          alreadyFinalized = true;
+          round -= 1;
+          continue;
+        }
+        assistantText = roundAnswer;
+        if (assistantText) history.push({ role: 'assistant', content: assistantText });
+        break;
+      }
+      researchHoldStep = '';
+      researchHoldCount = 0;
+      researchTools = null;
+      await processRoundToolCalls({
+        result,
+        apiMessages: callMessages,
+        historyMessages: history,
+        ctx,
+        signal,
+        minAcceptDelayMs: 0,
+        hooks: {
+          writeRefresh: async () => { entries = await getEntries(pid); },
+        },
+      });
+      turnDone = true;
+      if (signal.aborted) throw new Error('已中断');
+    }
+
+    if (!assistantText) {
+      const toolNames = history
+        .filter((m) => m && m.role === 'assistant' && m.tool_calls)
+        .flatMap((m) => (m.tool_calls || []).map((tc) => tc.function?.name || tc.name))
+        .filter(Boolean);
+      assistantText = turnDone
+        ? emptyToolFallbackText(toolNames)
+        : 'AI 未返回内容，请检查模型配置或稍后重试。';
+      history.push({ role: 'assistant', content: assistantText });
+    }
+  } catch (err) {
+    if (controller && ctx) {
+      await abortAndSettleChildren(controller, ctx, { timeoutMs: 8000 });
+    }
+    runOk = false;
+    runError = formatNetworkError(err);
+    assistantText = `心跳任务失败：${runError}`;
+    if (!history.some((m) => m && m.role === 'user' && m.content === userText)) {
+      history.push({ role: 'user', content: userText });
+    }
+    history.push({ role: 'assistant', content: assistantText });
+  } finally {
+    try { controller?.abort(); } catch (_) {}
+    clearInterval(keepAlive);
+    const endedAt = Date.now();
+    // 子任务停干净后再改 lastStatus / 写失败气泡，避免「显示失败了、任务还在进行」。
+    try {
+      await markHeartbeatFinished(task.id, { ok: runOk, error: runError, result: assistantText });
+    } catch (err) {
+      console.warn('[SW] mark heartbeat finished failed:', err);
+      try {
+        await markHeartbeatFinished(task.id, { ok: runOk, error: runError, result: assistantText });
+      } catch (err2) {
+        console.warn('[SW] mark heartbeat finished retry failed:', err2);
+      }
+    }
+    try {
+      await persistHeartbeatRun({
+        pid, task, runId, history, summary, userText, assistantText,
+        startedAt, endedAt, ok: runOk, error: runError, charts, images, docEdits,
+      });
+    } catch (err) {
+      console.warn('[SW] persist heartbeat run failed:', err);
+    }
+    try {
+      const sent = chrome.runtime.sendMessage({
+        type: 'HEARTBEAT_RUN_FINISHED',
+        taskId: task.id,
+        projectId: pid,
+        ok: runOk,
+        error: runError,
+      });
+      if (sent && typeof sent.catch === 'function') sent.catch(() => {});
+    } catch (_) {}
+    closeAiTabs(owner).catch(() => {});
+    updateHeartbeatBadge();
+  }
+}
+
+let heartbeatTickBusy = false;
+const activeHeartbeatRuns = new Set();
+
+async function tickHeartbeats() {
+  // busy 只保护「领取」这一小段，不覆盖任务执行；否则一个长任务会拖住后面所有到期的任务。
+  if (heartbeatTickBusy) return;
+  heartbeatTickBusy = true;
+  let claimed = [];
+  try {
+    claimed = await claimDueHeartbeatTasks();
+  } finally {
+    heartbeatTickBusy = false;
+  }
+  if (!claimed.length) {
+    await updateHeartbeatBadge();
+    return;
+  }
+  // 同一批到期任务并行启动，后续 alarm tick 也可以继续领取新到期任务。
+  for (const task of claimed) {
+    const run = runHeartbeatTaskInBackground(task)
+      .catch((err) => console.warn('[SW] heartbeat run failed:', task.id, err))
+      .finally(() => {
+        activeHeartbeatRuns.delete(run);
+        updateHeartbeatBadge();
+      });
+    activeHeartbeatRuns.add(run);
+  }
+  await updateHeartbeatBadge();
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -277,22 +747,17 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
     return;
   }
-  if (alarm.name === LICENSE_ALARM) {
-    heartbeatLicense().catch((err) => console.warn('[SW] license heartbeat failed:', err));
-    return;
-  }
   if (alarm.name === HEARTBEAT_ALARM) {
-    if (!(await isRuntimeLicensed())) return;
     tickHeartbeats().catch((err) => console.warn('[SW] heartbeat tick failed:', err));
     return;
   }
   if (alarm.name !== FEED_REFRESH_ALARM) return;
-  if (!(await isRuntimeLicensed())) return;
   console.log('[SW] Feed alarm triggered');
-  const feeds = await listFeeds();
-  if (feeds.length === 0) return;
-  await refreshFeeds(feeds.map((f) => f.id));
   const prefs = await getFeedPrefs();
+  const feeds = await listFeeds();
+  const due = feeds.filter((f) => feedRefreshDue(f, Number(prefs.intervalMin) || 30));
+  if (due.length === 0) return;
+  await refreshFeeds(due.map((f) => f.id));
   if (prefs.defaultTargetLanguage) {
     runBackfill(prefs.defaultTargetLanguage).catch(() => {});
   }
@@ -316,8 +781,7 @@ async function initOnStartup() {
     const tasks = [
       scheduleFeedAlarm(),
       ensureHeartbeatAlarm().catch(() => {}),
-      ensureLicenseAlarm().catch(() => {}),
-      heartbeatLicense().catch((err) => console.warn('[SW] license startup failed:', err)),
+      tickHeartbeats().catch((err) => console.warn('[SW] heartbeat startup tick failed:', err)),
       chrome.tabs.query({}).then((tabs) => {
         for (const t of tabs) {
           notePanelPageTab(t);
@@ -328,7 +792,7 @@ async function initOnStartup() {
 
     // Step 3: kick off backfill after translate provider is settled
     const prefs = await getFeedPrefs();
-    if (prefs.defaultTargetLanguage && await isRuntimeLicensed()) {
+    if (prefs.defaultTargetLanguage) {
       tasks.push(
         runBackfill(prefs.defaultTargetLanguage).catch((err) =>
           console.warn('[SW] initial backfill failed:', err)
@@ -776,6 +1240,25 @@ async function dispatchDocReview(d) {
   return docEditService.reviewWordDoc(target.docId, d.tool, args);
 }
 
+// SW 场景工具桥：消息通道全部直调自身 handler（自发 chrome.runtime.sendMessage 收不到）。
+function makeSwBridge() {
+  return {
+    fetchPage: (url) => handleFetchPage({ url }),
+    openTab: (data) => handleOpenTab({ ...(data || {}), aiOpened: true }),
+    collectContent: (data) => handleCollectContent(data),
+    tabSnapshot: () => handleTabSnapshot({}),
+    tabReadMany: (data) => handleTabReadMany(data),
+    tabSessionOperate: (data) => handleTabSessionOperate(data),
+    feedTransport: swFeedTransport,
+    broadcastCollectionStatus: (data) => broadcastCollectionStatus(data).catch(() => {}),
+    // 文档编辑：docx / xlsx 均由 SW 引擎直接执行（无需编辑模式/阅读器）
+    notifyDocUpdated: (docId) => docEditService.invalidateDoc(docId),
+    docEdit: async ({ tool, args }) => dispatchDocEdit({ tool, args }),
+    // 审阅修订：docx 修订管理（list/accept/reject），SW 引擎执行
+    docReview: async ({ tool, args }) => dispatchDocReview({ tool, args }),
+  };
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'ann-chat') return;
   let abortCtrl = null;
@@ -797,6 +1280,7 @@ chrome.runtime.onConnect.addListener((port) => {
     pendingImages: [],
     subagentSessions: new Map(),
     runningSubagents: new Set(),
+    backgroundAborts: new Set(),
   };
   annChatPorts.add(portState);
   const ctx = {
@@ -841,6 +1325,9 @@ chrome.runtime.onConnect.addListener((port) => {
     set subagentSessions(v) { portState.subagentSessions = v; },
     get runningSubagents() { return portState.runningSubagents; },
     set runningSubagents(v) { portState.runningSubagents = v; },
+    get backgroundAborts() { return portState.backgroundAborts; },
+    registerBackgroundAbort: (c) => { if (c) portState.backgroundAborts.add(c); },
+    unregisterBackgroundAbort: (c) => { portState.backgroundAborts.delete(c); },
     onSubagentEvent: (card) => { try { port.postMessage({ type: 'subagent', card }); } catch (_) {} },
     onSubagentWriteRefresh: async () => {
       portState.entries = await getEntries(portState.pid);
@@ -853,22 +1340,7 @@ chrome.runtime.onConnect.addListener((port) => {
       clearMessages: () => { try { port.postMessage({ type: 'ui', clearHistory: true }); } catch (_) {} },
     },
     closeOwnedAiTabs: (owner, extraIds) => closeAiTabs(owner, extraIds),
-    // SW 场景桥：消息通道全部直调自身 handler（自发消息收不到）
-    bridge: {
-      fetchPage: (url) => handleFetchPage({ url }),
-      openTab: (data) => handleOpenTab({ ...(data || {}), aiOpened: true }),
-      collectContent: (data) => handleCollectContent(data),
-      tabSnapshot: () => handleTabSnapshot({}),
-      tabReadMany: (data) => handleTabReadMany(data),
-      tabSessionOperate: (data) => handleTabSessionOperate(data),
-      feedTransport: swFeedTransport,
-      broadcastCollectionStatus: (data) => broadcastCollectionStatus(data).catch(() => {}),
-      // 文档编辑：docx / xlsx 均由 SW 引擎直接执行（无需编辑模式/阅读器）
-      notifyDocUpdated: (docId) => docEditService.invalidateDoc(docId),
-      docEdit: async ({ tool, args }) => dispatchDocEdit({ tool, args }),
-      // 审阅修订：docx 修订管理（list/accept/reject），SW 引擎执行
-      docReview: async ({ tool, args }) => dispatchDocReview({ tool, args }),
-    },
+    bridge: makeSwBridge(),
   };
 
   port.onMessage.addListener(async (msg) => {
@@ -886,10 +1358,6 @@ chrome.runtime.onConnect.addListener((port) => {
     if (abortCtrl) abortCtrl.abort();
     abortCtrl = new AbortController();
     const { signal } = abortCtrl;
-    if (!(await isRuntimeLicensed())) {
-      emit({ type: 'error', error: LICENSE_DENIED.error });
-      return;
-    }
     if (!live()) return;
     const pid = await getCurrentProject();
     if (!live()) return;
@@ -920,12 +1388,21 @@ chrome.runtime.onConnect.addListener((port) => {
     let savedFinal = false;
     let showedQuiz = false;
     let turnDone = false;
+    let turnTokens = 0;
+    const turnStartedAt = Date.now();
     try {
       // ---- 消息组装（与侧栏 buildMessagesForApi 同构）----
       // system（静态前缀）→ 压缩摘要 → 历史 → 动态前言 → 本条用户消息
       const userMessages = Array.isArray(msg.messages) ? msg.messages.filter((m) => m && m.role === 'user') : [];
       const lastUser = userMessages[userMessages.length - 1] || { role: 'user', content: '' };
       const userText = (lastUser.content || '').toString();
+      const selectedCount = portState.selectedIds
+        ? (portState.selectedIds.size || portState.selectedIds.length || 0)
+        : 0;
+      const researchRoute = routeResearchMode(userText, {
+        selectedCount,
+        unfinishedResearch: researchCarryFromHistory(portState.messages),
+      });
       const { maxParallel } = await getSubagentLimits().catch(() => ({ maxParallel: undefined }));
       if (!live()) return;
 
@@ -965,6 +1442,7 @@ chrome.runtime.onConnect.addListener((port) => {
         insights: await listInsights(pid),
         plan: await getPlan(pid),
         apiCatalog: formatApiCatalog(await loadConnectors()),
+        researchRoute,
       });
       if (!live()) return;
       if (signal.aborted) {
@@ -990,27 +1468,66 @@ chrome.runtime.onConnect.addListener((port) => {
 
       ctx.apiConfig = apiConfig;
       ctx.subagentParentSignal = signal;
+      ctx.researchMode = researchRoute.mode;
+      ctx.researchPolicy = researchRoute.policy;
       ctx.currentTabInfo = currentTabInfo + sessionReaderNote();
       const chatTools = buildChatTools(agents, { maxParallel });
 
       // ---- 工具循环（与侧栏 sendMessage 同构）----
-      for (let round = 0; round < AGENT_MAX_ROUNDS; round++) {
+      const rp = researchRoute.policy || {};
+      const maxRounds = resolveLoopRounds(rp, AGENT_MAX_ROUNDS);
+      const wrapRound = resolveWrapRound(rp, AGENT_WRAP_HINT_ROUND);
+      const researchTurnStart = callMessages.length;
+      let alreadyFinalized = false;
+      let llmRecoveries = 0;
+      let researchHoldStep = '';
+      let researchHoldCount = 0;
+      let researchTools = null;
+      for (let round = 0; round < maxRounds; round++) {
         if (!live() || signal.aborted) break;
-        roundText = '';
-        // 接近工具调用上限：注入收尾提示（与侧栏一致；只进 callMessages 不进 portState 持久历史）
-        if (round === AGENT_WRAP_HINT_ROUND) {
+        const budget = inspectTurnBudget(rp, {
+          round,
+          maxRounds,
+          turnUsageSum: turnTokens,
+          turnStartedAt,
+        });
+        if (budget.finalize && !alreadyFinalized) {
+          callMessages.push({ role: 'system', content: budget.reason });
+          alreadyFinalized = true;
+        } else if (!alreadyFinalized && wrapRound > 0 && round === wrapRound) {
           callMessages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
         }
-        const result = await streamChatWithTools(callMessages, chatTools, apiConfig,
-          (chunk) => {
-            roundText += chunk;
-            emit({ type: 'chunk', text: chunk });
-          },
-          signal);
+        roundText = '';
+        const rec = await recoverParentLlmCall(
+          () => streamChatWithTools(
+            callMessages,
+            alreadyFinalized ? [] : (researchTools || chatTools),
+            apiConfig,
+            (chunk) => {
+              roundText += chunk;
+              emit({ type: 'chunk', text: chunk });
+            },
+            signal,
+          ),
+          { signal, hasProgress: turnDone, recoveries: llmRecoveries },
+        );
+        if (rec.action !== 'ok') {
+          if (rec.action === 'salvage' && !alreadyFinalized) {
+            await waitForLiveChildren(ctx, { timeoutMs: HEARTBEAT_STALE_RUNNING_MS, signal });
+            callMessages.push({ role: 'system', content: FINALIZE_EMPTY_AFTER_TOOLS });
+            alreadyFinalized = true;
+            round -= 1;
+            continue;
+          }
+          throw rec.error;
+        }
+        llmRecoveries = 0;
+        const result = rec.result;
         if (!live()) return;
+        turnTokens += usageTotalTokens(result.usage);
         if (signal.aborted) break;
-        if (result.toolCalls.length === 0) {
-          const finalText = String(result.content || roundText || '').trim();
+        const finalText = String(result.content || roundText || '').trim();
+        if (alreadyFinalized) {
           roundText = '';
           if (finalText) {
             portState.messages.push({ role: 'assistant', content: finalText });
@@ -1018,6 +1535,57 @@ chrome.runtime.onConnect.addListener((port) => {
           }
           break;
         }
+        if (result.toolCalls.length === 0) {
+          if (hasLiveChildren(ctx)) {
+            emit({ type: 'tool', status: 'start', label: '子任务还在跑，完成后继续' });
+            await waitForLiveChildren(ctx, { timeoutMs: RESEARCH_CHILD_WAIT_MS, signal });
+            if (!live() || signal.aborted) break;
+          }
+          const held = nextResearchHold(callMessages.slice(researchTurnStart), rp, {
+            holdStep: researchHoldStep,
+            holdCount: researchHoldCount,
+            waitingForUser: !!(portState.pendingScopeQuiz || portState.pendingSuggestions),
+          });
+          researchHoldStep = held.holdStep;
+          researchHoldCount = held.holdCount;
+          if (held.action === 'continue') {
+            callMessages.push({ role: 'system', content: held.gap.prompt });
+            researchTools = held.gap.step === 'gather' ? null : toolsForResearchStep(chatTools, held.gap.step);
+            emit({ type: 'stream-reset' });
+            emit({ type: 'tool', status: 'start', label: held.gap.label });
+            round -= 1;
+            continue;
+          }
+          if (held.action === 'stuck') {
+            emit({ type: 'stream-reset' });
+            emit({ type: 'chunk', text: held.text });
+            portState.messages.push({ role: 'assistant', content: held.text });
+            savedFinal = true;
+            researchTools = null;
+            break;
+          }
+          researchTools = null;
+          if (shouldFinalizeEmptyAnswer({
+            turnHadTools: turnDone,
+            toolCalls: result.toolCalls,
+            content: finalText,
+            alreadyFinalized,
+          })) {
+            callMessages.push({ role: 'system', content: FINALIZE_EMPTY_AFTER_TOOLS });
+            alreadyFinalized = true;
+            round -= 1;
+            continue;
+          }
+          roundText = '';
+          if (finalText) {
+            portState.messages.push({ role: 'assistant', content: finalText });
+            savedFinal = true;
+          }
+          break;
+        }
+        researchHoldStep = '';
+        researchHoldCount = 0;
+        researchTools = null;
 
         // 一轮工具调用：骨架在 chat-executor.processRoundToolCalls（与侧栏共用一份实现），
         // 这里只注入浮动窗的端口上报与写库后的缓存重读
@@ -1074,7 +1642,11 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       if (!savedFinal && !showedQuiz) {
         if (turnDone) {
-          portState.messages.push({ role: 'assistant', content: '已执行操作。' });
+          const toolNames = (portState.messages || [])
+            .filter((m) => m && m.role === 'assistant' && m.tool_calls)
+            .flatMap((m) => (m.tool_calls || []).map((tc) => tc.function?.name || tc.name))
+            .filter(Boolean);
+          portState.messages.push({ role: 'assistant', content: emptyToolFallbackText(toolNames) });
         } else {
           const reason = 'AI 未返回内容，请检查模型配置或稍后重试。';
           portState.messages.push({ role: 'assistant', content: reason });
@@ -1094,15 +1666,17 @@ chrome.runtime.onConnect.addListener((port) => {
     } catch (err) {
       if (!live()) return;
       if (err.name === 'AbortError' || signal.aborted) {
+        await abortAndSettleChildren(abortCtrl, ctx, { timeoutMs: 8000 });
         const partial = roundText.trim();
         if (partial) portState.messages.push({ role: 'assistant', content: partial + '\n\n(已中断)' });
         emit({ type: 'done', messages: portState.messages, aborted: true });
         closeAiTabs('chat').catch(() => {});
         return;
       }
+      await abortAndSettleChildren(abortCtrl, ctx, { timeoutMs: 8000 });
       const partial = roundText.trim();
       if (partial) portState.messages.push({ role: 'assistant', content: partial });
-      emit({ type: 'error', error: err.message, messages: portState.messages });
+      emit({ type: 'error', error: formatNetworkError(err), messages: portState.messages });
       closeAiTabs('chat').catch(() => {});
     }
   });
@@ -1133,19 +1707,6 @@ chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !message.type) return;
-  if (message.type === 'GET_LICENSE_STATE') {
-    getLicenseView()
-      .then((data) => sendResponse({ success: true, ...data }))
-      .catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-  if (message.type === 'ACTIVATE_LICENSE') {
-    activateLicense(message.data && message.data.key)
-      .then((data) => sendResponse({ success: !!data.ok, ...data }))
-      .catch((err) => sendResponse({ success: false, ok: false, error: err.message || String(err) }));
-    return true;
-  }
-
   const dispatch = () => {
   switch (message.type) {
     case 'COLLECT':
@@ -1239,6 +1800,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     case 'FEED_SUBSCRIBE':
       handleFeedSubscribe(message.data).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
+      return true;
+    case 'FEED_SUBSCRIBE_WEBPAGE':
+      handleFeedSubscribeWebpage(message.data).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
       return true;
     case 'FEED_SUBSCRIBE_BATCH':
       handleFeedSubscribeBatch(message.data).then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
@@ -1401,14 +1965,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   };
 
-  isRuntimeLicensed().then((ok) => {
-    if (!ok) {
-      sendResponse(LICENSE_DENIED);
-      return;
-    }
-    dispatch();
-  }).catch((err) => sendResponse({ success: false, error: err.message }));
-  return true;
+  return dispatch();
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
@@ -1756,7 +2313,16 @@ const FETCH_HEADERS = {
 
 /* Shared fetch + extract pipeline used by both processEntry and handleFetchPage. */
 async function fetchAndExtract(url) {
-  const response = await fetch(url, { credentials: 'include', headers: FETCH_HEADERS });
+  const response = await withNetworkRetry(async () => {
+    const r = await fetch(url, { credentials: 'include', headers: FETCH_HEADERS });
+    const retryableStatus = r.status === 408 || r.status === 425 || r.status === 429 || r.status >= 500;
+    if (!r.ok && retryableStatus) {
+      const e = new Error('HTTP ' + r.status);
+      e.status = r.status;
+      throw e;
+    }
+    return r;
+  }, { maxRetries: 5 });
   const html = await response.text();
   const blockResult = detectBlocked(response, html);
   if (blockResult.blocked) {
@@ -2068,6 +2634,32 @@ function generateId() {
  * RSS / Atom feed handlers
  * ====================================================================== */
 
+async function handleFeedSubscribeWebpage({ recipe, title, scope, intervalMin, maxItems, refreshMode, initialItems } = {}) {
+  if (!recipe || !recipe.itemSelector) return { success: false, error: '网页抓取规则缺失' };
+  const pid = await getCurrentProject();
+  const feedScope = scope === 'project' ? pid : 'global';
+  const cleanInterval = Math.max(0, Math.min(1440, Number(intervalMin) || 0));
+  const cleanMax = maxItems == null || maxItems === ''
+    ? null
+    : Math.max(1, Math.min(500, Number(maxItems) || 50));
+  const cleanRefreshMode = ['auto', 'http', 'tab'].includes(refreshMode) ? refreshMode : 'auto';
+  try {
+    const { feed, inserted } = await subscribeWebpage({
+      recipe,
+      title: String(title || '').trim().slice(0, 200),
+      scope: feedScope,
+      intervalMin: cleanInterval,
+      maxItems: cleanMax,
+      refreshMode: cleanRefreshMode,
+      initialItems: Array.isArray(initialItems) ? initialItems : [],
+    });
+    scheduleFeedAlarm().catch(() => {});
+    return { success: true, feed, inserted };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
 async function handleFeedSubscribe({ url, scope }) {
   if (!url) return { success: false, error: '请输入 URL' };
   const pid = await getCurrentProject();
@@ -2138,7 +2730,14 @@ async function handleFeedList({ scope } = {}) {
 
 async function handleFeedUpdate({ feedId, updates }) {
   if (!feedId || !updates) return { success: false, error: '参数缺失' };
+  if (updates.refreshMode !== undefined) {
+    updates = {
+      ...updates,
+      refreshMode: ['auto', 'http', 'tab'].includes(updates.refreshMode) ? updates.refreshMode : 'auto',
+    };
+  }
   const next = await updateFeed(feedId, updates);
+  if (next) scheduleFeedAlarm().catch(() => {});
   return { success: !!next, feed: next };
 }
 
@@ -2517,3 +3116,7 @@ async function handleTestTranslateProvider({ provider, tencent } = {}) {
     return { success: false, error: err.message };
   }
 }
+
+
+
+

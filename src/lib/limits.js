@@ -28,13 +28,14 @@ export const AGENT_WRAP_HINT_ROUND = 95;
  * 收尾提示；实测一次麦捷科技调研打满 24 轮仍在调工具，循环按预算退出时把
  * `lastText`（模型唯一说过的开场白）当报告交回，父代理收到的是 completed + 一句话。
  *
- * 2026-10-07 改为**资源预算 + 强制交回**：按累计 token 与耗时计，不按轮数。
+ * 2026-10-07 改为**资源预算 + 强制交回**：按累计 token 计，不按轮数。
  * 到 SUBAGENT_BUDGET_WARN_RATIO 注入收尾提示；耗尽时只给模型 submit_report 一个工具，
  * 逼它把已核实的写进 claims、没查完的写进 unresolved——旧问题是退出时丢弃了工作，
- * 不是预算本身。0 = 不限。用户可在设置「子代理」里改。 */
-export const SUBAGENT_BUDGET_TOKENS = 2_000_000;
+ * 不是预算本身。0 = 不限。用户可在设置「子代理」里改 token（默认不限）。
+ * 耗时预算已取消；主代理 / Deep Research / 子代理默认 token 也不限（2026-10-28）。 */
+export const SUBAGENT_BUDGET_TOKENS = 0;
 export const SUBAGENT_BUDGET_TOKENS_MAX = 50_000_000;
-export const SUBAGENT_BUDGET_MINUTES = 20;
+export const SUBAGENT_BUDGET_MINUTES = 0;
 export const SUBAGENT_BUDGET_MINUTES_MAX = 240;
 export const SUBAGENT_BUDGET_WARN_RATIO = 0.85;
 /** 预算耗尽后的强制交回最多尝试几轮（模型仍不调 submit_report 则判 incomplete）。 */

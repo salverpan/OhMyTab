@@ -1,8 +1,9 @@
 /**
  * 心跳定时任务（ChatGPT Tasks / agent heartbeat 模式）。
  *
- * 调度走 chrome.alarms 分钟 tick（MV3 最小粒度），到期后优先交给打开的
- * 侧栏跑一轮对话；侧栏不在就入队，打开面板时 drain。任务按项目隔离。
+ * 调度走 chrome.alarms 分钟 tick（MV3 最小粒度）。到期后由 Service Worker
+ * 直接后台执行，不依赖侧栏是否打开；同一 tick 的多个到期任务并行启动。
+ * 每个任务有独立 API 线程，避免并行时互相覆盖历史。任务按项目隔离。
  *
  * 时间模型见下方「调度模型」：once / interval / daily / weekly / cron，
  * 全部按用户本地时区解释；旧的 everyMin / dailyAt 字段仍可读。
@@ -15,8 +16,19 @@ export const HEARTBEAT_STORAGE_KEY = 'heartbeatTasks';
 export const HEARTBEAT_MAX_TASKS = 20;
 export const HEARTBEAT_MIN_INTERVAL_MIN = 5;
 export const HEARTBEAT_MAX_RUNS = 50;
-/** 侧栏中途关掉时 lastStatus 可能停在 running；超过此时长视为过期，允许再次调度 */
+/** SW 在心跳执行中途被杀时 lastStatus 会停在 running；超过此时长视为过期，允许再次调度 */
 export const HEARTBEAT_STALE_RUNNING_MS = 10 * 60 * 1000;
+
+/** 每个项目一份「任务线程」映射：{ [taskId]: { history, summary, updatedAt } }。
+ *  心跳在 SW 后台独立执行，不能和侧栏项目会话共用历史，否则并行任务会互相覆盖。 */
+export function heartbeatSessionsKey(projectId) {
+  return `heartbeatSessions_${projectId || 'default'}`;
+}
+
+/** 后台心跳写回侧栏项目聊天的 UI 气泡；sidepanel 只读并合并，不参与写。 */
+export function heartbeatInboxKey(projectId) {
+  return `heartbeatInbox_${projectId || 'default'}`;
+}
 
 const PRESETS = [
   { every: '5m', everyMin: 5, label: '每 5 分钟' },
@@ -353,6 +365,23 @@ export function taskBelongsToProject(task, projectId) {
   return heartbeatProjectId(task) === String(projectId);
 }
 
+/** 正在跑、且还没被当成 SW 被杀后的过期 running。 */
+export function isHeartbeatTaskRunning(task, now = Date.now()) {
+  if (!task || task.lastStatus !== 'running') return false;
+  const started = Number(task.updatedAt || task.runStartedAt || 0);
+  if (!started) return true;
+  return now - started <= HEARTBEAT_STALE_RUNNING_MS;
+}
+
+/** 项目页呼吸灯：所有仍在跑的心跳所属项目。 */
+export function runningHeartbeatProjectIds(tasks, now = Date.now()) {
+  const ids = new Set();
+  for (const t of tasks || []) {
+    if (isHeartbeatTaskRunning(t, now)) ids.add(heartbeatProjectId(t));
+  }
+  return ids;
+}
+
 export async function listHeartbeatTasks(projectId) {
   const all = await readAll();
   if (!projectId) return all;
@@ -374,6 +403,10 @@ export async function purgeHeartbeatTasks(projectId) {
     else keep.push(t);
   }
   if (removed.length) await writeAll(keep);
+  // 心跳线程与后台结果气泡跟项目一起删；否则删库后仍留孤儿历史。
+  try {
+    await chrome.storage.local.remove([heartbeatSessionsKey(pid), heartbeatInboxKey(pid)]);
+  } catch (_) {}
   return removed;
 }
 
@@ -450,11 +483,35 @@ function applyCadence(task, fields) {
   return true;
 }
 
+async function clearHeartbeatTaskData(task) {
+  if (!task || !task.id) return;
+  const pid = heartbeatProjectId(task);
+  const sessionsKey = heartbeatSessionsKey(pid);
+  const inboxKey = heartbeatInboxKey(pid);
+  try {
+    const data = await chrome.storage.local.get([sessionsKey, inboxKey]);
+    const sessions = data[sessionsKey] && typeof data[sessionsKey] === 'object'
+      ? { ...data[sessionsKey] } : null;
+    const inbox = Array.isArray(data[inboxKey]) ? data[inboxKey] : null;
+    const patch = {};
+    if (sessions && Object.prototype.hasOwnProperty.call(sessions, task.id)) {
+      delete sessions[task.id];
+      patch[sessionsKey] = sessions;
+    }
+    if (inbox && inbox.some((m) => m && m.taskId === task.id)) {
+      patch[inboxKey] = inbox.filter((m) => !m || m.taskId !== task.id);
+    }
+    if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+  } catch (_) {}
+}
+
 export async function deleteHeartbeatTask(id) {
   const all = await readAll();
+  const task = all.find((t) => t.id === id) || null;
   const next = all.filter((t) => t.id !== id);
   if (next.length === all.length) throw new Error('找不到该心跳任务');
   await writeAll(next);
+  await clearHeartbeatTaskData(task);
 }
 
 export async function setHeartbeatEnabled(id, enabled) {
@@ -463,7 +520,7 @@ export async function setHeartbeatEnabled(id, enabled) {
 
 export async function dueHeartbeatTasks(now = Date.now()) {
   return (await readAll()).filter((t) => {
-    if (t.enabled === false || t.queued) return false;
+    if (t.enabled === false) return false;
     if (!t.nextRunAt) return false; // 一次性任务跑完 nextRunAt=null 且已停用，双保险
     if (Number(t.nextRunAt) > now) return false;
     if (t.lastStatus === 'running') {
@@ -471,6 +528,28 @@ export async function dueHeartbeatTasks(now = Date.now()) {
     }
     return true;
   });
+}
+
+/**
+ * 原子领取到期任务：一次读改写把 lastStatus 标成 running，避免同一 tick / 多上下文重复执行。
+ * 旧版本留下的 queued 任务也会在此直接领取，不再等侧栏打开。
+ */
+export async function claimDueHeartbeatTasks(now = Date.now()) {
+  const all = await readAll();
+  const claimed = [];
+  let changed = false;
+  for (const t of all) {
+    if (t.enabled === false || !t.nextRunAt || Number(t.nextRunAt) > now) continue;
+    if (t.lastStatus === 'running' && now - Number(t.updatedAt || 0) <= HEARTBEAT_STALE_RUNNING_MS) continue;
+    t.lastStatus = 'running';
+    t.runStartedAt = now;
+    t.queued = false;
+    t.updatedAt = now;
+    changed = true;
+    claimed.push({ ...t });
+  }
+  if (changed) await writeAll(all);
+  return claimed;
 }
 
 export async function queuedHeartbeatTasks(projectId) {
@@ -512,7 +591,7 @@ export function appendRunRecord(runs, record) {
   return list.slice(-HEARTBEAT_MAX_RUNS);
 }
 
-export async function markHeartbeatFinished(id, { ok, error } = {}) {
+export async function markHeartbeatFinished(id, { ok, error, result } = {}) {
   const all = await readAll();
   const t = all.find((x) => x.id === id);
   if (!t) return null;
@@ -521,12 +600,14 @@ export async function markHeartbeatFinished(id, { ok, error } = {}) {
   t.lastError = ok ? '' : String(error || '失败');
   t.lastRunAt = now;
   t.queued = false;
+  if (result != null) t.lastResult = String(result || '').slice(0, 4000);
   t.runs = appendRunRecord(t.runs, {
     at: Number(t.runStartedAt) || now,
     endedAt: now,
     status: ok ? 'ok' : 'error',
     durationMs: t.runStartedAt ? Math.max(0, now - Number(t.runStartedAt)) : 0,
     error: ok ? '' : String(error || '失败').slice(0, 200),
+    result: result != null ? String(result || '').slice(0, 240) : '',
   });
   t.runStartedAt = null;
   const s = normalizeSchedule(t);
@@ -553,7 +634,9 @@ export async function markHeartbeatFinished(id, { ok, error } = {}) {
 export async function queuedOrDueCount(projectId) {
   const now = Date.now();
   const list = await listHeartbeatTasks(projectId);
-  return list.filter((t) => t.enabled !== false && (t.queued || Number(t.nextRunAt || 0) <= now)).length;
+  return list.filter((t) => t.enabled !== false
+    && t.lastStatus !== 'running'
+    && (t.queued || Number(t.nextRunAt || 0) <= now)).length;
 }
 
 export async function ensureHeartbeatAlarm(tasks) {

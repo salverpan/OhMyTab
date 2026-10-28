@@ -1,6 +1,6 @@
 /**
  * AI 把页面图取来、交到对话 / 网页编辑器 / 文档。
- * 来源只做中转（source=place），交货后默认删掉。
+ * 默认只做中转（source=place），交货后删掉；persist=source 时作为图片条目留在来源。
  * 纯模块：SW / sidepanel / chat-executor 共用。
  */
 
@@ -61,9 +61,10 @@ function newId() {
 }
 
 export async function saveImageSource(pid, {
-  url = '', title = '', imageUrl = '', bytes, mime = '', alt = '', ephemeral = true,
+  url = '', title = '', imageUrl = '', bytes, mime = '', alt = '', persist = 'transient',
 } = {}) {
   if (!bytes) throw new Error('没有可保存的图片字节');
+  const effectivePersist = persist === 'source' ? 'source' : 'transient';
   const format = imageFormatFrom(mime, imageUrl);
   const caption = String(alt || '').trim();
   const id = newId();
@@ -81,7 +82,7 @@ export async function saveImageSource(pid, {
     fileName,
     fileSize: bytes.byteLength || (bytes.byteLength === 0 ? 0 : new Uint8Array(bytes).byteLength),
     docId: id,
-    source: ephemeral ? PLACE_IMAGE_SOURCE : 'collect',
+    source: effectivePersist === 'source' ? 'collect' : PLACE_IMAGE_SOURCE,
     tags: [],
     createdAt: Date.now(),
     status: 'completed',
@@ -102,18 +103,28 @@ export async function loadImageSource(pid, id) {
   return { entry, bytes, mime: mimeForFormat(entry.format) };
 }
 
+/** 只挑出「本次创建、仍是 place 中转」的图片；persist=source 的图片绝不会被清理。 */
+export function filterDiscardablePlaceImages(entries, ids) {
+  const wanted = new Set((ids || []).map(String));
+  return (entries || []).filter((entry) => entry
+    && wanted.has(String(entry.id || ''))
+    && entry.kind === 'image'
+    && entry.source === PLACE_IMAGE_SOURCE);
+}
+
+/** document 终点由写文档时清理已嵌入的中转图；其它终点在交付后清理。 */
+export function shouldDiscardPlaceImages(persist, to) {
+  return persist !== 'source' && to !== 'document';
+}
+
 export async function discardPlacedImages(pid, ids) {
   if (!ids || !ids.length) return 0;
   const all = await getEntries(pid);
-  let n = 0;
-  for (const id of ids) {
-    const entry = all.find((e) => e && e.id === id);
-    if (!entry || entry.kind !== 'image') continue;
-    if (entry.source !== PLACE_IMAGE_SOURCE) continue;
+  const discardable = filterDiscardablePlaceImages(all, ids);
+  for (const entry of discardable) {
     await deleteEntryCascade(entry, pid);
-    n += 1;
   }
-  return n;
+  return discardable.length;
 }
 
 /** create_document / update_entry 写完 docx 后，把正文里引用过的 place 图清掉。 */
@@ -145,28 +156,53 @@ export async function bytesToPreviewDataUrl(bytes, mime = 'image/jpeg') {
   return bytesToDataUrl(await out.arrayBuffer(), 'image/jpeg');
 }
 
+/** 把 CSS 视口坐标归一化并夹到可见视口内；无效或小于 4px 时返回 null。 */
+export function normalizeViewportRect(rect = {}) {
+  const num = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const vw = num(rect.vw);
+  const vh = num(rect.vh);
+  const x = num(rect.x);
+  const y = num(rect.y);
+  const w = num(rect.w ?? rect.width);
+  const h = num(rect.h ?? rect.height);
+  if (![vw, vh, x, y, w, h].every(Number.isFinite)) return null;
+  if (vw < 4 || vh < 4 || w <= 0 || h <= 0) return null;
+  const left = Math.max(0, Math.min(vw, x));
+  const top = Math.max(0, Math.min(vh, y));
+  const right = Math.max(0, Math.min(vw, x + w));
+  const bottom = Math.max(0, Math.min(vh, y + h));
+  if (right - left < 4 || bottom - top < 4) return null;
+  return { x: left, y: top, w: right - left, h: bottom - top, vw, vh };
+}
+
+/** 截视口后按 CSS 像素区域裁成 PNG。无法裁剪时返回 null，绝不静默回退整图。 */
 export async function cropViewportShot(dataUrl, rect) {
   if (!dataUrl || !rect) return null;
-  const vw = Number(rect.vw) || 0;
-  const vh = Number(rect.vh) || 0;
-  const x = Number(rect.x) || 0;
-  const y = Number(rect.y) || 0;
-  const w = Number(rect.w) || 0;
-  const h = Number(rect.h) || 0;
-  if (w < 4 || h < 4 || vw < 4 || vh < 4) return null;
+  const box = normalizeViewportRect(rect);
+  if (!box) return null;
   const parsed = dataUrlToBytes(dataUrl);
   if (!parsed) return null;
-  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') return parsed;
-  const bmp = await createImageBitmap(new Blob([parsed.bytes], { type: parsed.mime }));
-  const sx = Math.max(0, Math.round((x / vw) * bmp.width));
-  const sy = Math.max(0, Math.round((y / vh) * bmp.height));
-  const sw = Math.max(1, Math.min(bmp.width - sx, Math.round((w / vw) * bmp.width)));
-  const sh = Math.max(1, Math.min(bmp.height - sy, Math.round((h / vh) * bmp.height)));
-  const canvas = new OffscreenCanvas(sw, sh);
-  canvas.getContext('2d').drawImage(bmp, sx, sy, sw, sh, 0, 0, sw, sh);
-  try { bmp.close(); } catch (_) {}
-  const out = await canvas.convertToBlob({ type: 'image/png' });
-  return { mime: 'image/png', bytes: await out.arrayBuffer() };
+  if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas !== 'function') return null;
+  let bmp = null;
+  try {
+    bmp = await createImageBitmap(new Blob([parsed.bytes], { type: parsed.mime }));
+    if (!bmp || !bmp.width || !bmp.height) return null;
+    const sx = Math.max(0, Math.round((box.x / box.vw) * bmp.width));
+    const sy = Math.max(0, Math.round((box.y / box.vh) * bmp.height));
+    const sw = Math.max(1, Math.min(bmp.width - sx, Math.round((box.w / box.vw) * bmp.width)));
+    const sh = Math.max(1, Math.min(bmp.height - sy, Math.round((box.h / box.vh) * bmp.height)));
+    const canvas = new OffscreenCanvas(sw, sh);
+    canvas.getContext('2d').drawImage(bmp, sx, sy, sw, sh, 0, 0, sw, sh);
+    const out = await canvas.convertToBlob({ type: 'image/png' });
+    return { mime: 'image/png', bytes: await out.arrayBuffer() };
+  } catch (_) {
+    return null;
+  } finally {
+    try { bmp?.close(); } catch (_) { /* ignore */ }
+  }
 }
 
 async function resolveTab(tabId) {
@@ -186,6 +222,56 @@ async function captureVisible(tabId) {
   try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
   await new Promise((r) => setTimeout(r, 80));
   return chrome.tabs.captureVisibleTab(tab && tab.windowId, { format: 'png' });
+}
+
+/**
+ * 解析截图区域。region_selector 优先：先把元素滚进视口，再取 CSS 像素矩形。
+ * 没传 selector 时直接用 region={x,y,w,h}（视口坐标）。返回未裁剪、只读取区域。
+ */
+async function resolveScreenshotRegion(tabId, { selector = '', region = null } = {}) {
+  const injected = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: ({ selector: sel, region: box } = {}) => {
+      const vw = window.innerWidth || document.documentElement.clientWidth || 1;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+      if (sel) {
+        let el = null;
+        try { el = document.querySelector(sel); } catch (_) {
+          return { ok: false, error: `区域选择器语法错误：${sel}` };
+        }
+        if (!el) return { ok: false, error: `页面里找不到区域元素：${sel}` };
+        try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        const r = el.getBoundingClientRect();
+        if (!r || r.width <= 0 || r.height <= 0) {
+          return { ok: false, error: `区域元素不可见或尺寸为 0：${sel}` };
+        }
+        return {
+          ok: true,
+          rect: { x: r.x, y: r.y, w: r.width, h: r.height, vw, vh },
+        };
+      }
+      if (!box || typeof box !== 'object') return { ok: false, error: '截图区域参数无效' };
+      return {
+        ok: true,
+        rect: {
+          x: box.x,
+          y: box.y,
+          w: box.w ?? box.width,
+          h: box.h ?? box.height,
+          vw,
+          vh,
+        },
+      };
+    },
+    args: [{ selector, region }],
+  }).catch(() => []);
+  const result = injected && injected[0] && injected[0].result;
+  if (!result || result.ok !== true) {
+    return { ok: false, error: (result && result.error) || '无法读取截图区域' };
+  }
+  const rect = normalizeViewportRect(result.rect);
+  if (!rect) return { ok: false, error: '截图区域无效或不在当前可见视口内' };
+  return { ok: true, rect };
 }
 
 async function fetchImageBytes(src) {
@@ -443,10 +529,22 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
   if (!['chat', 'editor', 'document'].includes(to)) {
     return JSON.stringify({ ok: false, error: 'to 须为 chat / editor / document' });
   }
-  const keep = args.keep === true;
+  if (Object.prototype.hasOwnProperty.call(args, 'keep')) {
+    return JSON.stringify({ ok: false, error: 'keep 已移除，请改用 persist: transient | source' });
+  }
+  if (args.persist != null && !['transient', 'source'].includes(args.persist)) {
+    return JSON.stringify({ ok: false, error: 'persist 须为 transient 或 source' });
+  }
+  const persist = args.persist === 'source' ? 'source' : 'transient';
   const urls = Array.isArray(args.urls) ? args.urls.map(String).filter(Boolean) : [];
   const selectors = Array.isArray(args.selectors) ? args.selectors.map(String).filter(Boolean) : [];
   const entryIds = Array.isArray(args.entry_ids) ? args.entry_ids.map(String).filter(Boolean) : [];
+  const regionSelector = String(args.region_selector || '').trim();
+  const region = args.region && typeof args.region === 'object' && !Array.isArray(args.region) ? args.region : null;
+  if (args.region != null && !region) {
+    return JSON.stringify({ ok: false, error: 'region 须为 {x,y,w,h} 对象' });
+  }
+  const hasRegion = !!(regionSelector || region);
   const created = [];
   const reused = [];
   const errors = [];
@@ -462,8 +560,13 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
 
   const figs = normalizeFigs(args.figs);
   const targeted = urls.length > 0 || selectors.length > 0;
-  const wantShot = args.screenshot === true && !figs.length && !targeted && !entryIds.length;
+  const explicitSources = figs.length > 0 || targeted || entryIds.length > 0;
+  if (hasRegion && explicitSources) {
+    return JSON.stringify({ ok: false, error: 'region / region_selector 不能与 figs、urls、selectors、entry_ids 同时使用' });
+  }
+  const wantShot = (args.screenshot === true || hasRegion) && !explicitSources;
   let candidates = [];
+  let shotRect = null;
   const openedTabs = [];
 
   if (figs.length) {
@@ -502,6 +605,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
           bytes: got.bytes,
           mime: got.mime,
           alt: grabbed.caption || '',
+          persist,
         });
         created.push({ entry, bytes: got.bytes, mime: got.mime });
       }
@@ -528,24 +632,43 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
     if (!srcTab) return JSON.stringify({ ok: false, error: '找不到取图的标签页（传 tab_id 或先打开目标页）' });
 
     if (wantShot) {
+      if (hasRegion) {
+        const resolved = await resolveScreenshotRegion(srcTab.id, { selector: regionSelector, region });
+        if (!resolved.ok) return JSON.stringify({ ok: false, error: resolved.error });
+        shotRect = resolved.rect;
+      }
       const shot = await captureVisible(srcTab.id).catch(() => null);
-      const parsed = shot ? dataUrlToBytes(shot) : null;
-      if (!parsed) return JSON.stringify({ ok: false, error: '截取视口失败。确认该标签页在前台可见。' });
+      if (!shot) return JSON.stringify({ ok: false, error: '截取视口失败。确认该标签页在前台可见。' });
+      const captured = shotRect
+        ? await cropViewportShot(shot, shotRect)
+        : dataUrlToBytes(shot);
+      if (!captured) {
+        return JSON.stringify({
+          ok: false,
+          error: shotRect ? '截图区域裁剪失败，请检查 region / region_selector 是否在可见视口内。' : '截图数据无效。',
+        });
+      }
       const entry = await saveImageSource(pid, {
         url: srcTab.url || '', title: srcTab.title || '截图',
-        imageUrl: '', bytes: parsed.bytes, mime: parsed.mime, alt: '页面截图',
+        imageUrl: '', bytes: captured.bytes, mime: captured.mime,
+        alt: shotRect ? '页面区域截图' : '页面截图',
+        persist,
       });
-      created.push({ entry, bytes: parsed.bytes, mime: parsed.mime });
-      const preview = await bytesToPreviewDataUrl(parsed.bytes, parsed.mime).catch(() => bytesToDataUrl(parsed.bytes, parsed.mime));
+      created.push({ entry, bytes: captured.bytes, mime: captured.mime });
+      const preview = await bytesToPreviewDataUrl(captured.bytes, captured.mime).catch(() => bytesToDataUrl(captured.bytes, captured.mime));
       ctx._viewportShot = preview;
-      ctx._viewportShotNote = '【视口截图】刚截的当前页。先看图理解页面；要正文原图再用 figs 指定 data.figures 的编号，不要再 screenshot=true。';
-      const hits = await grabFromTab(srcTab.id, {}).catch(() => []);
-      candidates = hits.map((h) => ({
-        src: h.src || '',
-        alt: h.alt || '',
-        width: h.width,
-        height: h.height,
-      }));
+      ctx._viewportShotNote = shotRect
+        ? '【区域截图】刚截的页面选区。先看图理解；需要正文原图再用 figs 指定 data.figures 的编号，不要再 screenshot=true。'
+        : '【视口截图】刚截的当前页。先看图理解页面；要正文原图再用 figs 指定 data.figures 的编号，不要再 screenshot=true。';
+      if (!shotRect) {
+        const hits = await grabFromTab(srcTab.id, {}).catch(() => []);
+        candidates = hits.map((h) => ({
+          src: h.src || '',
+          alt: h.alt || '',
+          width: h.width,
+          height: h.height,
+        }));
+      }
     } else if (targeted) {
       const hits = await grabFromTab(srcTab.id, { urls, selectors });
       const room = PLACE_IMAGES_MAX - created.length - reused.length;
@@ -563,6 +686,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
             bytes: got.bytes,
             mime: got.mime,
             alt: hit.alt || '',
+            persist,
           });
           created.push({ entry, bytes: got.bytes, mime: got.mime });
         } catch (err) {
@@ -594,7 +718,7 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
       });
     }
     delivered = wantShot
-      ? `已截当前视口并显示在对话里。${candidates.length ? `可见大图 ${candidates.length} 张，看完截图再取原图。` : '页面上没有明显的大图元素。'}`
+      ? `已截取${shotRect ? '当前页面选区' : '当前视口'}并显示在对话里。${shotRect ? '' : (candidates.length ? `可见大图 ${candidates.length} 张，看完截图再取原图。` : '页面上没有明显的大图元素。')}`
       : `已在对话里显示 ${pack.length} 张图。`;
   } else if (to === 'editor') {
     const dest = await resolveTab(args.editor_tab_id || args.tab_id);
@@ -622,18 +746,25 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
     } else {
       return JSON.stringify({
         ok: true,
-        kept: true,
+        persist,
+        persisted: persist === 'source',
         count: pack.length,
         ids: pack.map((p) => p.entry.id),
         refs,
-        hint: '把下面的引用行原样写进 write_document 的 brief（format=docx）或 create_document / update_entry 的 markdown。写完会嵌进文档并清掉这些来源中转。',
+        hint: persist === 'source'
+          ? '图片已保存在来源。把下面的引用行原样写进 write_document 的 brief（format=docx）或 create_document / update_entry 的 markdown；来源里的图片会保留。'
+          : '把下面的引用行原样写进 write_document 的 brief（format=docx）或 create_document / update_entry 的 markdown。写完会嵌进文档并清掉这些中转图片。',
         errors,
       });
     }
   }
 
+  if (persist === 'source' && delivered && !delivered.includes('来源')) {
+    delivered += ' 图片已保存到来源。';
+  }
+
   let discarded = 0;
-  if (!keep && to !== 'document') {
+  if (shouldDiscardPlaceImages(persist, to)) {
     discarded = await discardPlacedImages(pid, created.map((p) => p.entry.id));
     if (typeof ctx.onEntriesChanged === 'function') {
       try { ctx.onEntriesChanged(); } catch (_) {}
@@ -643,7 +774,10 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
   return JSON.stringify({
     ok: true,
     to,
+    persist,
+    persisted: persist === 'source',
     screenshot: wantShot,
+    region: shotRect ? { x: shotRect.x, y: shotRect.y, w: shotRect.w, h: shotRect.h } : undefined,
     count: pack.length,
     ids: pack.map((p) => p.entry.id),
     refs,
@@ -651,7 +785,9 @@ export async function runPlaceImages(args, ctx, hooks = {}) {
     delivered,
     candidates,
     hint: wantShot
-      ? '截图像素已附在下一轮。看完再决定：只要这张截图就结束；要正文原图则用 figs 指定 data.figures 的编号再调一次（不要再 screenshot=true）。'
+      ? (persist === 'source'
+        ? '选区像素已附在下一轮，图片作为来源条目保留。'
+        : '截图像素已附在下一轮。临时图在交付后清理；只有用户明确要求保存到来源时才传 persist=source。')
       : undefined,
     errors,
   });

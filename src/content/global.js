@@ -35,6 +35,10 @@ import { upsertDocEditsCardEl } from '../lib/doc-edits.js';
 import {
   FIGURE_MAX, absUrl, resolveImageUrl, figureCaption,
 } from '../lib/figure-catalog.js';
+import {
+  startWebFeedPicker, startWebFeedFieldPicker, stopWebFeedPicker,
+  selectWebFeedCandidate, extractWebFeedItems,
+} from '../lib/webfeed.js';
 
 // Alias for backwards compatibility within this file
 const extractPublishedDate = extractPublishedDateFromDoc;
@@ -45,18 +49,6 @@ function safeSendMessage(msg) {
   }
   return chrome.runtime.sendMessage(msg);
 }
-
-async function requireLicense() {
-  try {
-    const r = await safeSendMessage({ type: 'GET_LICENSE_STATE' });
-    if (r && r.ok) return true;
-    showMiniToast((r && r.error) || '未激活许可证，请在侧栏输入授权码');
-  } catch (_) {
-    showMiniToast('未激活许可证，请在侧栏输入授权码');
-  }
-  return false;
-}
-
 
 function extractPageContent() {
   try {
@@ -803,10 +795,6 @@ async function init() {
 let lastUrl = location.href;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg && msg.type === 'LICENSE_STATE_CHANGED' && msg.data && !msg.data.ok) {
-    if (INSPECT.chatWin) INSPECT.chatWin.classList.remove('show');
-    return false;
-  }
   // manage_tabs(list) 轻量快照：禁止走 Readability / 结构化全文，必须同步秒回。
   if (msg.type === 'EXTRACT_SNAPSHOT') {
     try {
@@ -934,6 +922,58 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: false, error: (err && err.message) || 'interact_page 执行失败' });
     });
     return true;
+  }
+
+  // Webpage -> feed visual recipe builder. These messages are sent by the
+  // side panel directly to the active tab; long-running user clicks are
+  // reported back asynchronously through WEBFEED_EVENT.
+  if (msg.type === 'WEBFEED_START_PICKER') {
+    try {
+      sendResponse(startWebFeedPicker(document));
+    } catch (err) {
+      sendResponse({ ok: false, error: (err && err.message) || String(err) });
+    }
+    return false;
+  }
+
+  if (msg.type === 'WEBFEED_SELECT_CANDIDATE') {
+    try {
+      sendResponse(selectWebFeedCandidate(msg.candidateId));
+    } catch (err) {
+      sendResponse({ ok: false, error: (err && err.message) || String(err) });
+    }
+    return false;
+  }
+
+  if (msg.type === 'WEBFEED_START_FIELD_PICKER') {
+    try {
+      sendResponse(startWebFeedFieldPicker({
+        field: msg.field,
+        multi: !!msg.multi,
+        recipe: msg.recipe,
+      }));
+    } catch (err) {
+      sendResponse({ ok: false, error: (err && err.message) || String(err) });
+    }
+    return false;
+  }
+
+  if (msg.type === 'WEBFEED_STOP_PICKER') {
+    stopWebFeedPicker();
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.type === 'WEBFEED_EXTRACT') {
+    try {
+      sendResponse(extractWebFeedItems(msg.recipe, document, {
+        maxItems: msg.maxItems || 200,
+        includeHidden: !!msg.includeHidden,
+      }));
+    } catch (err) {
+      sendResponse({ ok: false, error: (err && err.message) || String(err), items: [], matched: 0, warnings: [] });
+    }
+    return false;
   }
 
   if (msg.type === 'COLLECTION_STATUS_CHANGED') {
@@ -3833,7 +3873,6 @@ function renderChatContext() {
 }
 
 async function openChatWindow() {
-  if (!(await requireLicense())) return;
   updateChatContext();
   if (!chatContext || !INSPECT.chatWin) return;
   hideSelectionBar();
@@ -3898,7 +3937,10 @@ async function openChatWindow() {
 
 /* SW 端口消息统一处理（openChatWindow 注册 + 断线后 sendChatMessage 自动重连共用） */
 function handleChatPortMessage(m) {
-  if (m.type === 'chunk') appendAiChunk(m.text);
+  if (m.type === 'stream-reset') {
+    chatStreamText = '';
+    if (INSPECT.chatStreamEl) INSPECT.chatStreamEl.textContent = '';
+  } else if (m.type === 'chunk') appendAiChunk(m.text);
   else if (m.type === 'done') {
     if (m.aborted && chatStreamText && !/\(已中断\)\s*$/.test(chatStreamText)) {
       chatStreamText += '\n\n(已中断)';
@@ -5226,7 +5268,6 @@ async function createElementAnnotation(kind) {
   el.dataset.annEl = ann.id;
 }
 async function collectTextSnippet() {
-  if (!(await requireLicense())) return;
   const range = INSPECT.lastTextRange;
   if (!range) return;
   const result = await collectTextSnippetCore(range, location.href, document.title);
@@ -5289,7 +5330,6 @@ async function collectPageImage(img) {
 }
 
 async function collectElementSnippet() {
-  if (!(await requireLicense())) return;
   const el = INSPECT.lastSelectedEl;
   if (!el) return;
   const imgs = collectableImages(el);

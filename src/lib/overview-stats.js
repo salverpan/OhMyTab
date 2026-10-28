@@ -90,7 +90,8 @@ export function computeOverviewStats(groups, { days = 14, now = Date.now() } = {
   const calibration = CONFIDENCE_ORDER.map(() => NOTE_STATUS_ORDER.map(() => 0));
   let judgedTotal = 0;
   for (const row of notes) {
-    const n = row.note || row;
+    const n = row.note;
+    if (!n) continue; // 研究 artifact 只计「近 14 天新增」，不进状态 / 校准矩阵
     if (n.kind === 'observation') continue; // 观测只是数据点，不参与状态 / 校准统计
     judgedTotal += 1;
     const status = NOTE_STATUS_ORDER.includes(n.status) ? n.status : 'open';
@@ -139,8 +140,8 @@ export function activityOption(stats) {
       },
     },
     axis: {
-      x: { title: false, labelFontSize: 10, labelAutoHide: true },
-      y: { title: false, labelFontSize: 10, grid: true, gridStrokeOpacity: 0.35 },
+      x: { title: false, labelFontSize: 10, labelAutoHide: true, tick: false, grid: false, line: false },
+      y: { title: false, label: false, tick: false, grid: false, line: false },
     },
     legend: { color: { position: 'top', itemMarkerSize: 8, itemLabelFontSize: 10 } },
     style: { maxWidth: 16 },

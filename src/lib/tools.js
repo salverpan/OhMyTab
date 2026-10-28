@@ -3,6 +3,64 @@
 // each tool has a name, description, and JSON Schema parameters.
 
 import { SUBAGENT_MAX_PARALLEL } from './limits.js';
+import { FRAMEWORK_CATALOG } from './analysis-frameworks.js';
+
+const ANALYSIS_SCHEMA = {
+  type: 'object',
+  description: '观点契约。事实必须有据；判断可超出原文，但必须明确倾向、框架、反方、建议和证伪条件。',
+  properties: {
+    bottom_line: { type: 'string', description: '一句话核心判断，必须明确，不可两边下注。' },
+    stance: {
+      type: 'object',
+      properties: {
+        direction: { type: 'string', enum: ['support', 'oppose', 'conditional-support', 'conditional-oppose'] },
+        confidence: { type: 'number', description: '0 到 1 之间。' },
+        reason: { type: 'string', description: '为什么持这个倾向。' },
+      },
+      required: ['direction', 'confidence', 'reason'],
+    },
+    framework: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '领域分析框架，如五力、利润池、DCF、ACH、第一性原理。' },
+        id: { type: 'string', enum: FRAMEWORK_CATALOG.map((f) => f.id), description: '框架目录 id。no_framework=不套框架；custom=自定义领域方法，name 必须写具体方法名。' },
+        why: { type: 'string', description: '为什么这个框架适合当前问题。' },
+        limitation: { type: 'string', description: '这个框架可能漏掉什么。' },
+      },
+      required: ['id', 'name', 'why', 'limitation'],
+    },
+    key_judgments: {
+      type: 'array', minItems: 1,
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          statement: { type: 'string' },
+          basis: { type: 'string', description: '依据哪些事实或推理。' },
+          confidence: { type: 'string', enum: ['low', 'medium', 'high'] },
+          falsifier: { type: 'string', description: '什么情况下这个判断会被推翻。' },
+        },
+        required: ['statement', 'falsifier'],
+      },
+    },
+    strongest_countercase: {
+      type: 'object',
+      properties: { argument: { type: 'string' }, response: { type: 'string' } },
+      required: ['argument', 'response'],
+    },
+    recommendation: {
+      type: 'object',
+      properties: {
+        action: { type: 'string' }, conditions: { type: 'string' }, upside: { type: 'string' },
+        downside: { type: 'string' }, stop_condition: { type: 'string' },
+        leading_indicators: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['action', 'conditions', 'downside', 'stop_condition'],
+    },
+    unresolved: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['bottom_line', 'stance', 'framework', 'key_judgments', 'strongest_countercase', 'recommendation'],
+};
 
 const CHAT_TOOLS = [
   {
@@ -302,7 +360,7 @@ const CHAT_TOOLS = [
           action: {
             type: 'string',
             enum: ['number_elements', 'click_number', 'clear_numbers', 'scroll_down', 'scroll_up', 'scroll_to_bottom', 'click_text', 'click', 'click_at', 'hover', 'type', 'press_key', 'select_option', 'open_dropdown', 'select_from_dropdown', 'describe_form', 'wait_for', 'get_element', 'get_table', 'get_links', 'list_clickable', 'wait', 'exec_js', 'navigate', 'go_back', 'screenshot', 'vision_find', 'cdp_click', 'cdp_type', 'ax_snapshot', 'ax_click', 'extract_subtitles', 'vision_read', 'vision_extract', 'exec_js_main', 'capture_network'],
-            description: 'number_elements=给页面元素编号并显示标记(推荐第一步)；click_number=按编号点击；clear_numbers=清除编号标记；scroll_down/up/scroll_to_bottom=滚动(自动检测新内容)；click_text=按文字点击；click=CSS选择器点击；click_at=按坐标点击(selector=x,text=y)；hover=悬停(展开下拉菜单)；type=输入文字(可用char_by_char逐字符)；press_key=按键(Enter/Escape/Tab)；select_option=原生<select>选择(支持selector精确定位)；open_dropdown=打开自定义下拉控件并返回选项列表；select_from_dropdown=从已打开的下拉列表中选择选项；describe_form=扫描页面所有可交互元素并返回结构化描述(含id/selector/label/类型/选项/checked/disabled)；wait_for=等待条件(text_match=appear|disappear|text|network_idle)；get_element=获取元素文本；get_table=提取表格数据；get_links=获取所有链接；list_clickable=列出可点击元素；wait=等待；exec_js=在隔离世界执行JS代码(可访问chrome.runtime、编号状态，但读不到页面框架变量)；navigate=导航到URL；go_back=返回上一页；screenshot=截取当前页面；vision_find=截图发给Vision LLM定位元素并自动点击(DOM检测失败时的兜底)；cdp_click=用CDP派发可信鼠标事件(isTrusted=true；会短暂显示调试横幅)；cdp_type=用CDP派发可信键盘输入；ax_snapshot=用CDP Accessibility Tree获取语义元素列表(role/name/checked/expanded，比number_elements更稳定，自动覆盖Shadow DOM和ARIA)；ax_click=点击ax_snapshot返回的元素编号；extract_subtitles=从当前视频页面提取字幕(通用方案：先读textTracks/DOM叠加层，再从PerformanceResourceTiming找字幕URL并fetch，支持任意视频平台)；vision_read=截图发给Vision LLM回答关于当前页面的问题(页面理解：布局/类型/图片内容，text=问题)；vision_extract=用Vision LLM逐屏OCR提取整页文字(反爬兜底：字体混淆/Canvas/图片文字时用，自动滚动逐屏截图拼接去重)；exec_js_main=在页面主世界执行JS代码(可读__NEXT_DATA__/React fiber/Vue $data等框架全局变量，虚拟列表源数据；结果需JSON可序列化)；capture_network=CDP抓包捕获XHR/Fetch的JSON响应(滚动触发懒加载接口，text=URL过滤词如"api"/"chapter"，返回接口返回的原始结构化数据，绕过字体混淆/Canvas)。',
+            description: 'number_elements=给页面元素编号并显示标记(推荐第一步)；click_number=按编号点击；clear_numbers=清除编号标记；scroll_down/up/scroll_to_bottom=滚动(自动检测新内容)；click_text=按文字点击；click=CSS选择器点击；click_at=按坐标点击(selector=x,text=y)；hover=悬停(展开下拉菜单)；type=输入文字(可用char_by_char逐字符)；press_key=按键(Enter/Escape/Tab)；select_option=原生<select>选择(支持selector精确定位)；open_dropdown=打开自定义下拉控件并返回选项列表；select_from_dropdown=从已打开的下拉列表中选择选项；describe_form=扫描页面所有可交互元素并返回结构化描述(含id/selector/label/类型/选项/checked/disabled)；wait_for=等待条件(text_match=appear|disappear|text|network_idle)；get_element=获取元素文本；get_table=提取表格数据；get_links=获取所有链接；list_clickable=列出可点击元素；wait=等待；exec_js=在隔离世界执行JS代码(可访问chrome.runtime、编号状态，但读不到页面框架变量)；navigate=导航到URL；go_back=返回上一页；screenshot=截取当前页面(不回传像素，自用视觉请用 vision_*)；vision_find=截图发给Vision LLM定位元素并自动点击(DOM检测失败时的兜底)；cdp_click=用CDP派发可信鼠标事件(isTrusted=true；会短暂显示调试横幅)；cdp_type=用CDP派发可信键盘输入；ax_snapshot=用CDP Accessibility Tree获取语义元素列表(role/name/checked/expanded，比number_elements更稳定，自动覆盖Shadow DOM和ARIA)；ax_click=点击ax_snapshot返回的元素编号；extract_subtitles=从当前视频页面提取字幕(通用方案：先读textTracks/DOM叠加层，再从PerformanceResourceTiming找字幕URL并fetch，支持任意视频平台)；vision_read=截图发给Vision LLM回答关于当前页面的问题(页面理解：布局/类型/图片内容，text=问题)；vision_extract=用Vision LLM逐屏OCR提取整页文字(反爬兜底：字体混淆/Canvas/图片文字时用，自动滚动逐屏截图拼接去重)；exec_js_main=在页面主世界执行JS代码(可读__NEXT_DATA__/React fiber/Vue $data等框架全局变量，虚拟列表源数据；结果需JSON可序列化)；capture_network=CDP抓包捕获XHR/Fetch的JSON响应(滚动触发懒加载接口，text=URL过滤词如"api"/"chapter"，返回接口返回的原始结构化数据，绕过字体混淆/Canvas)。',
           },
           text: {
             type: 'string',
@@ -342,13 +400,23 @@ const CHAT_TOOLS = [
     function: {
       name: 'search_web',
       description:
-        '搜索互联网，返回搜索结果摘要（标题+片段+真实来源URL），不含全文。用的是设置里当前选中的搜索渠道（结果方括号里是渠道名）。没填 Key 会直接失败；其它失败会改用网页抓取。适合快速事实核查。需要详细内容时：先搜索拿到 URL，再用 interact_page(navigate:url) 打开页面，然后 read_current_page 获取完整正文。',
+        '搜索互联网，返回搜索结果（标题+摘要+真实来源URL）。DeepSeek 原生渠道默认同时返回每条结果的正文（need_content=true），可以直接阅读，不必再打开网页；其它渠道只返回摘要。结果过长会写入工作区并给 doc_id，用 read_section 续读。适合事实核查和快速调研；需要交互、登录或打开最新页面时再访问网页。',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
             description: '搜索关键词，支持中英文。越具体越好。',
+          },
+          count: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 50,
+            description: '返回条数，默认 10。仅 DeepSeek 原生渠道生效。',
+          },
+          need_content: {
+            type: 'boolean',
+            description: '是否返回正文，默认 true。仅 DeepSeek 原生渠道生效；设为 false 只取摘要，节省上下文。',
           },
         },
         required: ['query'],
@@ -459,14 +527,11 @@ const CHAT_TOOLS = [
     function: {
       name: 'collect_content',
       description:
-        '【两阶段采集 · 第 1 步】把网页 URL 或一段文本「暂存」起来，**不会真的写入来源**。' +
-        '**优先传 URL**：如果你从 search_web 结果或 RSS 条目中拿到了 http(s) 链接，务必把链接作为 source 传入，而不是粘贴正文文本。' +
-        '链接若是 PDF / Word（.docx .doc）/ Excel（.xlsx .xls）/ CSV / Markdown / 纯文本，会用阅读器抽正文再暂存，不要改贴二进制。' +
-        '只有确实没有链接（如纯文本消息、用户直接粘贴的内容）时才传文本。' +
-        '调用后必须等用户明确口头确认（"确认/加入/可以/入库"等），才能调用 confirm_collect 真正入库；' +
-        '若用户说"算了/不要/取消"则调用 cancel_collect。' +
-        '一次只能暂存一条；多条新闻请逐条处理（暂存 -> 等确认 -> 入库 -> 再下一条）。' +
-        '禁止：①未等用户回应就连续多次 collect_content；②自己替用户调 confirm_collect；③对同一 URL/文本重复 collect_content。',
+        '直接把网页 URL 或一段文本加入来源。你自行判断内容是否值得入库，不需要用户再确认；用户只看结果。' +
+        '**优先传 URL**：从 search_web 结果或 RSS 条目拿到 http(s) 链接时，务必传链接，而不是粘贴正文。' +
+        '链接若是 PDF / Word / Excel / CSV / Markdown / 纯文本，会用阅读器抽正文；不要改贴二进制。' +
+        '只有确实没有链接（如用户直接粘贴的纯文本）时才传文本。一次一条；同一 URL/文本不要重复入库。' +
+        '不要用本工具保存 AI 自己生成的报告或推测；AI 产出走 create_document / write_document。',
       parameters: {
         type: 'object',
         properties: {
@@ -476,40 +541,6 @@ const CHAT_TOOLS = [
           },
         },
         required: ['source'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'confirm_collect',
-      description:
-        '【两阶段采集 · 第 2 步】把上次 collect_content 暂存的内容真正写入来源。' +
-        '只有在以下两种情况之一时才允许调用：' +
-        '①用户在你给出暂存预览后，明确表达了"确认/加入/入库/可以"等积极意图；' +
-        '②用户最初的请求里就显式说了"直接入库/帮我加入来源"。' +
-        '禁止：用户没说话、说"看看/再说/等等/不确定"时调用本工具。',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'cancel_collect',
-      description:
-        '【两阶段采集 · 撤销】取消上次 collect_content 的暂存内容，不入库。' +
-        '用户说"算了/不要/取消/放弃"或暂存内容明显不符合预期时使用。',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'clear_context',
-      description: '清空对话上下文，重新开始。用户说"清空""忘记""重新来"时使用。调用后对话历史归零。',
-      parameters: {
-        type: 'object',
-        properties: {},
       },
     },
   },
@@ -555,7 +586,8 @@ const CHAT_TOOLS = [
         '④ 按日计数画图：mode="by_day"，返回稀疏 {date:YYYY-MM-DD UTC, count}[]，可直接交给 plot_chart；split_by_feed=true 时每项带 feed_title。' +
         '⑤ 想拿全文才能作答：先 query 拿 id，再 fetch_feed_items 批量入库后按 doc_id 回读。' +
         '⑥ 结果多想翻页：把 next_cursor 传给下一次调用的 cursor。' +
-        '⑦ 用户要「最新/刚刚」的条目：先 refresh_feeds 再 query。',
+        '⑦ 用户要「最新/刚刚」的条目：先 refresh_feeds 再 query。' +
+        '⑧ 订阅日报/推荐 N 篇：本工具返回的 title/summary/link/published_at 即可成文，不要为日报批量 fetch 全文。',
       parameters: {
         type: 'object',
         properties: {
@@ -662,7 +694,8 @@ const CHAT_TOOLS = [
         '批量把多条 RSS 条目的全文写入工作区，一次最多 15 条。' +
         '返回 JSON：{ items: [ { id, title, link, feed_title, published_at, doc_id, chars } ], errors: [] }。' +
         '**不回正文**：用 read_section(doc_id) 按需抽片段。' +
-        '**触发条件**：用户要求「总结这几条」「对比这几条」「翻译以下 N 条」等一次需要多条全文的场景。',
+        '**触发条件**：用户要求「总结这几条」「对比这几条」「翻译以下 N 条」等一次需要多条全文的场景。' +
+        '订阅日报、推荐 N 篇新闻不要用本工具——用 query_feed_items 的标题和摘要直接写。',
       parameters: {
         type: 'object',
         properties: {
@@ -739,7 +772,7 @@ const CHAT_TOOLS = [
         '典型场景：' +
         '① 用户明确说「压缩上下文 / 清一下上下文 / 太长了 / compact」；' +
         '② 你自己判断当前对话已经跑得很长、后续任务需要更清爽的上下文。' +
-        '与 clear_context 的区别：clear_context 直接清空，auto_compact 保留摘要。默认最近 ~32000 tokens 会原样保留。',
+        '清空对话由用户自己在界面删除，不通过 AI 工具执行；本工具只做压缩并保留摘要。默认最近 ~32000 tokens 会原样保留。',
       parameters: {
         type: 'object',
         properties: {
@@ -1008,13 +1041,14 @@ const CHAT_TOOLS = [
     function: {
       name: 'place_images',
       description:
-        '把页面上的图取来交给对话、网页编辑器或正在写的文档。来源只做中转，交货后默认删掉，不要让用户自己复制粘贴。' +
+        '把页面上的图或用户指定区域交给对话、网页编辑器或正在写的文档。只用于用户明确要图/截图/贴图；Agent 自己看页面用 vision_read / vision_find / vision_extract，不要为了自己看图调用本工具。' +
+        '默认 persist=transient：来源只做中转，交付后清理。只有用户明确说保存到来源/入库/留着/存图时，才传 persist=source；图片会作为 kind=image 的来源条目保留。' +
+        '用户说截屏/截图/screenshot 时传 screenshot=true。可传 region_selector（优先）或 region={x,y,w,h}（视口 CSS 像素）只截指定元素/区域；不传则截整个可见视口。看完若要正文原图，用 figs 再调一次。' +
         '能拉原图（jpg/jpeg/png/webp/gif）就拉；跨域/防盗链失败则对元素截图。一次最多 8 张。' +
         'to=chat：图出现在当前对话。to=editor：插入指定标签页的可编辑区（公众号正文、邮件正文等），先让用户打开该页或传 editor_tab_id；点进正文再调更稳，可用 selector。' +
         'to=document：写入已有 doc_id，或带 title 新建 docx；两者都没有则返回 ![说明](img:id)。写研报/方案时，把材料里有意义的流程图、示意图、折线/柱状图这样取来，引用行原样写进 write_document 的 brief（format=docx），不要用 plot_chart 重画已有的图。' +
         '引用阅读结果里的正文图：传 figs=[{n, tab_id 或 url}]，n 是 data.figures 的编号，封面用 n=0。按给出的顺序一对一取，不在清单里的图不会另找。来源页已关闭时传该页 url，会重新打开再按编号取，不会改去当前前台页。' +
         '用户给出确切图片地址时才用 urls（整段地址相等才算同一张）。selectors 只在用户点名了页面元素时用。' +
-        '用户说截屏/截图/screenshot 时必须 screenshot=true：先截当前视口交给对话和模型看。看完若要正文原图，用 figs 再调一次。' +
         '不要在用户只要截屏时去扒页面 <img>。',
       parameters: {
         type: 'object',
@@ -1025,6 +1059,18 @@ const CHAT_TOOLS = [
             description: 'chat=显示在对话；editor=插入网页编辑器；document=写入 Word。默认 chat。',
           },
           tab_id: { type: 'number', description: '取图的标签页。省略=当前页。' },
+          region_selector: { type: 'string', description: 'screenshot 区域元素 CSS 选择器（优先于 region）。会先滚进视口再截该元素。只支持当前文档顶层 DOM。' },
+          region: {
+            type: 'object',
+            description: 'screenshot 的可见视口区域，CSS 像素；不传 region_selector 时生效。',
+            properties: {
+              x: { type: 'number', description: '区域左上角 x（相对视口）' },
+              y: { type: 'number', description: '区域左上角 y（相对视口）' },
+              w: { type: 'number', description: '区域宽度' },
+              h: { type: 'number', description: '区域高度' },
+            },
+            required: ['x', 'y', 'w', 'h'],
+          },
           editor_tab_id: { type: 'number', description: 'to=editor 时插入的标签页。省略=当前页或 tab_id。' },
           selector: { type: 'string', description: 'to=editor 时编辑器 CSS 选择器。省略=当前焦点或第一个 contenteditable。' },
           figs: {
@@ -1057,11 +1103,15 @@ const CHAT_TOOLS = [
           },
           screenshot: {
             type: 'boolean',
-            description: 'true=立刻截当前视口（用户说截屏时用这个），不再扒 <img>。截图会给用户看，也会作为下一轮视觉输入。看完若要原图，再用 urls/selectors 调一次。',
+            description: 'true=截图（用户说截屏时用这个），不再扒 <img>。可与 region_selector/region 同用；传了区域参数时即使省略 screenshot 也按截图处理。截图会给用户看，也会作为下一轮视觉输入。',
           },
           doc_id: { type: 'string', description: 'to=document 时写入的已有文档 id。' },
           title: { type: 'string', description: 'to=document 且没有 doc_id 时，用这个标题新建 docx。' },
-          keep: { type: 'boolean', description: 'true=交货后仍留在来源。默认 false（用完即弃）。' },
+          persist: {
+            type: 'string',
+            enum: ['transient', 'source'],
+            description: 'transient（默认）=交付后清理，不进来源；source=作为图片条目保存到来源。只有用户明确要求保存/入库时才用 source。',
+          },
         },
       },
     },
@@ -1336,7 +1386,8 @@ const CHAT_TOOLS = [
         '不要用：一次 search_web 摘要就能答；只读用户当前页；改一个已勾选条目。\n' +
         '必须用：两路及以上独立检索/读多源全文；会刷爆主对话的调研；页面自动化支线。用户不必 @。\n' +
         '同一条消息可并行多个 task（最多 {{SUBAGENT_MAX_PARALLEL}}）；覆盖不全可再补一波，只补缺口不要重做。也可同时 read_current_page。派出去后不要自己再做同一件事。\n' +
-        '阅读任务的 prompt 写明要回答的问题。explore 的 summary 是判断、数字和对不上的地方，passages 是原文。只会让判断反过来的缺口才再派。判断够了调用 write_document。task_id 续传同一子会话。\n' +
+        '阅读任务的 prompt 写明要回答的问题。explore 先用 write_research_artifact 写完整笔记，再交回 summary + artifact_id + sources + gaps。只会让判断反过来的缺口才再派。判断够了调用 write_document。task_id 续传同一子会话。\n' +
+        '返回 incomplete/error 且文案含「网络中断」：立刻用同一 task_id 续传，不要重新派、不要换 prompt。\n' +
         'background=true 仅侧栏（立刻返回，完成后回注）；浮动窗会忽略并前台等待。不要轮询后台任务。',
       parameters: {
         type: 'object',
@@ -1347,7 +1398,7 @@ const CHAT_TOOLS = [
           },
           prompt: {
             type: 'string',
-            description: '给子代理的完整任务书。阅读任务写明要回答的问题，要求交回判断、关键数字、对不上的地方，并附原文段落。不要只写「查一下 X」。',
+            description: '给子代理的完整任务书。阅读任务写明要回答的问题，要求交回判断、关键数字、对不上的地方；完整笔记写 artifact，交回 summary/artifact_id/sources/gaps。不要只写「查一下 X」。',
           },
           subagent_type: {
             type: 'string',
@@ -1375,73 +1426,152 @@ const CHAT_TOOLS = [
     function: {
       name: 'write_document',
       description:
-        '按用户要的体裁，用本会话 explore 交回的原文段落写成文档并保存到「产出」。'
-        + '运行时先写判断，再只删编造的数字，结论留着。研报定稿后另挂出处，不改已经写好的句子。'
+        '按用户要的体裁写成文档并保存到「产出」。材料用本会话 explore 的研究笔记（artifact_id）、claims 里的逐字引文，或旧的 passages。'
+        + '只有笔记、没有 passages 时直接写，不要为此再派一轮阅读。'
+        + '运行时先写判断，再只删编造的数字，结论留着。研报在有逐字引文时才另挂出处。'
         + '返回 need_reading 时文档未保存，只因为有编造的数字。不要因为结论原文里没有就退回。'
-        + '成功后只告诉用户已保存。不要用：用户已经给了全文的表格或文案（用 create_document）；还没有 passages 时先派阅读。',
+        + '必须传 analysis：明确选边、领域框架、最强反方、建议与代价；写后调用 review_argument，事实再用 check_facts。'
+        + '成功后只告诉用户已保存。不要用：用户已经给了全文的表格或文案（用 create_document）。',
       parameters: {
         type: 'object',
         properties: {
+          analysis: ANALYSIS_SCHEMA,
           genre: { type: 'string', description: '体裁，如策划方案、纪要、研报、对比、档案。决定章节，不套固定研报结构。' },
           audience: { type: 'string', description: '读者是谁。' },
           brief: { type: 'string', description: '这份文档要写什么、怎样算好、范围口径。材料里的流程图/示意图/数据图先 place_images 取到，再把 ![说明](img:id) 原样写在这里。写作阶段看不到对话，这里要写全。' },
           must_cover: { type: 'array', items: { type: 'string' }, description: '必须覆盖的要点。' },
           title: { type: 'string', description: '文档标题。留空从正文取。' },
-          task_ids: { type: 'array', items: { type: 'string' }, description: '只用这些子任务的段落。会话里有无关旧任务时必须传。' },
+          task_ids: { type: 'array', items: { type: 'string' }, description: '只用这些子任务的材料。会话里有无关旧任务时必须传。' },
+          artifact_ids: { type: 'array', items: { type: 'string' }, description: 'explore 交回的 artifact_id。子任务还在本会话时可以不传，写作会自己去取。' },
           format: { type: 'string', enum: ['md', 'docx'], description: '默认 md。用户要 Word、或 brief 里有 img: 引用时用 docx，图才会嵌进文件。' },
           tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
         },
-        required: ['genre', 'brief'],
+        required: ['genre', 'brief', 'analysis'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'compose_report',
+      name: 'write_research_artifact',
       description:
-        '与 write_document 相同，保留给旧调用。新任务请调用 write_document。',
+        '把完整研究笔记写入工作区，返回 artifact_id。'
+        + 'artifact 是研究笔记，不是可引用事实来源；事实来源仍用原始 doc_id#anchor 或 URL。'
+        + '提交 submit_research 前先调用本工具。',
       parameters: {
         type: 'object',
         properties: {
-          title: { type: 'string', description: '报告标题。留空由骨架生成。' },
-          question: {
-            type: 'string',
-            description: '报告要回答的核心问题，用用户的话并带上范围确认后的口径（对象、时间窗、地域）。',
+          title: { type: 'string', description: '研究笔记标题。' },
+          text: { type: 'string', description: '完整笔记：材料、来源、判断、矛盾和未解决问题。' },
+        },
+        required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'load_framework',
+      description:
+        '按 id 加载领域分析框架方法卡。目录在动态前言；选择框架后调用本工具获取必需输入、步骤、输出契约、常见错误和评审标准。'
+        + '最多一个主框架 + 一个辅助框架，禁止框架沙拉。',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', enum: FRAMEWORK_CATALOG.map((f) => f.id) },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'analyst_memo',
+      description:
+        '生成 Analyst Memo + Red Team 中间产物并写入工作区。'
+        + '它把材料转成明确判断、框架、关键判断、最强攻击、脆弱假设、翻转证据和建议代价。'
+        + 'Deep Research 在 write_document 前必须调用；成功后把返回的 analysis 原样传给 write_document。',
+      parameters: {
+        type: 'object',
+        properties: {
+          analysis: ANALYSIS_SCHEMA,
+          red_team: {
+            type: 'object',
+            properties: {
+              strongest_attack: { type: 'string' },
+              vulnerable_assumptions: { type: 'array', items: { type: 'string' } },
+              evidence_that_would_flip: { type: 'array', items: { type: 'string' } },
+              response: { type: 'string' },
+              residual_uncertainty: { type: 'string' },
+            },
+            required: ['strongest_attack', 'vulnerable_assumptions', 'evidence_that_would_flip', 'response'],
           },
-          brief: {
-            type: 'string',
-            description: '调研简报：用户关心的角度、用途、排除项、范围确认卡的答案。写作阶段看不到对话，这里要写全。',
-          },
-          audience: { type: 'string', description: '读者是谁（如“投研团队”“产品负责人”），决定措辞深浅。' },
-          hypotheses: {
+        },
+        required: ['analysis'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'check_facts',
+      description:
+        '只核验事实层：给定 claims 或 task_ids，回读来源、匹配逐字 quote、运行 entailment 与独立信源计数。'
+        + '它不判断观点是否激进，也不要求结论逐字符合原文；判断质量用 review_argument。'
+        + '不要用它替代研究；没有证据句柄的内容先补调研。',
+      parameters: {
+        type: 'object',
+        properties: {
+          claims: {
             type: 'array',
-            items: { type: 'string' },
-            description: '派任务前提出的待检验假设；报告会逐条给出支持 / 削弱 / 无法判断。',
-          },
-          analyst_notes: {
-            type: 'string',
-            description: '你自己读页或对话中得到、但没进核验的观察。只作背景，不会被当成事实写进正文。',
+            description: '要核验的事实主张。每条必须带 evidence[{doc_id,anchor,quote}]。',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                claim: { type: 'string' },
+                attribution: { type: 'string' },
+                modality: { type: 'string', enum: ['confirmed', 'claimed', 'reported', 'denied', 'assessed', 'speculative'] },
+                confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+                evidence: {
+                  type: 'array', minItems: 1,
+                  items: {
+                    type: 'object',
+                    properties: {
+                      doc_id: { type: 'string' },
+                      anchor: { type: 'string' },
+                      quote: { type: 'string' },
+                    },
+                    required: ['doc_id', 'anchor', 'quote'],
+                  },
+                },
+              },
+              required: ['claim', 'evidence'],
+            },
           },
           task_ids: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '只用这些子任务的证据。本会话里有不相关的旧任务时必须传；缺省用本会话全部子任务。',
+            type: 'array', items: { type: 'string' },
+            description: '可选。直接核验这些子代理 session 已交回的事实 claims。',
           },
-          notebook_ids: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '额外纳入的笔记本条目 id（verified 的当事实用，open 的只进不确定性）。',
-          },
-          format: { type: 'string', enum: ['md', 'docx'], description: '默认 md；用户要 Word 时 docx。' },
-          length: {
-            type: 'string',
-            enum: ['brief', 'standard', 'deep'],
-            description: 'brief≈1200–2000 字；standard≈2500–5000 字（默认）；deep≈5000–9000 字（用户要深度/完整报告时）。',
-          },
-          tags: { type: 'array', items: { type: 'string' }, description: '1-3 个标签。' },
         },
-        required: ['question'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'review_argument',
+      description:
+        'LLM-only 观点评审：是否明确选边、框架是否合适、是否回应最强反方、建议是否有代价/条件/停止条件、是否过度防御或虚假平衡。'
+        + '它不核验事实真假、不改写正文；事实用 check_facts。write_document 之后必须调用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          analysis: ANALYSIS_SCHEMA,
+          framework_id: { type: 'string', enum: FRAMEWORK_CATALOG.map((f) => f.id), description: '可选。用哪张方法卡的 rubric 评审。' },
+          draft: { type: 'string', description: '可选。要检查的正文/报告 Markdown。' },
+        },
       },
     },
   },
@@ -1525,6 +1655,12 @@ const TOOL_LABELS = {
   task: 'Delegating',
   write_document: 'Writing document',
   compose_report: 'Writing document',
+  check_facts: 'Checking facts',
+  review_argument: 'Reviewing argument',
+  write_research_artifact: 'Saving research notes',
+  load_framework: 'Loading framework',
+  analyst_memo: 'Writing analyst memo',
+  submit_research: 'Submitting research',
 };
 
 /* ============ 工具参数校验（不合法不执行，错误回喂模型自纠重试） ============
@@ -1600,3 +1736,16 @@ export function validateToolArgs(name, args) {
 }
 
 export { CHAT_TOOLS, TOOL_LABELS };
+
+
+
+
+
+
+
+
+
+
+
+
+

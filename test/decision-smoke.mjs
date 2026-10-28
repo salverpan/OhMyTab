@@ -83,8 +83,11 @@ ok(budgetState({ tokens: 0, ms: 1000 }, 0, t0 - 2000).by === 'time', '由耗时�
 ok(budgetState({ tokens: 0, ms: 0 }, 1e9, 0).ratio === 0, '0 = 不限');
 
 const lim = normalizeSubagentLimits(null);
-ok(lim.budgetTokens > 0 && lim.budgetMinutes > 0 && lim.checkChannelId === '', '默认限额');
-ok(normalizeSubagentLimits({ budgetTokens: 0, budgetMinutes: 0 }).budgetTokens === 0, '允许设为不限');
+ok(lim.budgetTokens === 0 && lim.budgetMinutes === 0 && lim.checkChannelId === '', '默认不限 token / 耗时');
+ok(normalizeSubagentLimits({ budgetTokens: 2_000_000 }).budgetTokens === 0, '旧默认 200 万视为未设置');
+ok(normalizeSubagentLimits({ budgetTokens: 2_000_000, limitsVersion: 2 }).budgetTokens === 2_000_000, '升级后用户显式保存的额度保留');
+ok(normalizeSubagentLimits({ budgetTokens: 0, budgetMinutes: 20 }).budgetMinutes === 0, '历史分钟配置被忽略');
+ok(normalizeSubagentLimits({ budgetTokens: 0, limitsVersion: 2 }).budgetTokens === 0, '允许 token 设为不限');
 
 // ---------- 决策板 ----------
 const now = Date.UTC(2026, 9, 7, 12);

@@ -12,7 +12,8 @@
     "webNavigation",
     "alarms",
     "debugger",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"

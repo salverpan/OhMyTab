@@ -17,6 +17,18 @@ export function inferEntryType(entry = {}) {
   return entry.source === 'AI 生成' ? ENTRY_TYPE_OUTPUT : ENTRY_TYPE_SOURCE;
 }
 
+/** 工作区“清空某主干”时受影响的 Entry；图片按 entryType=source 随来源一起清。 */
+export function selectEntriesForTrunkClear(entries = [], trunk = 'all') {
+  const clearSources = trunk === 'sources' || trunk === 'all';
+  const clearOutputs = trunk === 'outputs' || trunk === 'all';
+  if (!clearSources && !clearOutputs) return [];
+  return (Array.isArray(entries) ? entries : []).filter((entry) => {
+    const type = inferEntryType(entry);
+    return (clearSources && type === ENTRY_TYPE_SOURCE)
+      || (clearOutputs && type === ENTRY_TYPE_OUTPUT);
+  });
+}
+
 export function inferEntryProvenanceType(entry = {}) {
   if (entry.provenance && entry.provenance.type) return String(entry.provenance.type);
   if (inferEntryType(entry) === ENTRY_TYPE_OUTPUT) return 'generated';
@@ -75,4 +87,16 @@ export function isCitationEligibleArtifact(doc) {
     && doc.kind !== 'text'
     && doc.provenanceType !== 'generated'
     && (!!String(doc.fullText || doc.text || '').trim() || Number(doc.chars) > 0);
+}
+
+/** 子代理 write_research_artifact / analyst_memo 落的长笔记，应出现在工作区「笔记」。 */
+export function isResearchNoteArtifact(doc = {}) {
+  const via = String(doc.via || '');
+  if (via === 'research-artifact' || via === 'analyst-memo') return true;
+  const url = String(doc.url || '');
+  return url.startsWith('artifact://research/') || url.startsWith('artifact://analyst-memo/');
+}
+
+export function researchNoteBadge(doc = {}) {
+  return String(doc.via || '') === 'analyst-memo' ? '分析备忘' : '研究笔记';
 }

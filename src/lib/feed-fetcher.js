@@ -21,6 +21,9 @@ import {
   countFeedItems,
 } from './feed-db.js';
 import { isRsshubUrl, buildRsshubFallbacks } from './rsshub-fallback.js';
+import { normalizeWebFeedRecipe, normalizeWebFeedItems, normalizeWebpageRefreshMode } from './webfeed-recipe.js';
+import { extractWebpageItemsViaTab } from './webfeed-tab.js';
+import { extractWebpageItemsViaHttp } from './webfeed-http.js';
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36';
 const FETCH_TIMEOUT_MS = 20000;
@@ -318,6 +321,7 @@ export async function subscribe({ url, scope = 'global' }) {
 
   const feed = await dbAddFeed({
     url: finalFeedUrl,
+    kind: 'rss',
     title: parsed.title || finalFeedUrl,
     siteUrl,
     faviconUrl,
@@ -341,6 +345,116 @@ export async function subscribe({ url, scope = 'global' }) {
   return { feed, inserted: parsed.items.length };
 }
 
+function defaultWebpageTitle(pageUrl) {
+  try { return new URL(pageUrl).hostname.replace(/^www\./, ''); } catch (_) { return '网页源'; }
+}
+
+/**
+ * Resolve the webpage refresh transport:
+ *   auto -> HTTP first, rendered tab only when the HTML shell has no items
+ *   http -> direct fetch + offscreen DOMParser, never a tab
+ *   tab  -> always render in an inactive tab (SPA/login compatibility)
+ */
+async function extractWebpageByMode(recipe, { mode = 'auto', maxItems = 200 } = {}) {
+  const refreshMode = normalizeWebpageRefreshMode(mode);
+  const opts = { maxItems: maxItems || 200 };
+
+  if (refreshMode === 'http') {
+    const result = await extractWebpageItemsViaHttp(recipe, {
+      ...opts,
+      timeoutMs: 25000,
+    });
+    if (!result.ok || result.items.length === 0) {
+      throw new Error(result.error || 'HTTP 抓取未匹配到条目，请改用“自动”或“兼容渲染”');
+    }
+    return result;
+  }
+
+  if (refreshMode === 'tab') {
+    const result = await extractWebpageItemsViaTab(recipe, opts);
+    return { ...result, transport: 'tab' };
+  }
+
+  let httpError = '';
+  try {
+    const httpResult = await extractWebpageItemsViaHttp(recipe, {
+      ...opts,
+      timeoutMs: 12000,
+    });
+    if (httpResult.ok && httpResult.items.length > 0) return httpResult;
+    httpError = httpResult.error || 'HTTP 未匹配到条目';
+  } catch (err) {
+    httpError = (err && err.message) || String(err);
+  }
+
+  try {
+    const tabResult = await extractWebpageItemsViaTab(recipe, opts);
+    return {
+      ...tabResult,
+      transport: 'tab',
+      fallbackFrom: 'http',
+      httpError,
+    };
+  } catch (err) {
+    throw new Error(`HTTP 与渲染抓取均失败（HTTP: ${httpError}；渲染: ${(err && err.message) || err}）`);
+  }
+}
+
+/**
+ * Create a feed backed by a visual webpage recipe. The side panel normally
+ * supplies already-previewed items for an immediate first render; if none are
+ * available (manual API use / stale preview) we extract once according to the
+ * selected refresh mode.
+ */
+export async function subscribeWebpage({
+  recipe: recipeInput,
+  title = '',
+  scope = 'global',
+  intervalMin = 0,
+  maxItems = null,
+  refreshMode = 'auto',
+  initialItems = [],
+}) {
+  const recipe = normalizeWebFeedRecipe(recipeInput);
+  const mode = normalizeWebpageRefreshMode(refreshMode);
+  let rawItems = normalizeWebFeedItems(initialItems, recipe.pageUrl, 500);
+  let initialTransport = '';
+
+  if (rawItems.length === 0) {
+    const extracted = await extractWebpageByMode(recipe, { mode, maxItems: maxItems || 200 });
+    rawItems = normalizeWebFeedItems(extracted.items, recipe.pageUrl, 500);
+    initialTransport = extracted.transport || '';
+  }
+  if (rawItems.length === 0) throw new Error('网页中没有抓到可用于订阅的条目');
+
+  const feed = await dbAddFeed({
+    url: recipe.pageUrl,
+    kind: 'webpage',
+    recipe,
+    refreshMode: mode,
+    title: title || defaultWebpageTitle(recipe.pageUrl),
+    siteUrl: recipe.pageUrl,
+    faviconUrl: computeFaviconUrl(recipe.pageUrl),
+    description: '由网页元素创建的自定义订阅源',
+    scope,
+    intervalMin,
+    maxItems,
+  });
+
+  const filters = await effectiveFilters(feed);
+  await ingestItems(feed.id, rawItems, filters);
+  const totalCount = await countFeedItems(feed.id);
+  await updateFeed(feed.id, {
+    lastFetchedAt: Date.now(),
+    lastSuccessAt: Date.now(),
+    lastError: '',
+    lastTransport: initialTransport,
+    totalCount,
+  });
+
+  return { feed: { ...feed, totalCount }, inserted: rawItems.length };
+}
+
 function computeFaviconUrl(url) {
   try {
     const host = new URL(url).hostname;
@@ -350,11 +464,60 @@ function computeFaviconUrl(url) {
   }
 }
 
+/* ---------- Webpage feed refresh ---------- */
+
+async function refreshWebpageFeed(feed) {
+  try {
+    const recipe = normalizeWebFeedRecipe(feed.recipe);
+    const filters = await effectiveFilters(feed);
+    const refreshMode = normalizeWebpageRefreshMode(feed.refreshMode);
+    const extracted = await extractWebpageByMode(recipe, {
+      mode: refreshMode,
+      maxItems: filters.maxItems || 200,
+    });
+    if (!extracted.ok) throw new Error(extracted.error || '网页抓取失败');
+    const rawItems = normalizeWebFeedItems(extracted.items, recipe.pageUrl, 500);
+    if (rawItems.length === 0) {
+      throw new Error('网页中没有匹配到条目，网站结构可能已变化');
+    }
+    const { inserted, skipped } = await ingestItems(feed.id, rawItems, filters);
+    const totalCount = await countFeedItems(feed.id);
+    await updateFeed(feed.id, {
+      recipe,
+      refreshMode,
+      siteUrl: recipe.pageUrl,
+      lastFetchedAt: Date.now(),
+      lastSuccessAt: Date.now(),
+      lastError: '',
+      lastTransport: extracted.transport || '',
+      lastFallbackReason: extracted.fallbackFrom ? (extracted.httpError || '') : '',
+      totalCount,
+    });
+    return {
+      feedId: feed.id,
+      inserted,
+      skipped,
+      notModified: false,
+      kind: 'webpage',
+      matched: extracted.matched,
+      transport: extracted.transport || '',
+      fallbackFrom: extracted.fallbackFrom || '',
+    };
+  } catch (err) {
+    await updateFeed(feed.id, {
+      lastFetchedAt: Date.now(),
+      lastError: err.message || String(err),
+    });
+    throw err;
+  }
+}
+
 /* ---------- Refresh one feed ---------- */
 
 export async function refreshFeed(feedId) {
   const feed = await getFeed(feedId);
   if (!feed) throw new Error('订阅源不存在');
+  if (feed.kind === 'webpage') return refreshWebpageFeed(feed);
 
   try {
     const { resp, finalUrl, fallbackUsed, allFailed, lastReason } =
@@ -470,7 +633,11 @@ async function ingestItems(feedId, rawItems, feed = null) {
   for (const raw of items) {
     if (!raw.guid && !raw.link) continue;
     const id = await makeItemId(feedId, raw.guid, raw.link);
-    const publishedAt = Number.isFinite(raw.publishedAt) ? raw.publishedAt : now;
+    const hasExplicitDate = Number.isFinite(raw.publishedAt) && raw.publishedAt > 0;
+    // No-date sources (common for webpage feeds) need a visible order on first
+    // ingest. Future refreshes preserve this first-seen time via
+    // preservePublishedAt instead of making all old items look new.
+    const publishedAt = hasExplicitDate ? raw.publishedAt : now - prepared.length * 1000;
     prepared.push({
       id, feedId,
       guid: raw.guid || '',
@@ -479,9 +646,11 @@ async function ingestItems(feedId, rawItems, feed = null) {
       originalTitle: raw.originalTitle || '',
       author: (raw.author || '').slice(0, 200),
       publishedAt,
+      preservePublishedAt: !!raw.preservePublishedAt || !hasExplicitDate,
       summary: (raw.summary || '').slice(0, 2000),
       originalSummary: raw.originalSummary || '',
       originalFullText: '',
+      coverUrl: raw.coverUrl || '',
       sourceLanguage: raw.sourceLanguage || '',
       translated: !!raw.translated,
       translatedTo: raw.translatedTo || '',

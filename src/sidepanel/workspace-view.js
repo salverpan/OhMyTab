@@ -2,14 +2,14 @@
  * 工作区视图 —— 来源 / 笔记 / 产出三主干 + 统一预览。
  *
  * 来源 / 产出 来自 entries（+ 深度任务读到、尚未加入来源的网页）
- * 笔记 来自 notebook_{projectId}
+ * 笔记 来自 notebook_{projectId} 的短结论，以及 write_research_artifact 落的长研究笔记
  */
 
 import { listNotes, formatSource, removeNote, updateNote } from '../lib/notebook.js';
 import { logActivity } from '../lib/activity-log.js';
 import { listArtifacts, getArtifact, readSection, deleteArtifact, updateArtifact } from '../lib/artifact-store.js';
 import { getDocFile } from '../lib/doc-store.js';
-import { inferEntryType } from '../lib/source-model.js';
+import { inferEntryType, isResearchNoteArtifact, researchNoteBadge } from '../lib/source-model.js';
 import { mountChart, disposeChartHost } from '../lib/chat-charts.js';
 import { createTimelineView } from './timeline-view.js';
 import { computeOverviewStats, buildOverviewCharts } from '../lib/overview-stats.js';
@@ -93,7 +93,7 @@ function canOpenUrl(e) {
 function rowUrl(row) {
   if (row.kind === 'entry') return canOpenUrl(row.entry) ? row.entry.url : '';
   const u = row.artifact?.url;
-  if (row.kind === 'artifact' && u && !String(u).startsWith('local://')) return u;
+  if (row.kind === 'artifact' && u && /^https?:\/\//i.test(u)) return u;
   return '';
 }
 
@@ -225,10 +225,25 @@ export function createWorkspaceView(opts) {
       }
     }
 
-    // AI 深度任务读过但未形成 Entry 的网页 → 来源（按 URL 去重）
+    const researchNotes = [];
+    // AI 深度任务读过但未形成 Entry 的网页 → 来源；子代理研究笔记 → 笔记
     try {
-      const arts = await listArtifacts({ limit: 80, projectId: pid });
+      const arts = await listArtifacts({ limit: 200, projectId: pid });
       for (const a of arts) {
+        if (isResearchNoteArtifact(a)) {
+          researchNotes.push({
+            key: `notes:art:${a.doc_id}`,
+            trunk: 'notes',
+            kind: 'artifact',
+            id: a.doc_id,
+            title: a.title || '研究笔记',
+            badge: researchNoteBadge(a),
+            subtitle: a.chars ? `${a.chars} 字` : '',
+            updatedAt: a.updatedAt,
+            artifact: a,
+          });
+          continue;
+        }
         const url = String(a.url || '');
         if (url && entryUrls.has(url)) continue;
         if (a.sourceEntryId && entryIds.has(String(a.sourceEntryId))) continue;
@@ -247,7 +262,7 @@ export function createWorkspaceView(opts) {
       }
     } catch (_) { /* ignore */ }
 
-    const notes = (await listNotes(pid)).map((n) => ({
+    const claimNotes = (await listNotes(pid)).map((n) => ({
       key: `notes:${n.id}`,
       trunk: 'notes',
       kind: 'note',
@@ -258,6 +273,8 @@ export function createWorkspaceView(opts) {
       updatedAt: n.updatedAt || n.createdAt,
       note: n,
     }));
+    const notes = [...researchNotes, ...claimNotes]
+      .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
 
     const q = searchQuery.trim().toLowerCase();
     const filter = (rows) => {
@@ -468,15 +485,21 @@ export function createWorkspaceView(opts) {
           <pre class="ws-preview-text">${escHtml(body)}${more}</pre>
         </div>`;
     } else if (row.kind === 'artifact') {
-      els.previewBody.innerHTML = '<p class="ws-muted">正在读取证据原文…</p>';
+      const research = isResearchNoteArtifact(row.artifact || {});
+      els.previewBody.innerHTML = research
+        ? '<p class="ws-muted">正在读取研究笔记…</p>'
+        : '<p class="ws-muted">正在读取证据原文…</p>';
       const doc = await getArtifact(row.id).catch(() => null);
       if (epoch !== previewEpoch || selectedKey !== row.key) return;
-      const body = String(doc?.fullText || '').slice(0, 4000);
+      const full = String(doc?.fullText || '');
+      const cap = research ? 40000 : 4000;
+      const body = full.slice(0, cap);
+      const href = /^https?:\/\//i.test(String(row.artifact?.url || '')) ? row.artifact.url : '';
       els.previewBody.innerHTML = `
         <div class="ws-preview-entry">
-          ${row.artifact?.url ? `<p class="ws-preview-url"><a href="${escAttr(row.artifact.url)}" target="_blank" rel="noopener">${escHtml(row.artifact.url)}</a></p>` : ''}
-          <p class="ws-preview-summary">${escHtml(row.subtitle || '')}</p>
-          <pre class="ws-preview-text">${escHtml(body || '')}${String(doc?.fullText || '').length > 4000 ? '\n\n…' : ''}</pre>
+          ${href ? `<p class="ws-preview-url"><a href="${escAttr(href)}" target="_blank" rel="noopener">${escHtml(href)}</a></p>` : ''}
+          ${research ? '' : `<p class="ws-preview-summary">${escHtml(row.subtitle || '')}</p>`}
+          <pre class="ws-preview-text">${escHtml(body || '')}${full.length > cap ? '\n\n…' : ''}</pre>
         </div>`;
     } else if (row.kind === 'note') {
       const n = row.note;

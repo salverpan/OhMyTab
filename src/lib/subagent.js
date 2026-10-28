@@ -18,7 +18,7 @@ import {
 } from './chat-executor.js';
 import { formatMemoriesBlock } from './agent-memory.js';
 import { CHAT_TOOLS } from './tools.js';
-import { SUBMIT_REPORT_TOOL } from './task-report.js';
+import { SUBMIT_RESEARCH_TOOL, formatResearchTaskResult } from './research-result.js';
 import { SECTION_JOB_TOOL, runSectionJob } from './section-worker.js';
 import { runCheckPipeline, verificationForMain } from './check/index.js';
 import { getAiChannels, getCustomSubagents, getSubagentLimits, resolveChannelModel } from './storage.js';
@@ -32,7 +32,10 @@ import {
   BUILTIN_AGENTS, AGENT_NAME_RE, parseAgentMentions, validateCustomAgent,
   formatAgentCatalog, filterToolsForAgent, allowedToolNames, formatTaskResult,
   revisionRequestFor, serializeSubagentSessions, restoreSubagentSessions,
+  classifySubagentLlmError, subagentHasRecoverableProgress,
+  SUBAGENT_LLM_NETWORK_RECOVERIES, SUBAGENT_NETWORK_RESUME_HINT,
 } from './subagent-core.js';
+import { isRetryableNetworkError, networkSleep } from './net-retry.js';
 import { appendViewportShots } from './tool-round-messages.js';
 import { emitUsage, usageTotalTokens } from './usage.js';
 import { logActivity } from './activity-log.js';
@@ -42,6 +45,8 @@ export {
   BUILTIN_AGENTS, parseAgentMentions, validateCustomAgent, formatAgentCatalog,
   filterToolsForAgent, formatTaskResult, revisionRequestFor,
   serializeSubagentSessions, restoreSubagentSessions,
+  classifySubagentLlmError, subagentHasRecoverableProgress,
+  SUBAGENT_LLM_NETWORK_RECOVERIES, SUBAGENT_NETWORK_RESUME_HINT,
 };
 
 export async function listAgents() {
@@ -147,21 +152,23 @@ function childSystemPrompt(agent, maxTabs = SUBAGENT_MAX_TABS) {
     '禁止调用 task。禁止 clear_context / suggest_actions / ask_research_scope / manage_heartbeat / save_memory。',
     '经验记忆只读：系统会按当前页与任务自动注入相关条目（如有）。不要调用 save_memory；值得记的经验写进给父代理的报告即可。',
     `标签预算：同时最多打开 ${maxTabs} 个标签页。读完不需要的先 manage_tabs(close, tab_id) 关掉再开新的——读过的内容仍在你的上下文里，不必为留着标签而占额度。`,
-    '任务完成后必须调用 submit_report。自然语言正文、Markdown 或自称“已完成”都不算交回。',
+    '任务完成后必须调用 submit_research。自然语言正文、Markdown 或自称“已完成”都不算交回。',
+    '完整笔记先调用 write_research_artifact 保存，拿到 artifact_id；再把 summary、artifact_id、sources、gaps 交给 submit_research。',
+    '事实必须有据；判断可以超出原文，但必须明确倾向，禁止用视情况而定或两边下注替代结论。重要判断写清依据、最强反方和证伪条件。',
     ...(agent.name === 'explore'
       ? [
         'summary 写你的判断、关键数字、对不上的地方。数字必须来自打开的原文。',
-        'passages 留下 use、doc_id、anchor、逐字 quote，供核对和挂出处。claims 传空数组。',
-        '会让判断反过来、但没找到原文的点写进 unresolved。不要写整篇研报。',
+        '原文和来源写进 write_research_artifact；sources 用 doc_id#anchor 或 URL。有可核查事实才附 claims，纯判断可以不带 claims。',
+        '会让判断反过来、但没找到原文的点写进 gaps。不要写整篇研报。',
       ]
       : [
-        '事实拆成 claims；每条 evidence 必须给 doc_id、锚点和来源逐字 quote。只有 URL、标签页 id 或转述的内容放 unresolved，不得伪造证据。',
+        '完整笔记写进 write_research_artifact；sources 用 doc_id#anchor 或 URL。只把可核查事实拆成 claims，每条 evidence 必须给 doc_id、锚点和逐字 quote；转述或没有原文的内容写进 gaps，不得伪造证据。',
         '每条 claim 写明 attribution（最初是谁说的，不是转载网站）与 modality。当事方的说法是 claimed，媒体转述是 reported，不要把它们写成 confirmed；claim 句子本身也要保留“X 称”。',
-        '查过但没找到的方向也写进 unresolved。操作型任务把已执行动作写入 actions；没有事实 claim 时 claims 可以为空。',
+        '查过但没找到的方向写进 gaps。操作型任务把已执行动作写入 actions；没有事实 claim 时 claims 可以为空。',
       ]),
     '单篇长文档超出当前上下文时可调用 section_job。'
       + '返回 content_has_more=true 时，用相同 doc_id 与 goal、只传 offset=content_next_offset 续拉，直到 content_has_more=false。'
-      + '阅读任务把其中的逐字 quote 收进 passages。不要用它代替普通网页检索。',
+      + '阅读任务把其中的逐字 quote 收进 write_research_artifact。不要用它代替普通网页检索。',
     '禁止把网页原文或大段摘录粘进 summary；长材料只通过 evidence 锚点引用。',
     '',
     agent.prompt || '',
@@ -192,7 +199,7 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
   childCtx.subagentDepth = (ctx.subagentDepth || 0) + 1;
   childCtx.subagentKind = agent.name;
   childCtx.subagentAllowedTools = allowedToolNames(agent, CHAT_TOOLS);
-  childCtx.subagentAllowedTools.add('submit_report');
+  childCtx.subagentAllowedTools.add('submit_research');
   childCtx.subagentAllowedTools.add('section_job');
   childCtx.subagentOpenedTabs = new Set();
   childCtx.subagentOwner = session.id;
@@ -207,7 +214,7 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
   Object.defineProperty(childCtx, 'chatHistorySummary', {
     value: '', writable: true, configurable: true, enumerable: true,
   });
-  Object.defineProperty(childCtx, 'submittedReport', {
+  Object.defineProperty(childCtx, 'submittedResearch', {
     value: null, writable: true, configurable: true, enumerable: true,
   });
 
@@ -224,56 +231,86 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
   let lastText = '';
   let lastEmit = 0;
   let missingSubmitAttempts = 0;
+  let llmNetworkRecoveries = 0;
+  let networkInterrupted = false;
   const budget = {
     tokens: Number(limits.budgetTokens) || 0,
-    ms: (Number(limits.budgetMinutes) || 0) * 60000,
+    ms: 0,
   };
   const startedAt = Date.now();
   let usedTokens = 0;
   let warned = false;
   let forced = false;
   let forcedRounds = 0;
-  const submitOnly = [SUBMIT_REPORT_TOOL];
+  const submitOnly = [SUBMIT_RESEARCH_TOOL];
   try {
-    // 不设轮次上限；按 token / 耗时预算收口。耗尽时只留 submit_report，强制交回已有工作。
+    // 不设轮次上限、不按墙钟收口；只按 token 预算。耗尽时只留 submit_research，强制交回已有工作。
     for (;;) {
     if (signal && signal.aborted) break;
     const state = budgetState(budget, usedTokens, startedAt);
     if (!forced && state.ratio >= 1) {
       forced = true;
       session.card.budgetExhausted = state.by;
-      childCtx.subagentAllowedTools = new Set(['submit_report']);
+      childCtx.subagentAllowedTools = new Set(['submit_research']);
       childCtx.subagentBudgetForced = true;
       messages.push({
         role: 'user',
         content: agent.name === 'explore'
-          ? `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：summary 写你的判断、关键数字和对不上的地方；passages 留下已有原文；claims 留空；没查完的写进 unresolved。`
-          : `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_report：已核实的写进 claims，能回答的问题写进 findings，没查完的方向和原因写进 unresolved。`,
+? `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_research：summary 写判断；artifact_id 填已有笔记；sources 填已有来源；gaps 写没查完的点；claims 可留空。`
+: `[RUNTIME] ${state.by === 'token' ? 'token' : '耗时'}预算已用完，不能再调用其它工具。现在立即调用 submit_research：summary 写判断；artifact_id、sources、gaps 必须填；已核实事实才写 claims。`,
       });
     } else if (!warned && !forced && state.ratio >= SUBAGENT_BUDGET_WARN_RATIO) {
       warned = true;
       messages.push({
         role: 'user',
-        content: '[RUNTIME] 预算已用掉大部分。停止扩大检索范围，补齐最关键的缺口后尽快调用 submit_report。',
+        content: '[RUNTIME] 预算已用掉大部分。停止扩大检索范围，补齐最关键的缺口后尽快调用 submit_research。',
       });
     }
     if (forced && forcedRounds >= SUBAGENT_FORCED_SUBMIT_ROUNDS) break;
     if (forced) forcedRounds += 1;
     let roundStarted = false;
-    const result = await streamChatWithTools(messages, forced ? submitOnly : tools, apiCfg, (chunk) => {
-      if (!chunk) return;
-      if (!roundStarted) {
+    let result;
+    try {
+      result = await streamChatWithTools(messages, forced ? submitOnly : tools, apiCfg, (chunk) => {
+        if (!chunk) return;
+        if (!roundStarted) {
+          lastText = '';
+          roundStarted = true;
+          session.card.currentLabel = '';
+        }
+        lastText += chunk;
+        session.card.report = lastText;
+        session.card.status = 'running';
+        const now = Date.now();
+        if (now - lastEmit < 80) return;
+        lastEmit = now;
+        try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
+      }, signal);
+    } catch (err) {
+      const decision = classifySubagentLlmError(err, {
+        recoveries: llmNetworkRecoveries,
+        maxRecoveries: SUBAGENT_LLM_NETWORK_RECOVERIES,
+        hasProgress: subagentHasRecoverableProgress(messages),
+        aborted: !!(signal && signal.aborted),
+      });
+      if (decision.action === 'retry') {
+        llmNetworkRecoveries = decision.recoveries;
         lastText = '';
-        roundStarted = true;
+        session.card.report = '';
+        session.card.status = 'running';
+        session.card.currentLabel = `网络中断，正在重试（${llmNetworkRecoveries}/${SUBAGENT_LLM_NETWORK_RECOVERIES}）`;
+        try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
+        await networkSleep(decision.delayMs, signal);
+        continue;
       }
-      lastText += chunk;
-      session.card.report = lastText;
-      session.card.status = 'running';
-      const now = Date.now();
-      if (now - lastEmit < 80) return;
-      lastEmit = now;
-      try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
-    }, signal);
+      if (decision.action === 'salvage') {
+        networkInterrupted = true;
+        session.card.error = SUBAGENT_NETWORK_RESUME_HINT;
+        break;
+      }
+      throw err;
+    }
+    llmNetworkRecoveries = 0;
     emitUsage(ctx, result.usage);
     usedTokens += usageTotalTokens(result.usage);
     session.card.budget = { usedTokens, elapsedMs: Date.now() - startedAt, tokens: budget.tokens, ms: budget.ms };
@@ -281,16 +318,16 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
     session.card.report = lastText;
     try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
     if (!result.toolCalls || result.toolCalls.length === 0) {
-      if (childCtx.submittedReport) break;
+      if (childCtx.submittedResearch) break;
       if (forced) {
-        messages.push({ role: 'user', content: '[RUNTIME] 预算已用完，唯一可做的是调用 submit_report。' });
+        messages.push({ role: 'user', content: '[RUNTIME] 预算已用完，唯一可做的是调用 submit_research。' });
         continue;
       }
       if (missingSubmitAttempts >= 1) break;
       missingSubmitAttempts += 1;
       messages.push({
         role: 'user',
-        content: '[RUNTIME] 你还没有调用 submit_report。现在必须用该工具提交结构化结果；不要再输出自然语言报告。',
+        content: '[RUNTIME] 你还没有调用 submit_research。现在必须用该工具提交结构化结果；不要再输出自然语言报告。',
       });
       continue;
     }
@@ -329,7 +366,7 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
         },
       },
     });
-    if (childCtx.submittedReport) break;
+    if (childCtx.submittedResearch) break;
     }
   } finally {
     await closeSubagentTabs(childCtx);
@@ -337,9 +374,10 @@ async function runSubagentLoop(session, prompt, ctx, signal, agent, apiCfg, tool
   session.updatedAt = Date.now();
   return {
     text: lastText || '',
-    report: childCtx.submittedReport,
-    submitted: !!childCtx.submittedReport,
+    research: childCtx.submittedResearch,
+    submitted: !!childCtx.submittedResearch,
     budgetExhausted: forced ? (session.card.budgetExhausted || 'token') : '',
+    networkInterrupted,
   };
 }
 
@@ -393,12 +431,6 @@ export async function runTaskTool(args, ctx = {}) {
       return formatTaskResult({
         id: String(args.task_id), type, state: 'error', summary: '无法续传',
         text: `找不到 task_id=${args.task_id}。只能续传本会话里已经派过的子代理。`,
-      });
-    }
-    if (ctx.runningSubagents.has(session.id)) {
-      return formatTaskResult({
-        id: session.id, type: session.type, state: 'running', summary: '仍在运行',
-        text: '该子代理仍在运行。不要轮询；前台任务请等它返回，后台任务完成会自动回注。',
       });
     }
     if (args.revision === true) {
@@ -465,7 +497,7 @@ export async function runTaskTool(args, ctx = {}) {
     });
   }
 
-  const tools = [...filterToolsForAgent(agent, CHAT_TOOLS), SECTION_JOB_TOOL, SUBMIT_REPORT_TOOL];
+  const tools = [...filterToolsForAgent(agent, CHAT_TOOLS), SECTION_JOB_TOOL, SUBMIT_RESEARCH_TOOL];
   const background = args.background === true && ctx.allowBackground === true;
   session.card.background = background;
   try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
@@ -510,14 +542,25 @@ export async function runTaskTool(args, ctx = {}) {
     };
     try {
       const limits = await getSubagentLimits().catch(() => ({}));
-      const result = await runSubagentLoop(session, effectivePrompt || '请继续上次未完成的任务并调用 submit_report。', ctx, signal, agent, apiCfg, tools, limits);
+      const result = await runSubagentLoop(session, effectivePrompt || '请继续上次未完成的任务并调用 submit_research。', ctx, signal, agent, apiCfg, tools, limits);
       const aborted = signal && signal.aborted;
       const incomplete = !aborted && !result.submitted;
       const state = aborted ? 'error' : (incomplete ? 'incomplete' : 'completed');
-      session.report = result.report || null;
-      const passageOnly = !!(result.report && (result.report.passages || []).length && !(result.report.claims || []).length);
-      session.verification = result.submitted && !passageOnly
-        ? await runCheckPipeline(result.report, {
+      const networkNote = result.networkInterrupted ? SUBAGENT_NETWORK_RESUME_HINT : '';
+      const research = result.research || null;
+      session.report = research ? {
+        summary: research.summary,
+        claims: research.claims || [],
+        actions: research.actions || [],
+        unresolved: research.gaps || [],
+        passages: research.passages || [],
+        gaps: research.gaps || [],
+        sources: research.sources || [],
+        artifact_id: research.artifact_id || '',
+      } : null;
+      const hasClaims = !!(research && (research.claims || []).length);
+      session.verification = result.submitted && hasClaims
+        ? await runCheckPipeline(research, {
           projectId: ctx.projectId || 'default',
           apiConfig: apiCfg,
           judgeApiConfig: await resolveJudgeApiConfig(ctx, limits),
@@ -530,29 +573,29 @@ export async function runTaskTool(args, ctx = {}) {
         : '';
       session.card.status = state;
       session.card.error = aborted ? '已中断' : (incomplete
-        ? (result.budgetExhausted ? '预算用完且未能提交报告，任务未完成' : '未调用 submit_report，任务未完成')
+        ? (networkNote
+          || (result.budgetExhausted ? '预算用完且未能提交报告，任务未完成' : '未调用 submit_research，任务未完成'))
         : '');
       session.card.budgetNote = budgetNote;
       session.card.currentTool = '';
       session.card.currentLabel = '';
-      session.card.report = result.report?.summary || result.text || '';
-      session.card.structuredReport = result.report || null;
+      session.card.report = research?.summary || result.text || '';
+      session.card.structuredReport = research || null;
       session.card.verification = session.verification;
       try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
-      traceEnd(state, result.report?.summary || result.text || session.card.error, result.report, session.verification);
+      traceEnd(state, research?.summary || result.text || session.card.error, session.report, session.verification);
       logSub(
         'subagent.end',
         state === 'completed' ? 'ok' : 'error',
-        state === 'completed' ? '子代理完成' : (aborted ? '子代理中断' : '子代理未提交'),
-        result.report?.summary ? `${description} — ${result.report.summary}` : description,
+        state === 'completed' ? '子代理完成' : (aborted ? '子代理中断' : (result.networkInterrupted ? '子代理网络中断' : '子代理未提交')),
+        research?.summary ? `${description} — ${research.summary}` : description,
       );
-      return formatTaskResult({
+      return formatResearchTaskResult({
         id: session.id,
         type: session.type,
         state,
-        summary: aborted ? `已中断: ${description}` : (incomplete ? `未完成: ${description}` : description),
+        research,
         text: aborted ? '子代理已中断。' : (incomplete ? session.card.error : budgetNote),
-        report: result.report,
         verification: verificationForMain(session.verification),
       });
     } catch (err) {
@@ -563,12 +606,17 @@ export async function runTaskTool(args, ctx = {}) {
       try { ctx.onSubagentEvent?.(session.card); } catch (_) {}
       traceEnd('error', session.card.error);
       logSub('subagent.end', 'error', '子代理失败', `${description} — ${session.card.error}`);
+      const networkTail = isRetryableNetworkError(err)
+        ? (subagentHasRecoverableProgress(session.messages)
+          ? ` ${SUBAGENT_NETWORK_RESUME_HINT}`
+          : ' 本次尚未留下检索结果，可以重新派同一任务。')
+        : '';
       return formatTaskResult({
         id: session.id,
         type: session.type,
         state: 'error',
         summary: `失败: ${description}`,
-        text: `Subagent failed (task_id: ${session.id}): ${session.card.error}`,
+        text: `Subagent failed (task_id: ${session.id}): ${session.card.error}.${networkTail}`,
       });
     } finally {
       ctx.runningSubagents.delete(session.id);
@@ -624,3 +672,8 @@ export async function runTaskTool(args, ctx = {}) {
 
 registerTaskTool(runTaskTool);
 registerSectionJobTool(runSectionJob);
+
+
+
+
+

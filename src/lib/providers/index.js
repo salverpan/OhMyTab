@@ -18,6 +18,7 @@ import * as openaiChat from './openai-chat.js';
 import * as anthropicMessages from './anthropic-messages.js';
 import * as geminiNative from './gemini.js';
 import { planEffortRetry, rememberEffortOutcome } from '../effort-probe.js';
+import { withNetworkRetry } from '../net-retry.js';
 
 const ADAPTERS = {
   openai: openaiChat,
@@ -38,7 +39,15 @@ function resolveAdapter(cfg) {
 
 /** 流式对话 + 工具调用。cfg 需含 { protocol, baseUrl, apiKey, model }。 */
 export async function chatStream(cfg, messages, tools, onChunk, signal) {
-  return withEffortRetry(cfg, (next) => resolveAdapter(next).chatStream(next, messages, tools, onChunk, signal));
+  let emitted = false;
+  const emit = (chunk) => {
+    if (chunk) emitted = true;
+    if (onChunk) onChunk(chunk);
+  };
+  return withNetworkRetry(
+    () => withEffortRetry(cfg, (next) => resolveAdapter(next).chatStream(next, messages, tools, emit, signal)),
+    { signal, canRetry: () => !emitted },
+  );
 }
 
 /**
@@ -49,7 +58,10 @@ export async function chatStream(cfg, messages, tools, onChunk, signal) {
  *   retryWithoutResponseFormat -- 仅 openai：response_format 报 400 时去掉重试一次
  */
 export async function chatComplete(cfg, messages, opts = {}) {
-  return withEffortRetry(cfg, (next) => resolveAdapter(next).chatComplete(next, messages, opts));
+  return withNetworkRetry(
+    () => withEffortRetry(cfg, (next) => resolveAdapter(next).chatComplete(next, messages, opts)),
+    { signal: opts.signal },
+  );
 }
 
 /** 思考参数 400：最多降一档或剥字段各一次。其它错误原样抛出。 */
@@ -73,3 +85,4 @@ async function withEffortRetry(cfg, run) {
 }
 
 export { ApiError } from './util.js';
+

@@ -43,6 +43,7 @@ const PROMPT_TEMPLATE = `你是新闻资料采集助手。请从网页正文和�
 - tagMerges 是可选字段，用于合并推荐标签列表中含义相同的标签。如果你发现推荐列表中同时存在含义相同但名称不同的标签（如"UAV"和"无人机"），请在此数组中列出需要合并的配对，格式为 [["待合并的标签名", "保留的规范标签名"], ...]。每对的前者将被合并到后者。如果不需要合并，可省略此字段或返回空数组 []。`;
 
 import { chatComplete, chatStream } from './providers/index.js';
+import { isRetryableNetworkError, withNetworkRetry } from './net-retry.js';
 
 export { PROMPT_TEMPLATE };
 
@@ -241,15 +242,216 @@ function normalizeDate(raw) {
  *
  * Returns: { content: string, toolCalls: Array<{id, name, arguments}>, usage: object }
  */
-export async function streamChatWithTools(messages, tools, apiConfig, onChunk, signal) {
-  return chatStream(apiConfig, messages, tools, onChunk, signal);
+export async function streamChatWithTools(messages, tools, apiConfig, onChunk, signal, opts = {}) {
+  return chatStream(apiConfig, messages, tools, onChunk, signal, opts);
 }
 
-/* ============ DeepSeek 原生联网搜索（Responses API web_search） ============
+/* ============ DeepSeek Search API（首选） ============
+ * 官方文档: https://api-docs.deepseek.com/zh-cn/guides/search
+ * POST {base}/v1/tools/search，直接返回 results[]，不经过模型。
+ * need_content=true 时每条带正文；summary 约 600-800 字，rerank_score 用于排序。
+ * 计费只算 HTTP 200 且 results 非空，失败/空结果不计费；账号限速 5 QPS。
+ */
+
+/** 由 chat/completions / responses / anthropic 地址推导 Search API 地址（官方: https://api.deepseek.com/v1/tools/search） */
+export function deriveSearchToolsUrl(baseUrl) {
+  let u = (baseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) u = 'https://api.deepseek.com';
+  u = u.replace(/\/(chat\/completions|responses|anthropic)$/i, '');
+  u = u.replace(/\/v1$/i, '');
+  return u + '/v1/tools/search';
+}
+
+/** 构造 Search API 请求体。count 1-50（默认 10），need_content 默认 true。 */
+export function buildDeepseekSearchBody(query, { count = 10, needContent = true } = {}) {
+  const n = Math.floor(Number(count));
+  return {
+    query: String(query || '').trim(),
+    count: Number.isFinite(n) ? Math.max(1, Math.min(50, n)) : 10,
+    need_content: !!needContent,
+  };
+}
+
+function toFiniteNumber(value, fallback) {
+  if (value === null || value === undefined || value === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * 归一化 Search API 的 results[]。
+ * 只留 http(s) URL、按 rerank_score 降序；authority -1 表示未知，>=3 为高权威。
+ * 不按 authority 硬过滤，避免把有用但未知权威的来源直接丢掉。
+ */
+export function parseDeepseekSearchResults(data, maxResults = 10) {
+  const rows = Array.isArray(data && data.results) ? data.results : [];
+  const byUrl = new Map();
+  for (const raw of rows) {
+    if (!raw || typeof raw !== 'object') continue;
+    const url = String(raw.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) continue;
+    const hit = {
+      title: String(raw.title || '').trim() || url,
+      url,
+      snippet: String(raw.snippet || '').replace(/\s+/g, ' ').trim(),
+      summary: String(raw.summary || '').replace(/\s+/g, ' ').trim(),
+      content: String(raw.content || '').replace(/\r\n?/g, '\n').trim(),
+      date: String(raw.date || '').trim(),
+      authority: toFiniteNumber(raw.authority, -1),
+      rerankScore: toFiniteNumber(raw.rerank_score, 0),
+      siteName: String(raw.site_name || '').trim(),
+    };
+    const prev = byUrl.get(url);
+    if (!prev || hit.rerankScore > prev.rerankScore) byUrl.set(url, hit);
+  }
+  const hits = [...byUrl.values()].sort((a, b) => b.rerankScore - a.rerankScore);
+  const limit = Math.max(1, Math.min(50, Math.floor(Number(maxResults)) || 10));
+  return hits.slice(0, limit);
+}
+
+function formatSearchDate(value) {
+  const s = String(value || '').trim();
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(s);
+  return m ? m[1] : s;
+}
+
+/** 正文每行缩进两格：条数仍可用 /^- /gm 统计，正文里自己的列表不会被误计。 */
+function indentBlock(text) {
+  return String(text || '').split('\n').map((line) => '  ' + line).join('\n');
+}
+
+/** 搜索结果 → 模型可读文本。格式与旧的 "- 标题 / 摘要 / URL" 契约兼容。 */
+export function formatDeepseekSearchResults(hits) {
+  return (Array.isArray(hits) ? hits : []).map((r) => {
+    const lines = [`- ${r.title || r.url}`];
+    const overview = r.summary || r.snippet;
+    if (overview) lines.push(`  摘要：${overview}`);
+    lines.push(`  URL：${r.url}`);
+    const meta = [];
+    const date = formatSearchDate(r.date);
+    if (date) meta.push(date);
+    if (Number.isFinite(r.authority) && r.authority >= 0) meta.push(`权威度 ${r.authority}/4`);
+    if (r.siteName) meta.push(r.siteName);
+    if (meta.length) lines.push(`  ${meta.join(' · ')}`);
+    if (r.content) {
+      lines.push('  正文：');
+      lines.push(indentBlock(r.content));
+    } else if (!overview) {
+      lines.push('  （未返回摘要或正文）');
+    }
+    return lines.join('\n');
+  }).join('\n\n');
+}
+
+function deepseekApiError(data, status) {
+  const detail = data && data.error
+    ? (data.error.message || data.error.code || '')
+    : '';
+  return {
+    message: `搜索 API ${status}${detail ? ': ' + detail : ''}`,
+    detail: String(detail || ''),
+  };
+}
+
+async function postDeepseekSearch(endpoint, apiConfig, body, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiConfig.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    let data = null;
+    try { data = await response.json(); } catch (_) {}
+    if (!response.ok) {
+      const e = deepseekApiError(data, response.status);
+      const err = new Error(e.message);
+      err.status = response.status;
+      err.detail = e.detail;
+      throw err;
+    }
+    if (!data || typeof data !== 'object') {
+      const err = new Error('搜索 API 返回的不是 JSON');
+      err.status = response.status;
+      throw err;
+    }
+    return data;
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      const e = new Error(`搜索超时（${Math.round(timeoutMs / 1000)}s）`);
+      e.timeout = true;
+      throw e;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+/**
+ * 调 DeepSeek Search API。返回格式化文本；无结果返回 null。
+ * 网络错误 / 408 / 429 / 5xx 自动重试 5 次（指数退避）；401/402/429 给出可操作的中文错误。
+ */
+export async function deepseekSearch(query, apiConfig, {
+  count = 10, needContent = true, timeoutMs = 20000,
+} = {}) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('需要搜索关键词');
+
+  const cfg = apiConfig || {};
+  const endpoint = deriveSearchToolsUrl(cfg.baseUrl);
+  const body = buildDeepseekSearchBody(q, { count, needContent });
+  let retries = 0;
+
+  for (;;) {
+    try {
+      const data = await postDeepseekSearch(endpoint, cfg, body, timeoutMs);
+      const hits = parseDeepseekSearchResults(data, body.count);
+      return hits.length ? formatDeepseekSearchResults(hits) : null;
+    } catch (err) {
+      const status = err && err.status;
+      if (isRetryableNetworkError(err) && retries < 5) {
+        retries += 1;
+        const delay = Math.min(8000, 500 * 2 ** (retries - 1));
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      const suffix = err && err.detail ? `：${err.detail}` : '';
+      if (status === 401) {
+        const e = new Error(`DeepSeek API Key 无效或已过期（HTTP 401）${suffix}`);
+        e.status = 401;
+        e.detail = err.detail || '';
+        throw e;
+      }
+      if (status === 402) {
+        const e = new Error(`DeepSeek 搜索额度不足（HTTP 402），请先充值${suffix}`);
+        e.status = 402;
+        e.detail = err.detail || '';
+        throw e;
+      }
+      if (status === 429) {
+        const e = new Error(`DeepSeek 搜索限流（5 QPS），请稍后重试${suffix}`);
+        e.status = 429;
+        e.detail = err.detail || '';
+        throw e;
+      }
+      throw err;
+    }
+  }
+}
+
+/* ============ DeepSeek 原生联网搜索（Responses API web_search，旧接口兜底） ============
  * 官方文档: https://api-docs.deepseek.com/zh-cn/guides/responses_api/
  * POST {base}/responses，tools: [{type:'web_search'}] 由服务端执行搜索。
  * web_search_call 只有 action，没有 results 数组；命中从 message.url_citation / 正文提取。
  * 思考模式默认开，max_output_tokens 含 reasoning，过小会 incomplete 后看起来像「搜不到」。
+ * 仅当 Search API 返回 404/405（端点未覆盖）时调用；正常路径不再走这里。
  */
 
 /** 由 chat/completions 地址推导 Responses API 地址（官方: https://api.deepseek.com/responses） */
@@ -379,6 +581,14 @@ async function postResponsesSearch(endpoint, apiConfig, query, timeoutMs, extraB
       throw err;
     }
     return await response.json();
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      const e = new Error(`搜索超时（${Math.round(timeoutMs / 1000)}s）`);
+      e.code = 'ETIMEDOUT';
+      e.timeout = true;
+      throw e;
+    }
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
@@ -398,13 +608,17 @@ export async function nativeWebSearch(query, apiConfig, { timeoutMs = 30000, max
   const endpoint = deriveResponsesUrl(apiConfig.baseUrl);
   let data;
   try {
-    data = await postResponsesSearch(endpoint, apiConfig, query, timeoutMs, {
-      reasoning: { effort: 'none' },
-    });
+    data = await withNetworkRetry(
+      () => postResponsesSearch(endpoint, apiConfig, query, timeoutMs, { reasoning: { effort: 'none' } }),
+      { maxRetries: 5 },
+    );
   } catch (err) {
     const msg = (err && (err.detail || err.message)) || '';
     if (err && err.status === 400 && /reason/i.test(msg)) {
-      data = await postResponsesSearch(endpoint, apiConfig, query, timeoutMs, {});
+      data = await withNetworkRetry(
+        () => postResponsesSearch(endpoint, apiConfig, query, timeoutMs, {}),
+        { maxRetries: 5 },
+      );
     } else {
       throw err;
     }
@@ -439,3 +653,6 @@ export async function testApiConnection(apiConfig) {
     clearTimeout(timeout);
   }
 }
+
+
+

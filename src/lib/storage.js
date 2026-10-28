@@ -1,8 +1,8 @@
 import { normalizeEntryRecord } from './source-model.js';
 import { logActivity } from './activity-log.js';
 import {
-  SUBAGENT_MAX_PARALLEL, SUBAGENT_MAX_TABS, SUBAGENT_BUDGET_TOKENS, SUBAGENT_BUDGET_MINUTES,
-  clampSubagentMaxParallel, clampSubagentMaxTabs, clampSubagentBudgetTokens, clampSubagentBudgetMinutes,
+  SUBAGENT_MAX_PARALLEL, SUBAGENT_MAX_TABS, SUBAGENT_BUDGET_TOKENS,
+  clampSubagentMaxParallel, clampSubagentMaxTabs, clampSubagentBudgetTokens,
 } from './limits.js';
 
 const STORAGE_KEYS = {
@@ -397,20 +397,28 @@ export async function saveCustomSubagents(list) {
   await chrome.storage.local.set({ [CUSTOM_SUBAGENTS_KEY]: Array.isArray(list) ? list : [] });
 }
 
+const SUBAGENT_LIMITS_VERSION = 2;
+
 export function normalizeSubagentLimits(raw) {
   const pick = (k, d) => (raw && raw[k] != null && raw[k] !== '' ? raw[k] : d);
+  const migrated = Number(raw && raw.limitsVersion) >= SUBAGENT_LIMITS_VERSION;
   return {
     maxParallel: clampSubagentMaxParallel(pick('maxParallel', SUBAGENT_MAX_PARALLEL)),
     maxTabs: clampSubagentMaxTabs(pick('maxTabs', SUBAGENT_MAX_TABS)),
-    budgetTokens: clampSubagentBudgetTokens(pick('budgetTokens', SUBAGENT_BUDGET_TOKENS)),
-    budgetMinutes: clampSubagentBudgetMinutes(pick('budgetMinutes', SUBAGENT_BUDGET_MINUTES)),
+    // v2 起默认 token 不限；旧存储没有 version 时丢掉历史 200 万默认值。
+    budgetTokens: migrated
+      ? clampSubagentBudgetTokens(pick('budgetTokens', SUBAGENT_BUDGET_TOKENS))
+      : 0,
+    budgetMinutes: 0,
     checkChannelId: String((raw && raw.checkChannelId) || ''),
+    limitsVersion: SUBAGENT_LIMITS_VERSION,
   };
 }
 
 /**
- * 用户配置的子代理限额：批次并行、同时打开标签、单个子代理的 token / 耗时预算、
+ * 用户配置的子代理限额：批次并行、同时打开标签、单个子代理的 token 预算、
  * Check 审查模型所用渠道（空 = 跟随子代理自己的模型）。未配置时回落 limits.js 默认值。
+ * 耗时预算已取消，normalize 恒为 0。
  */
 export async function getSubagentLimits() {
   try {

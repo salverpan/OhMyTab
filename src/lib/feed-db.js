@@ -282,6 +282,12 @@ export async function addFeed(partial) {
   const feed = {
     id: crypto.randomUUID(),
     url: partial.url,
+    kind: partial.kind === 'webpage' ? 'webpage' : 'rss',
+    recipe: partial.recipe || null,
+    refreshMode: partial.kind === 'webpage' && ['auto', 'http', 'tab'].includes(partial.refreshMode)
+      ? partial.refreshMode
+      : (partial.kind === 'webpage' ? 'auto' : ''),
+    lastTransport: '',
     title: partial.title || partial.url,
     siteUrl: partial.siteUrl || '',
     faviconUrl: partial.faviconUrl || '',
@@ -449,8 +455,13 @@ export async function upsertItems(items) {
           const merged = {
             ...existing,
             author: item.author || existing.author,
-            publishedAt: item.publishedAt || existing.publishedAt,
+            // Webpage recipes without a timestamp keep their first-seen time
+            // stable; otherwise every refresh would make old cards look new.
+            publishedAt: item.preservePublishedAt
+              ? existing.publishedAt
+              : (item.publishedAt || existing.publishedAt),
             contentHtml: item.contentHtml || existing.contentHtml,
+            coverUrl: item.coverUrl || existing.coverUrl,
             link: item.link || existing.link,
           };
           if (!existing.translated) {
@@ -616,6 +627,7 @@ function slimItemMeta(it) {
     collectedEntryId: it.collectedEntryId || null,
     hasFullText: !!it.hasFullText,
     summary: it.summary || '',
+    coverUrl: it.coverUrl || '',
   };
 }
 

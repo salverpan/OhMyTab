@@ -7,6 +7,46 @@ import { CHAT_TOOLS } from './tools.js';
 import { PARENT_ONLY_TOOLS, EXPLORE_TOOLS, BROWSER_TOOLS } from './subagent-policy.js';
 import { reportForMain } from './task-report.js';
 import { stripViewportShotsForStorage } from './tool-round-messages.js';
+import { isRetryableNetworkError, networkRetryDelayMs } from './net-retry.js';
+
+/** 通道级 5 次重试耗尽（或流式已吐字不能重放）后，子代理循环再救几轮。 */
+export const SUBAGENT_LLM_NETWORK_RECOVERIES = 2;
+
+export const SUBAGENT_NETWORK_RESUME_HINT =
+  '模型接口网络中断，已有调研仍保留在本会话。请立刻用同一 task_id 续传（不要设 revision），不要重新派任务、不要换 prompt 重开。';
+
+export function subagentHasRecoverableProgress(messages) {
+  return (messages || []).some((m) => {
+    if (!m) return false;
+    if (m.role === 'tool') return true;
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) return true;
+    return false;
+  });
+}
+
+/**
+ * 子代理 LLM 调用失败后怎么走。
+ * retry：同一轮静默再打（消息数组未脏，模型看不到这次失败）。
+ * salvage：已有工具结果，结束本轮并标 incomplete，父代理用 task_id 续传。
+ * abort / throw：用户中止或不可恢复。
+ */
+export function classifySubagentLlmError(err, {
+  recoveries = 0,
+  maxRecoveries = SUBAGENT_LLM_NETWORK_RECOVERIES,
+  hasProgress = false,
+  aborted = false,
+} = {}) {
+  if (aborted || err?.name === 'AbortError') return { action: 'abort' };
+  if (!isRetryableNetworkError(err)) return { action: 'throw' };
+  const used = Math.max(0, Number(recoveries) || 0);
+  const cap = Math.max(0, Number(maxRecoveries) || 0);
+  if (used < cap) {
+    const next = used + 1;
+    return { action: 'retry', recoveries: next, delayMs: networkRetryDelayMs(next, err) };
+  }
+  if (hasProgress) return { action: 'salvage' };
+  return { action: 'throw' };
+}
 
 export const BUILTIN_AGENTS = [
   {
@@ -25,7 +65,7 @@ export const BUILTIN_AGENTS = [
       '- 任务结束会自动关掉你开过的页；读完也可立刻 manage_tabs(close, tab_id)。\n' +
       '- 查过但没有原文、而且会让判断反过来的点，写进 unresolved。\n' +
       '- 禁止 click/type/采集/写库/编辑文档。不要 switch 用户正在看的标签。\n' +
-      '- 完成后必须调用 submit_report；自然语言正文不算交回。不要向用户打招呼。',
+      '- 完成后必须调用 submit_research；自然语言正文不算交回。不要向用户打招呼。',
     tools: [...EXPLORE_TOOLS],
   },
   {
@@ -38,7 +78,7 @@ export const BUILTIN_AGENTS = [
       '- 需要写库/点页面时自己做完，不要把脏活推回父代理。\n' +
       '- 点页面默认 browser_act（先 observe 或直接按已有编号表 click/type）。不要 number_elements。点不动再用 interact_page。\n' +
       '- 优先开自己的标签（manage_tabs open，后台），避免抢用户正在看的页；任务结束自动 close。\n' +
-      '- 完成后必须调用 submit_report：操作结果写 actions，事实写带证据的 claims。不要向用户打招呼。',
+      '- 完成后必须调用 submit_research：操作结果写 actions，事实写带证据的 claims。不要向用户打招呼。',
     tools: '*',
   },
   {
@@ -52,10 +92,10 @@ export const BUILTIN_AGENTS = [
       '- 目标标签已在前台时，编号表后会附上同一视口截图。后台标签只有表，不要为了截图去切换用户正在看的页。\n' +
       '- click/type/select 只能用表里的编号。截图里看得见但表里没有的控件，再用 interact_page(click_at)。不要 number_elements，不要发明 CSS/JS。\n' +
       '- 字段已经是目标值就不要再填。TYPE 之后若出现建议列表，再 click 对应建议。\n' +
-      '- 需要的控件不在视口里：scroll_down/up。页面还在加载：wait。证据已可见：submit_report。\n' +
+      '- 需要的控件不在视口里：scroll_down/up。页面还在加载：wait。证据已可见：submit_research。\n' +
       '- 连续失败或表为空/反爬：再改用 interact_page 的 cdp_click / vision_find / capture_network / exec_js_main。\n' +
       '- 能后台操作就传 tab_id，不要 switch 用户正在看的标签。\n' +
-      '- 完成后必须调用 submit_report：操作写 actions（带 URL/可见字段当前值），事实写带证据 claims。不要向用户打招呼。',
+      '- 完成后必须调用 submit_research：操作写 actions（带 URL/可见字段当前值），事实写带证据 claims。不要向用户打招呼。',
     tools: [...BROWSER_TOOLS],
   },
 ];
@@ -135,7 +175,7 @@ export function revisionRequestFor(verification) {
     .map((claim) => ({ id: claim.id, error: claim.verdict }));
   return [
     '[RUNTIME-CHECK-REVISION]',
-    '只修正下列失败 claim；不要改写已通过项。完成后重新调用 submit_report。',
+    '只修正下列失败 claim；不要改写已通过项。完成后重新调用 submit_research。',
     JSON.stringify(failures),
   ].join('\n');
 }
@@ -179,3 +219,4 @@ export function restoreSubagentSessions(arr) {
   }
   return map;
 }
+

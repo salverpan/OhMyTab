@@ -65,7 +65,7 @@ export const SEARCH_PRESETS = [
     needsKey: false,
     needsBase: false,
     keyPlaceholder: '',
-    hint: '用当前 AI 渠道里的官方 DeepSeek Key，不另存一把钥匙。不是 api.deepseek.com 时会改用网页抓取。',
+    hint: '用当前 AI 渠道里的官方 DeepSeek Key，走 Search API 并默认返回正文。按成功搜索计费（¥5/1000 次）；不是 api.deepseek.com 时会改用网页抓取。',
   },
   {
     id: 'html',
@@ -82,6 +82,23 @@ const PROVIDERS = new Set(SEARCH_PRESETS.map((p) => p.provider));
 
 export function searchPreset(provider) {
   return SEARCH_PRESETS.find((p) => p.provider === provider) || SEARCH_PRESETS[0];
+}
+
+/**
+ * 当前 AI 渠道是否官方 DeepSeek（用于复用它的 Key 调 Search API）。
+ * 必须按 hostname 精确匹配：https://api.deepseek.com/... 是官方，
+ * evilapi.deepseek.com、api.deepseek.com.evil.com、proxy.com/api.deepseek.com 都不是。
+ */
+export function isOfficialDeepSeek(apiConfig) {
+  if (!apiConfig || !apiConfig.apiKey) return false;
+  const raw = String(apiConfig.baseUrl || '').trim();
+  if (!raw) return false;
+  try {
+    const host = new URL(raw.includes('://') ? raw : `https://${raw}`).hostname.toLowerCase();
+    return host === 'api.deepseek.com';
+  } catch (_) {
+    return false;
+  }
 }
 
 export function normalizeSearchChannel(raw) {

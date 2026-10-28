@@ -35,14 +35,20 @@ function structuredInner(card, prefix) {
     return `<li><span>${esc(c.claim)}</span>${refs ? `<small>${esc(refs)}</small>` : ''}</li>`;
   }).join('');
   const actions = (report.actions || []).map((a) =>
-    `<li><span>${esc(a.description)}</span>${a.result_ref ? `<small>${esc(a.result_ref)}</small>` : ''}</li>`).join('');
+'<li><span>' + esc(a.description) + '</span>' + (a.result_ref ? '<small>' + esc(a.result_ref) + '</small>' : '') + '</li>').join('');
+  const artifact = report.artifact_id ? `<p><small>研究笔记：${esc(report.artifact_id)}</small></p>` : '';
+  const sources = (report.sources || []).map((s) => `<li>${esc(s)}</li>`).join('');
+  const gaps = (report.gaps || report.unresolved || []).map((s) => `<li>${esc(s)}</li>`).join('');
   const findings = (report.findings || []).map((f) =>
     `<li><span><b>${esc(f.question)}</b> ${esc(f.answer)}</span><small>${esc([...(f.supporting || []), ...(f.contradicting || []).map((id) => `≠${id}`)].join(' · '))}</small></li>`).join('');
-  return `<div class="${prefix}-subagent-label">结构化交回</div>
+  return `<div class="${prefix}-subagent-label">研究交回</div>
     <p>${esc(report.summary || '')}</p>
+    ${artifact}
     ${findings ? `<ul>${findings}</ul>` : ''}
     ${claims ? `<ul>${claims}</ul>` : ''}
-    ${actions ? `<ul>${actions}</ul>` : ''}`;
+    ${actions ? `<ul>${actions}</ul>` : ''}
+    ${sources ? `<div class="${prefix}-subagent-label">来源</div><ul>${sources}</ul>` : ''}
+    ${gaps ? `<div class="${prefix}-subagent-label">未解决</div><ul>${gaps}</ul>` : ''}`;
 }
 
 function verificationInner(card, prefix) {

@@ -160,11 +160,20 @@ ok(stats.activity.sources.at(-1) === 1 && stats.activity.sources.at(-2) === 1, '
 ok(stats.activity.sources.reduce((a, b) => a + b, 0) === 2, '14 天之外的来源不计');
 ok(stats.activity.outputs.at(-3) === 1 && stats.activity.notes.at(-1) === 4, '产出与笔记按天计数');
 ok(stats.noteTotal === 3 && stats.noteStatus.open === 1 && stats.noteStatus.refuted === 1, '状态统计不含观测');
+ok(computeOverviewStats({
+  notes: [
+    { note: { createdAt: now, status: 'open', confidence: 'high' }, updatedAt: now },
+    { kind: 'artifact', title: '中韩半导体产业对比', updatedAt: now },
+  ],
+}, { now }).noteTotal === 1, '研究笔记 artifact 不进状态矩阵');
 ok(stats.calibration[0][0] === 1 && stats.calibration[0][2] === 1 && stats.calibration[2][1] === 1, '置信度 × 状态矩阵');
 ok(stats.sourceMix[0].name === '采集' && stats.sourceMix[0].count === 2, '来源构成按数量降序');
 const charts = buildOverviewCharts(stats);
 ok(charts.map((c) => c.id).join() === 'activity,status,calibration,sourceMix', '有数据时四张图齐全');
 ok(charts.every((c) => c.option && c.option.type && c.height > 0), '每张图都有 option 与高度');
+const activity = charts.find((c) => c.id === 'activity');
+ok(activity.option.axis.y.grid === false && activity.option.axis.x.grid === false, '近 14 天新增不画网格');
+ok(activity.option.axis.y.label === false && activity.option.axis.y.tick === false, '近 14 天新增不画 Y 刻度');
 ok(buildOverviewCharts(computeOverviewStats({}, { now })).length === 0, '空项目不画图');
 
 // —— 心跳任务跟项目走 ——

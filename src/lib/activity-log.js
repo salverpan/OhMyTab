@@ -57,7 +57,7 @@ const TOOL_ZH = {
   create_document: '创建文档', plot_chart: '绘制图表', place_images: '投放图片', call_api: '调用 API', save_memory: '保存记忆',
   doc_edit: '编辑文档', doc_review: '审阅文档', manage_heartbeat: '管理定时任务', ingest: '入库',
   read_section: '读取章节', search_workspace: '搜索工作区', notebook: '笔记本', plan: '任务清单',
-  task: '派出子代理', submit_report: '提交报告', section_job: '章节作业', write_document: '撰写文档', compose_report: '撰写文档',
+  task: '派出子代理', submit_report: '提交报告', section_job: '章节作业', write_document: '撰写文档', compose_report: '撰写文档', check_facts: '核验事实', review_argument: '评审观点', submit_research: '提交研究', write_research_artifact: '保存研究笔记', load_framework: '加载分析框架', analyst_memo: '分析师备忘录',
   extract_subtitles: '提取字幕', fetch_video_transcript: '获取视频字幕', capture_network: '抓取网络请求',
   exec_js_main: '执行页面脚本', vision_find: '视觉查找', vision_read: '视觉阅读', vision_extract: '视觉 OCR',
 };
@@ -386,3 +386,5 @@ export function logToolCall({ ctx, name, args, result, error, durationMs, reject
     durationMs,
   });
 }
+
+

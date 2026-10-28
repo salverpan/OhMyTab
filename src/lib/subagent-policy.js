@@ -5,7 +5,7 @@
 
 export const PARENT_ONLY_TOOLS = new Set([
   'task', 'clear_context', 'suggest_actions', 'ask_research_scope', 'manage_heartbeat', 'auto_compact',
-  'save_memory', 'notebook', 'plot_chart', 'place_images', 'plan', 'record_insight', 'compose_report', 'write_document',
+  'save_memory', 'notebook', 'plot_chart', 'place_images', 'plan', 'record_insight', 'compose_report', 'write_document', 'check_facts', 'review_argument', 'load_framework', 'analyst_memo',
 ]);
 // call_api 不是父级专属：explore 可 GET；save/delete/写入在执行器里再拦。
 
@@ -23,15 +23,19 @@ export const EXPLORE_TOOLS = [
   'refresh_feeds',
   'fetch_video_transcript', 'interact_page',
   // 工作区：读页自动落库，子代理也能按锚点回读 / 检索已读材料
-  'ingest', 'read_section', 'search_workspace',
+  'ingest', 'read_section', 'search_workspace', 'write_research_artifact',
   'call_api',
 ];
 
 export const BROWSER_TOOLS = [
   'browser_act', 'interact_page', 'read_current_page', 'read_tab', 'read_many', 'manage_tabs',
-  'search_web', 'fetch_video_transcript',
+  'search_web', 'fetch_video_transcript', 'write_research_artifact',
 ];
 
 export function isExploreInteractAllowed(action) {
   return EXPLORE_INTERACT_ALLOW.has(String(action || ''));
 }
+
+
+
+

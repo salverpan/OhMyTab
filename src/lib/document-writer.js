@@ -6,6 +6,8 @@
 
 import { streamChatWithTools } from './ai-client.js';
 import { emitUsage } from './usage.js';
+import { formatAnalysisBrief } from './analysis-contract.js';
+import { getArtifact } from './artifact-store.js';
 
 export const GENRE_GUIDE = {
   策划方案: '章节按方案写：背景、目标、对象、做法、节奏、资源与审批、风险。每个动作写明责任主体和时间。',
@@ -38,26 +40,73 @@ export function collectJudgments(sessions = [], taskIds = null) {
   return items;
 }
 
+function wantedIds(taskIds) {
+  return Array.isArray(taskIds) && taskIds.length ? new Set(taskIds.map(String)) : null;
+}
+
+function pushPassage(passages, seen, raw, fallbackUse) {
+  const quote = String(raw.quote || '').trim();
+  const docId = String(raw.doc_id || raw.docId || '').trim();
+  const anchor = String(raw.anchor || '').replace(/^.*#/, '').trim();
+  const use = String(raw.use || fallbackUse || '').trim();
+  if (!quote || !docId || !anchor) return;
+  const key = `${docId}#${anchor}|${quote}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  passages.push({ use: use || '未标明', doc_id: docId, anchor, quote });
+}
+
 export function collectPassages(sessions = [], taskIds = null) {
-  const wanted = Array.isArray(taskIds) && taskIds.length ? new Set(taskIds.map(String)) : null;
+  const wanted = wantedIds(taskIds);
   const passages = [];
   const seen = new Set();
   for (const session of sessions) {
     if (!session || !session.report) continue;
     if (wanted && !wanted.has(String(session.id))) continue;
-    for (const raw of session.report.passages || []) {
-      const quote = String(raw.quote || '').trim();
-      const docId = String(raw.doc_id || '').trim();
-      const anchor = String(raw.anchor || '').trim();
-      const use = String(raw.use || '').trim();
-      if (!quote || !docId || !anchor) continue;
-      const key = `${docId}#${anchor}|${quote}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      passages.push({ use: use || '未标明', doc_id: docId, anchor, quote });
+    for (const raw of session.report.passages || []) pushPassage(passages, seen, raw);
+    for (const claim of session.report.claims || []) {
+      const use = String(claim.claim || '').trim().slice(0, 80);
+      for (const ev of claim.evidence || []) pushPassage(passages, seen, ev, use);
     }
   }
   return passages;
+}
+
+const NOTE_CAP = 60000;
+
+export function collectArtifactIds(sessions = [], taskIds = null, explicit = []) {
+  const wanted = wantedIds(taskIds);
+  const ids = [];
+  const seen = new Set();
+  const add = (id) => {
+    const s = String(id || '').trim();
+    if (!s || seen.has(s)) return;
+    seen.add(s);
+    ids.push(s);
+  };
+  for (const id of explicit || []) add(id);
+  for (const session of sessions) {
+    if (!session || !session.report) continue;
+    if (wanted && !wanted.has(String(session.id))) continue;
+    add(session.report.artifact_id);
+  }
+  return ids;
+}
+
+async function loadResearchNotes(ids, loadArtifact) {
+  const loader = loadArtifact || getArtifact;
+  const parts = [];
+  for (const id of ids) {
+    let doc = null;
+    try { doc = await loader(id); } catch { doc = null; }
+    const text = String((doc && (doc.fullText || doc.text)) || '').trim();
+    if (!text) continue;
+    const title = String((doc && doc.title) || id).trim();
+    parts.push(`# ${title}\n${text}`);
+  }
+  const joined = parts.join('\n\n');
+  if (joined.length <= NOTE_CAP) return joined;
+  return `${joined.slice(0, NOTE_CAP)}\n\n（笔记后部未送入写作。）`;
 }
 
 export function splitDraft(text) {
@@ -138,19 +187,30 @@ export function applyCitations(markdown, passages = [], citeText = '') {
  * @returns {Promise<{ok:true,title:string,markdown:string,passageCount:number}|{ok:false,error?:string,need_reading?:string[],note?:string}>}
  */
 export async function writeDocument(args = {}, {
-  apiConfig, signal, ctx = {}, sessions = [], chat = streamChatWithTools,
+  apiConfig, signal, ctx = {}, sessions = [], chat = streamChatWithTools, loadArtifact,
 } = {}) {
   const brief = String(args.brief || args.question || '').trim();
   const genre = String(args.genre || '').trim() || '文档';
+  const analysisBlock = args.analysis ? formatAnalysisBrief(args.analysis) : '';
   if (!brief) return { ok: false, error: 'write_document 需要 brief：这份文档要写什么、怎样算好。' };
   if (!apiConfig || !apiConfig.apiKey) return { ok: false, error: '没有可用 API，无法写文档。' };
   const passages = collectPassages(sessions, args.task_ids);
-  if (!passages.length) {
-    return { ok: false, error: '还没有原文段落。先派 explore，任务书写明要覆盖的要点；交回 passages 后再调用 write_document。' };
+  const noteText = await loadResearchNotes(
+    collectArtifactIds(sessions, args.task_ids, args.artifact_ids),
+    loadArtifact,
+  );
+  if (!passages.length && !noteText) {
+    return {
+      ok: false,
+      error: '还没有可写的材料。把 explore 交回的 artifact_id 传给 artifact_ids，或等子任务留在本会话里。claims 里的逐字引文和 passages 也会用。不要因为没有旧格式的原文段落再派一轮阅读。',
+    };
   }
   const judgments = collectJudgments(sessions, args.task_ids);
   const judgmentText = formatJudgments(judgments);
-  const poolText = formatPassages(passages);
+  const poolText = [
+    passages.length ? formatPassages(passages) : '',
+    noteText ? `研究笔记（调查员的完整笔记，不是逐字引文。数字以笔记里写明的为准）：\n${noteText}` : '',
+  ].filter(Boolean).join('\n\n');
   const cover = asList(args.must_cover);
   const briefBlock = [
     `体裁：${genre}`,
@@ -166,6 +226,8 @@ export async function writeDocument(args = {}, {
         `你按用户要的体裁「${genre}」写一份可交付文档。只输出文档正文。`,
         genreGuide(genre),
         '若给了调查员的判断，你的结论要在那个判断上再推进一步，不要把它再说一遍。',
+        '必须先写明确结论，再写论证。事实必须有据；判断可以超出原文，但必须说明依据、反方和证伪条件。',
+        '禁止两边下注、虚假平衡、用视情况而定或需要进一步研究替代当前判断。风险要写，但风险不是不表态的理由。',
         '先把判断写完，不要在正文里挂出处。出处会在定稿后另挂。',
         '数字必须来自给定原文，或由这些数字算出。写明在算什么。原文里没有、又算不出来的数字不要写。',
         '判断留在正文里。原文没有这句话，不是删掉它的理由。不要把写作规矩写进正文。',
@@ -173,7 +235,7 @@ export async function writeDocument(args = {}, {
         '不要套用固定的研报章节，除非体裁就是研报。',
       ].join('\n'),
     },
-    { role: 'user', content: `${briefBlock}${judgmentText ? `\n\n## 调查员的判断\n${judgmentText}` : ''}\n\n## 原文\n${poolText}` },
+    { role: 'user', content: `${briefBlock}${analysisBlock ? `\n\n${analysisBlock}` : ''}${judgmentText ? `\n\n## 调查员的判断\n${judgmentText}` : ''}\n\n## 原文\n${poolText}` },
   ], [], apiConfig, () => {}, signal);
   emitUsage(ctx, draft.usage);
   let markdown = String(draft.content || '').trim();
@@ -186,11 +248,12 @@ export async function writeDocument(args = {}, {
         '对照原文改这一份文档。只输出下面两段，不要解释。',
         `${DOC_MARK}`,
         '改后的完整文档。只删编造的数字：原文里没有、并且无法用原文数字算出来的数字。判断、机构名、期限、专名都留着。不要因为某句原文里没有就删句或改写判断。写作说明里的 ![说明](img:id) 行必须原样留在对应章节。',
+        '保留明确判断和倾向。不要把结论改写成两边下注；只删编造的数字，并让建议继续保留代价和停止条件。',
         `${GAP_MARK}`,
         '每行一个正文里当作事实使用、但原文没有也算不出来的数字。判断不要列入。没有就留空。',
       ].join('\n'),
     },
-    { role: 'user', content: `${briefBlock}${judgmentText ? `\n\n## 调查员的判断\n${judgmentText}` : ''}\n\n## 原文\n${poolText}\n\n## 初稿\n${markdown}` },
+    { role: 'user', content: `${briefBlock}${analysisBlock ? `\n\n${analysisBlock}` : ''}${judgmentText ? `\n\n## 调查员的判断\n${judgmentText}` : ''}\n\n## 原文\n${poolText}\n\n## 初稿\n${markdown}` },
   ], [], apiConfig, () => {}, signal);
   emitUsage(ctx, revised.usage);
   const split = splitDraft(revised.content || '');
@@ -202,7 +265,7 @@ export async function writeDocument(args = {}, {
       note: '这些数字原文里没有，也算不出来，文档未保存。补到对应材料后再调用 write_document。',
     };
   }
-  if (genre === '研报') {
+  if (genre === '研报' && passages.length) {
     const cited = await chat([
       {
         role: 'system',
@@ -222,5 +285,8 @@ export async function writeDocument(args = {}, {
     title: titleOf(markdown, genre, args.title),
     markdown,
     passageCount: passages.length,
+    analysis: args.analysis || null,
   };
 }
+
+

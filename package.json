@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "test": "npm run test:smoke",
-    "test:smoke": "node test/workspace-smoke.mjs && node test/plan-smoke.mjs && node test/project-concurrency-smoke.mjs && node test/subagent-smoke.mjs && node test/agent-pipeline-smoke.mjs && node test/report-smoke.mjs && node test/providers-smoke.mjs && node test/memory-retrieve-smoke.mjs && node test/search-smoke.mjs && node test/heartbeat-smoke.mjs && node test/scope-quiz-smoke.mjs && node test/plot-spec-smoke.mjs && node test/api-call-smoke.mjs && node test/vision-probe-smoke.mjs && node test/viewport-shot-smoke.mjs && node test/rss-tools-smoke.mjs && node test/license-smoke.mjs && node test/doc-text-smoke.mjs && node test/timeline-smoke.mjs && node test/activity-smoke.mjs && node test/trace-smoke.mjs && node test/decision-smoke.mjs && node test/docx-headless-smoke.mjs && node test/xlsx-headless-smoke.mjs && node test/pdf-repair-smoke.mjs && node test/docx-chart-smoke.mjs && node test/place-images-smoke.mjs && node test/inline-media-smoke.mjs && node test/figure-catalog-smoke.mjs",
+    "test:image": "node test/image-workflow-smoke.mjs",
+    "test:smoke": "node test/workspace-smoke.mjs && node test/plan-smoke.mjs && node test/project-concurrency-smoke.mjs && node test/subagent-smoke.mjs && node test/agent-pipeline-smoke.mjs && node test/analysis-smoke.mjs && node test/net-retry-smoke.mjs && node test/run-settle-smoke.mjs && node test/report-smoke.mjs && node test/providers-smoke.mjs && node test/memory-retrieve-smoke.mjs && node test/search-smoke.mjs && node test/heartbeat-smoke.mjs && node test/heartbeat-background-smoke.mjs && node test/scope-quiz-smoke.mjs && node test/plot-spec-smoke.mjs && node test/api-call-smoke.mjs && node test/vision-probe-smoke.mjs && node test/viewport-shot-smoke.mjs && node test/rss-tools-smoke.mjs && node test/webfeed-smoke.mjs && node test/offscreen-csp-smoke.mjs && node test/agent-finalize-smoke.mjs && node test/doc-text-smoke.mjs && node test/timeline-smoke.mjs && node test/activity-smoke.mjs && node test/trace-smoke.mjs && node test/decision-smoke.mjs && node test/docx-headless-smoke.mjs && node test/xlsx-headless-smoke.mjs && node test/pdf-repair-smoke.mjs && node test/docx-chart-smoke.mjs && node test/place-images-smoke.mjs && node test/image-workflow-smoke.mjs && node test/inline-media-smoke.mjs && node test/figure-catalog-smoke.mjs",
     "build": "node build.js",
-    "dev": "node build.js && echo 'Load dist/ folder in chrome://extensions'"
+    "dev": "node build.js && echo 'Load dist/ folder in chrome://extensions'",
+    "gen:presets": "node scripts/gen-presets.mjs"
   },
   "dependencies": {
     "@antv/g2": "^5.4.8",
@@ -38,3 +40,5 @@
     "@xmldom/xmldom": "0.9.12"
   }
 }
+
+

@@ -5,10 +5,13 @@ import {
   filterToolsForAgent, parseAgentMentions, formatTaskResult,
   validateCustomAgent, BUILTIN_AGENTS, formatAgentCatalog, serializeSubagentSessions,
   restoreSubagentSessions, allowedToolNames, revisionRequestFor,
+  classifySubagentLlmError, subagentHasRecoverableProgress,
+  SUBAGENT_LLM_NETWORK_RECOVERIES, SUBAGENT_NETWORK_RESUME_HINT,
 } from '../src/lib/subagent-core.js';
 import { isExploreInteractAllowed, PARENT_ONLY_TOOLS } from '../src/lib/subagent-policy.js';
 import { subagentCardHtml } from '../src/lib/subagent-ui.js';
 import { CHAT_TOOLS, buildChatTools } from '../src/lib/tools.js';
+import { SUBMIT_RESEARCH_TOOL, validateResearchSubmission } from '../src/lib/research-result.js';
 import { SUBAGENT_MAX_PARALLEL, SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_TABS, clampSubagentMaxParallel, clampSubagentMaxTabs } from '../src/lib/limits.js';
 import { commitRoundToolTranscript } from '../src/lib/tool-round-messages.js';
 import { convertMessages as antConvert } from '../src/lib/providers/anthropic-messages.js';
@@ -34,12 +37,20 @@ ok(names.includes('call_api'), 'CHAT_TOOLS 含 call_api');
 ok(names.includes('browser_act'), 'CHAT_TOOLS 含 browser_act');
 ok(names.includes('plan'), 'CHAT_TOOLS 含 plan');
 ok(names.includes('write_document'), 'CHAT_TOOLS 含 write_document');
-ok(names.length === 41, '41 个工具');
+ok(names.length === 42, '42 个工具');
+ok(!names.includes('confirm_collect') && !names.includes('cancel_collect') && !names.includes('clear_context'), '采集确认与清空上下文已隐藏');
+ok(names.includes('collect_content') && names.includes('auto_compact'), '采集与压缩仍可用');
+ok(names.includes('check_facts'), 'CHAT_TOOLS 含 check_facts');
+ok(names.includes('review_argument'), 'CHAT_TOOLS 含 review_argument');
+ok(names.includes('write_research_artifact'), 'CHAT_TOOLS 含 write_research_artifact');
+ok(names.includes('analyst_memo'), 'CHAT_TOOLS 含 analyst_memo');
+ok(names.includes('load_framework'), 'CHAT_TOOLS 含 load_framework');
 ok(buildChatTools(BUILTIN_AGENTS).some((t) => t.function.name === 'task' && /explore/.test(t.function.description)), 'buildChatTools 注入类型列表');
 ok(/最多 3/.test(buildChatTools(BUILTIN_AGENTS).find((t) => t.function.name === 'task').function.description), 'task 描述默认并行上限');
 ok(/最多 5/.test(buildChatTools(BUILTIN_AGENTS, { maxParallel: 5 }).find((t) => t.function.name === 'task').function.description), 'task 描述写入自定义并行上限');
 const taskDesc = CHAT_TOOLS.find((t) => t.function.name === 'task').function.description;
 ok(!/不要夹杂/.test(taskDesc) && /必须用/.test(taskDesc), 'task 描述允许夹杂并正向委派');
+ok(/网络中断/.test(taskDesc) && /task_id 续传/.test(taskDesc), 'task 描述要求网络中断后续传');
 ok(/主动使用/.test(BUILTIN_AGENTS[0].description), 'explore description 写何时主动用');
 ok(/自动关/.test(BUILTIN_AGENTS[0].prompt), 'explore 承诺任务结束关标签');
 const longText = 'x'.repeat(40000);
@@ -62,6 +73,7 @@ ok(!exploreTools.includes('notebook'), 'explore 不能写笔记本（父级专�
 ok(!exploreTools.includes('plot_chart'), 'explore 不能画图');
 ok(!exploreTools.includes('place_images'), 'explore 不能交货图片');
 ok(exploreTools.includes('call_api'), 'explore 可只读调 API');
+ok(exploreTools.includes('write_research_artifact'), 'explore 可写研究笔记 artifact');
 
 const generalTools = filterToolsForAgent(BUILTIN_AGENTS[1], CHAT_TOOLS).map((t) => t.function.name);
 ok(!generalTools.includes('task') && generalTools.includes('create_document'), 'general 可写库但不能套娃');
@@ -85,6 +97,9 @@ ok(parseAgentMentions('email@x.com 不是 mention', ['explore']).length === 0, '
 
 const envelope = JSON.parse(formatTaskResult({ id: 'sg_1', type: 'explore', state: 'completed', summary: '调研', text: '结论' }));
 ok(envelope.state === 'completed' && envelope.task_id === 'sg_1' && envelope.message === '结论', 'task 结果 JSON');
+ok(SUBMIT_RESEARCH_TOOL.function.name === 'submit_research', 'Sub 使用 submit_research');
+const rr = validateResearchSubmission({ summary: '判断', artifact_id: 'doc_note', sources: ['doc_1#c1'], gaps: [] });
+ok(!rr.error && rr.research.artifact_id === 'doc_note', '轻量研究交回校验');
 
 ok(validateCustomAgent({ name: 'Explore', description: 'x', prompt: 'y' }) , '与内置重名被拒');
 ok(validateCustomAgent({ name: 'reviewer', description: '审稿', prompt: '你是审稿人' }) === null, '合法自定义');
@@ -136,4 +151,20 @@ const histArr = [{ role: 'user', content: 'go' }];
 commitRoundToolTranscript(apiArr, histArr, assistantTc, [{ api: toolApi, history: toolHist }]);
 ok(apiArr.length === 3 && histArr.length === 3 && histArr[2].content === 'trunc', '分数组时历史可截断');
 
+const netErr = new TypeError('network error');
+ok(SUBAGENT_LLM_NETWORK_RECOVERIES === 2, '循环级网络恢复次数为 2');
+ok(/task_id 续传/.test(SUBAGENT_NETWORK_RESUME_HINT), '续传提示含 task_id');
+ok(!subagentHasRecoverableProgress([{ role: 'system', content: 's' }, { role: 'user', content: 'go' }]), '仅任务书不算进度');
+ok(subagentHasRecoverableProgress([{ role: 'tool', tool_call_id: 'c1', content: 'hit' }]), '工具结果算进度');
+ok(classifySubagentLlmError({ name: 'AbortError' }).action === 'abort', '用户中止不重试');
+ok(classifySubagentLlmError({ status: 401, message: 'API 401' }).action === 'throw', '401 不重试');
+const retryOnce = classifySubagentLlmError(netErr, { recoveries: 0, hasProgress: true });
+ok(retryOnce.action === 'retry' && retryOnce.recoveries === 1 && retryOnce.delayMs >= 0, '首次网络错误循环重试');
+ok(classifySubagentLlmError(netErr, { recoveries: 2, hasProgress: true }).action === 'salvage', '有进度且重试耗尽则保留会话');
+ok(classifySubagentLlmError(netErr, { recoveries: 2, hasProgress: false }).action === 'throw', '无进度且重试耗尽才整路失败');
+
 console.log(`subagent-smoke: ${passed} ok`);
+
+
+
+

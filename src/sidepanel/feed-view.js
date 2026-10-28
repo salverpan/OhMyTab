@@ -4,6 +4,7 @@
  */
 
 import { pickLocalFiles, OPML_PICK_TYPES } from '../lib/pick-files.js';
+import { initWebFeedBuilder } from './webfeed-view.js';
 
 const qs = (sel) => document.querySelector(sel);
 const qsa = (sel) => document.querySelectorAll(sel);
@@ -146,7 +147,7 @@ function scheduleSidebarRefresh() {
   }, 600);
 }
 
-function send(type, data) {
+function send(type, data, timeoutMs = 8000) {
   return new Promise((resolve) => {
     let settled = false;
     const timer = setTimeout(() => {
@@ -154,7 +155,7 @@ function send(type, data) {
       settled = true;
       // SW 被 kill / 无响应：兜底返回 null，避免 promise 挂起 + 未处理拒绝
       resolve(null);
-    }, 8000);
+    }, timeoutMs);
     try {
       chrome.runtime.sendMessage({ type, data: data || {} }).then(
         (resp) => {
@@ -184,7 +185,7 @@ function send(type, data) {
  * Build a chat prompt that asks the AI to search the web for the original
  * article behind a link-less RSS item, then collect it. The user has clicked
  * "加入来源", so we make the intent explicit and let the AI drive the rest
- * (search_web → collect_content → confirm_collect).
+ * (search_web -> collect_content direct).
  */
 function buildAiSearchPrompt(payload) {
   const title = (payload?.title || '').replace(/\s+/g, ' ').trim();
@@ -193,8 +194,8 @@ function buildAiSearchPrompt(payload) {
     '这条 RSS 没有原文链接，请帮我找到原始来源并直接加入来源（不需要我确认，直接入库）：',
     title ? `标题：${title}` : '',
     summary ? `摘要：${summary}` : '',
-    '步骤：先用 search_web 找到权威原始来源（优先官方/政府/大型媒体），命中后调用 collect_content 传入找到的 URL，然后**立即**调用 confirm_collect 完成入库，不要等我说"确认"。若搜不到可靠来源，直接用上面的标题+摘要作为文本调用 collect_content，然后**立即** confirm_collect 入库（不要捏造细节）。',
-    '重要：这是一次性授权，collect_content 后直接 confirm_collect，不要再问我"是否加入来源"。',
+    '步骤：先用 search_web 找到权威原始来源（优先官方/政府/大型媒体），命中后调用 collect_content 传入找到的 URL，直接入库，不要等我说"确认"。若搜不到可靠来源，直接用上面的标题+摘要作为文本调用 collect_content 入库（不要捏造细节）。',
+    '重要：这是一次性授权，collect_content 直接入库，不要再问我"是否加入来源"。',
   ];
   return parts.filter(Boolean).join('\n');
 }
@@ -220,6 +221,17 @@ export function initFeedView(opts = {}) {
   }
   feedInitialized = true;
   bindEvents();
+  initWebFeedBuilder({
+    send,
+    showToast: _showToast,
+    escHtml: _escHtml,
+    escAttr: _escAttr,
+    onSaved: async (feedId) => {
+      if (feedId) state.activeFeedId = feedId;
+      await reloadSidebar();
+      await reloadItems();
+    },
+  });
   reloadSidebar();
   reloadItems();
 }
@@ -463,16 +475,34 @@ function confirmDialog(message, { okLabel = '确定', cancelLabel = '取消' } =
 /* ---- Edit dialog ---- */
 
 let editingFeedId = null;
+let editingFeed = null;
 let lastDialogTrigger = null; // 对话框打开前的焦点元素，关闭后还原
 
 function openEditDialog(feed) {
   editingFeedId = feed.id;
+  editingFeed = feed;
   lastDialogTrigger = document.activeElement;
   const dialog = qs('#feedEditDialog');
   if (!dialog) return;
   dialog.style.display = '';
   qs('#feedEditTitle').value = feed.title || '';
   qs('#feedEditUrl').value = feed.url || '';
+  const intervalEl = qs('#feedEditInterval');
+  if (intervalEl) intervalEl.value = String(Number(feed.intervalMin) || 0);
+  const kindHint = qs('#feedEditKindHint');
+  const urlLabel = qs('#feedEditUrlLabel');
+  const isWebpage = feed.kind === 'webpage';
+  if (kindHint) {
+    kindHint.hidden = !isWebpage;
+    kindHint.textContent = isWebpage
+      ? '这是由网页元素创建的源。修改页面 URL 时会同步更新抓取配方；条目选择器需删除后重新创建。'
+      : '';
+  }
+  if (urlLabel) urlLabel.textContent = isWebpage ? '页面 URL' : 'URL';
+  const refreshModeField = qs('#feedEditRefreshModeField');
+  if (refreshModeField) refreshModeField.hidden = !isWebpage;
+  const refreshModeSelect = qs('#feedEditRefreshMode');
+  if (refreshModeSelect) refreshModeSelect.value = feed.refreshMode || 'auto';
   qs('#feedEditMax').value = (feed.maxItems != null && feed.maxItems !== '') ? feed.maxItems : '';
   qs('#feedEditFrom').value = feed.fetchFrom || '';
   qs('#feedEditTo').value = feed.fetchTo || '';
@@ -484,6 +514,7 @@ function openEditDialog(feed) {
 
 function closeEditDialog() {
   editingFeedId = null;
+  editingFeed = null;
   const dialog = qs('#feedEditDialog');
   if (dialog) dialog.style.display = 'none';
   if (lastDialogTrigger && typeof lastDialogTrigger.focus === 'function') lastDialogTrigger.focus();
@@ -495,6 +526,7 @@ async function submitEdit() {
   const title = qs('#feedEditTitle').value.trim();
   const url = qs('#feedEditUrl').value.trim();
   const maxRaw = qs('#feedEditMax').value.trim();
+  const intervalMin = Math.max(0, Math.min(1440, Number(qs('#feedEditInterval')?.value) || 0));
   const from = qs('#feedEditFrom').value || null;
   const to = qs('#feedEditTo').value || null;
 
@@ -508,9 +540,14 @@ async function submitEdit() {
   status.textContent = '保存中...';
   status.className = 'feed-dialog-status';
 
+  const updates = { title, url, intervalMin, maxItems, fetchFrom: from, fetchTo: to, autoTranslate };
+  if (editingFeed?.kind === 'webpage') {
+    updates.refreshMode = qs('#feedEditRefreshMode')?.value || 'auto';
+    if (editingFeed.recipe) updates.recipe = { ...editingFeed.recipe, pageUrl: url };
+  }
   const resp = await send('FEED_UPDATE', {
     feedId: editingFeedId,
-    updates: { title, url, maxItems, fetchFrom: from, fetchTo: to, autoTranslate },
+    updates,
   });
 
   if (resp && resp.success) {
@@ -906,9 +943,17 @@ function renderSourceRow(feed) {
     : '<div class="feed-source-icon fallback-icon">' + _escHtml((feed.title || '?').slice(0, 1)) + '</div>';
   const count = feed.totalCount || 0;
   const countBadge = count > 0 ? '<span class="feed-source-count" title="' + count + ' 条">' + count + '</span>' : '';
+  const modeLabel = { auto: '自动', http: '快速 HTTP', tab: '兼容渲染' }[feed.refreshMode || 'auto'] || '自动';
+  const transportLabel = feed.lastTransport === 'http'
+    ? ' · 上次 HTTP'
+    : (feed.lastTransport === 'tab' ? ' · 上次渲染' : '');
+  const kindBadge = feed.kind === 'webpage'
+    ? '<span class="feed-source-kind" title="网页源 · ' + _escAttr(modeLabel + transportLabel) + '">网页</span>'
+    : '';
   return '<div class="feed-source-item ' + (isActive ? 'active' : '') + '" data-feed-id="' + _escAttr(feed.id) + '" title="' + _escAttr(feed.title) + '">' +
     favicon +
     '<div class="feed-source-name">' + _escHtml(feed.title || '(无标题)') + '</div>' +
+    kindBadge +
     countBadge +
     errBadge +
     '<div class="feed-source-actions">' +
@@ -1154,6 +1199,7 @@ function createItemCard(item, feed) {
   const isExpanded = state.expandedItemIds.has(item.id);
   const isCollected = !!item.collectedEntryId;
   card.className = 'feed-item-card';
+  if (!isExpanded && item.coverUrl) card.classList.add('has-cover');
   if (isSelected) card.classList.add('selected');
   if (isExpanded) card.classList.add('expanded');
   if (isCollected) card.classList.add('collected');
@@ -1188,6 +1234,7 @@ function createItemCard(item, feed) {
       '</div>' +
       '<h3 class="feed-item-title-full">' + _escHtml(item.title || '(无标题)') + '</h3>' +
       (item.author ? '<div class="feed-item-author">' + _escHtml(item.author) + '</div>' : '') +
+      (item.coverUrl ? '<img class="feed-item-cover-full" src="' + _escAttr(item.coverUrl) + '" alt="" loading="lazy">' : '') +
       contentHTML +
       '<div class="feed-item-expanded-footer">' +
         '<a href="' + _escAttr(item.link) + '" target="_blank" rel="noopener" class="feed-item-link">原文 ↗</a>' +
@@ -1202,9 +1249,13 @@ function createItemCard(item, feed) {
     const headIcon = sourceIcon
       ? sourceIcon
       : '<div class="feed-item-source-icon">' + _escHtml((sourceName || '?').slice(0, 1)) + '</div>';
+    const cover = item.coverUrl
+      ? '<img class="feed-item-cover" src="' + _escAttr(item.coverUrl) + '" alt="" loading="lazy">'
+      : '';
     card.innerHTML =
       '<input type="checkbox" class="feed-item-check" ' + (isSelected ? 'checked' : '') + '>' +
       (isFresh ? '<span class="feed-item-new-tag">NEW</span>' : '') +
+      cover +
       '<div class="feed-item-body">' +
         '<div class="feed-item-head">' +
           headIcon +
@@ -1223,7 +1274,7 @@ function createItemCard(item, feed) {
         '</div>' +
       '</div>';
   }
-  card.querySelectorAll('img.feed-item-favicon').forEach((img) => {
+  card.querySelectorAll('img.feed-item-favicon, img.feed-item-cover, img.feed-item-cover-full').forEach((img) => {
     img.addEventListener('error', () => { img.style.display = 'none'; }, { once: true });
   });
   bindCardEvents(card, item);

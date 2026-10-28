@@ -33,7 +33,8 @@ ok(Buffer.from(back.bytes).equals(Buffer.from(raw)), 'dataUrl 往返字节一致
 const tool = CHAT_TOOLS.find((t) => t.function.name === 'place_images');
 ok(!!tool, 'CHAT_TOOLS 含 place_images');
 ok(tool.function.parameters.properties.to.enum.join(',') === 'chat,editor,document', 'to 三终点');
-ok(/screenshot=true/.test(tool.function.description) && /视口/.test(tool.function.parameters.properties.screenshot.description), '截屏=视口而不是兜底扒 img');
+ok(/screenshot=true/.test(tool.function.description) && /region_selector/.test(tool.function.description), '截屏支持视口/区域且不兜底扒 img');
+ok(tool.function.parameters.properties.persist?.enum?.join(',') === 'transient,source', '图片保存语义 persist');
 ok(PARENT_ONLY_TOOLS.has('place_images'), 'place_images 父级专属');
 
 const bad = JSON.parse(await runPlaceImages({ to: 'clipboard' }, { projectId: 'p' }));

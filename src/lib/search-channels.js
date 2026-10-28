@@ -4,10 +4,12 @@
  */
 
 import { getApiConfig, getAiChannels, getActiveChannelId } from './storage.js';
-import { nativeWebSearch } from './ai-client.js';
+import { nativeWebSearch, deepseekSearch } from './ai-client.js';
+import { withNetworkRetry } from './net-retry.js';
 import { parseDuckDuckGoHtml, parseBingHtml, formatSearchSnippets } from './search-html.js';
 import {
   normalizeSearchChannel, searchPreset, buildSearchRequest, parseSearchPayload, searchErrorMessage,
+  isOfficialDeepSeek,
 } from './search-providers.js';
 
 const SEARCH_CHANNELS_KEY = 'searchChannels';
@@ -31,10 +33,6 @@ export async function getActiveSearchChannelId() {
 
 export async function setActiveSearchChannelId(id) {
   await chrome.storage.local.set({ [ACTIVE_SEARCH_KEY]: id });
-}
-
-function isOfficialDeepSeek(apiConfig) {
-  return !!(apiConfig && apiConfig.apiKey && /(^|\.)api\.deepseek\.com($|\/)/i.test(apiConfig.baseUrl || ''));
 }
 
 /** 第一次打开：从旧的 searchProvider 下拉迁成两条内置渠道，并选中原先那一种。 */
@@ -78,21 +76,32 @@ export async function getActiveSearchChannel() {
 }
 
 async function fetchHtmlWithTimeout(url, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, {
-      signal: controller.signal,
-      headers: { Accept: 'text/html', 'Accept-Language': 'en-US,zh-CN;q=0.9' },
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    return await resp.text();
-  } catch (err) {
-    if (err && err.name === 'AbortError') throw new Error('连接超时');
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
+  return withNetworkRetry(async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        signal: controller.signal,
+        headers: { Accept: 'text/html', 'Accept-Language': 'en-US,zh-CN;q=0.9' },
+      });
+      if (!resp.ok) {
+        const e = new Error('HTTP ' + resp.status);
+        e.status = resp.status;
+        throw e;
+      }
+      return await resp.text();
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        const e = new Error('连接超时');
+        e.code = 'ETIMEDOUT';
+        e.timeout = true;
+        throw e;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }, { maxRetries: 5 });
 }
 
 async function fetchHtmlSearch(query) {
@@ -136,8 +145,11 @@ async function fetchHtmlSearch(query) {
 /**
  * 执行一家搜索渠道。
  * 返回 { label, text }。配置缺失（没 Key / 没 Base URL）抛 err.config = true，调用方不要偷偷换引擎。
+ * count / needContent 只有 DeepSeek 原生渠道使用；needContent 默认 true（要求返回正文）。
  */
-export async function executeSearchChannel(channel, query, { apiConfig, timeoutMs = 15000 } = {}) {
+export async function executeSearchChannel(channel, query, {
+  apiConfig, timeoutMs = 20000, count = 10, needContent = true,
+} = {}) {
   const ch = normalizeSearchChannel(channel);
   const q = String(query || '').trim();
   if (!q) throw new Error('需要搜索关键词');
@@ -152,9 +164,20 @@ export async function executeSearchChannel(channel, query, { apiConfig, timeoutM
     if (!isOfficialDeepSeek(apiConfig)) {
       throw new Error('当前 AI 渠道不是官方 DeepSeek');
     }
-    const text = await nativeWebSearch(q, apiConfig);
-    if (!text) throw new Error('未返回条目');
-    return { label: ch.name, text };
+    try {
+      const text = await deepseekSearch(q, apiConfig, { count, needContent, timeoutMs });
+      if (!text) throw new Error('未返回条目');
+      return { label: ch.name, text };
+    } catch (err) {
+      // 新 Search 端点未覆盖时降级旧 Responses web_search；鉴权/计费/限流错误
+      // 不降级，否则会用模型代搜掩盖真实原因。
+      if (err && (err.status === 404 || err.status === 405)) {
+        const text = await nativeWebSearch(q, apiConfig);
+        if (!text) throw new Error('未返回条目');
+        return { label: `${ch.name}（旧接口）`, text };
+      }
+      throw err;
+    }
   }
 
   const preset = searchPreset(ch.provider);
@@ -172,21 +195,35 @@ export async function executeSearchChannel(channel, query, { apiConfig, timeoutM
   const req = buildSearchRequest(ch, q);
   if (!req) throw new Error('未知搜索类型');
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(req.url, { ...req.init, signal: controller.signal });
-    let data = null;
-    try { data = await resp.json(); } catch (_) {}
-    if (!resp.ok) throw new Error(searchErrorMessage(data, resp.status));
-    const parsed = parseSearchPayload(ch.provider, data);
-    if (parsed.error && !parsed.items.length) throw new Error(parsed.error);
-    if (!parsed.items.length) throw new Error('未返回条目');
-    return { label: ch.name, text: formatSearchSnippets(parsed.items) };
-  } catch (err) {
-    if (err && err.name === 'AbortError') throw new Error('连接超时');
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
+  const result = await withNetworkRetry(async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(req.url, { ...req.init, signal: controller.signal });
+      let data = null;
+      try { data = await resp.json(); } catch (_) {}
+      if (!resp.ok) {
+        const e = new Error(searchErrorMessage(data, resp.status));
+        e.status = resp.status;
+        e.detail = searchErrorMessage(data, resp.status);
+        throw e;
+      }
+      return { resp, data };
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        const e = new Error('连接超时');
+        e.code = 'ETIMEDOUT';
+        e.timeout = true;
+        throw e;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }, { maxRetries: 5 });
+  const parsed = parseSearchPayload(ch.provider, result.data);
+  if (parsed.error && !parsed.items.length) throw new Error(parsed.error);
+  if (!parsed.items.length) throw new Error('未返回条目');
+  return { label: ch.name, text: formatSearchSnippets(parsed.items) };
 }
+

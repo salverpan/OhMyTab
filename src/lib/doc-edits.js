@@ -153,7 +153,7 @@ export function docEditsCardHtml(card, prefix = 'chat') {
   const more = total > shown.length ? `<div class="${prefix}-diff-more">…另有 ${total - shown.length} 处未展开</div>` : '';
   const name = card.doc_name || card.doc_id || '文档';
   const pending = cardPending(card.edits);
-  const tag = pending ? '待审修订' : '已写入';
+  const tag = pending ? '待审修订' : '已写入·修订留痕';
   const foot = pending
     ? '文档里仍有修订痕迹，可在阅读器或 Word 里逐条接受或拒绝'
     : '已直接写入文档';
@@ -199,3 +199,4 @@ export function docEditsListHtml(list, prefix = 'chat') {
   if (!cards.length) return '';
   return `<div class="${prefix}-diffs">${cards.map((c) => docEditsCardHtml(c, prefix)).join('')}</div>`;
 }
+
