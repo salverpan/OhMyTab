@@ -2,6 +2,7 @@
   "name": "trusted-source-collector",
   "version": "0.1.0",
   "description": "SuperCat - Chrome Extension",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "npm run test:smoke",

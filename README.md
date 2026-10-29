@@ -236,4 +236,4 @@ dist/                            构建产物，Chrome 加载这个目录
 
 ## 许可
 
-[Apache License 2.0](./LICENSE)
+[MIT License](./LICENSE)
