@@ -137,7 +137,6 @@ npm run dev       # build + 提示加载 dist/
   "name": "SuperCat",
   "version": "0.3.0",
   "description": "浏览器侧栏 AI：采集网页、联网调研、写出文档",
-  "update_url": "http://47.104.128.124/citecat/update.xml",
   "permissions": ["storage", "sidePanel", "tabs", "scripting", "webNavigation", "alarms", "debugger", "unlimitedStorage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background/service-worker.js", "type": "module" },
@@ -157,7 +156,6 @@ npm run dev       # build + 提示加载 dist/
 - **`unlimitedStorage`** 解除 `chrome.storage.local` 默认 10MB 配额（文库条目带 `fullText`、文档原件存 IDB，体积增长快）。
 - **`webNavigation`** 用于 SPA 路由（pushState / hash）变化通知 content script：监听 `onHistoryStateUpdated` + `onReferenceFragmentUpdated`，向对应 tab 发 `URL_CHANGED`；**`onCommitted` 另用于 PDF 阅读器接管**（检测 `.pdf` URL，开 SuperCat 阅读器 tab 替代内置 viewer）。
 - **`host_permissions: <all_urls>`** 覆盖所有出站请求：SW 抓取原网页、sidepanel 里 `search_web`（`fetch('https://html.duckduckgo.com/html/?q=...')` 在 panel.js 跑，不在 SW）、视频字幕 API、RSS 源等。已移除单独的 `https://duckduckgo.com/*`（`<all_urls>` 已覆盖）。
-- **`update_url`** 指向自托管更新服务器，用于扩展自更新。
 - **`web_accessible_resources`** 仅暴露 `lib/plot-runtime.js`，给页面浮动聊天窗的 content script 动态 import G2 运行时。侧栏/阅读器是扩展页，不依赖 WAR，但也走同一 URL。
 - **`icons`** 16/48/128 均使用同一张 `icon/logo.png`。
 
@@ -759,7 +757,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 | 0 | `panelCollect`  | `workspace-view.js#refresh()` | `workspace-view.js`（来源/笔记/产出三主干 + 统一预览） |
 | 1 | `panelFeed`     | `initFeedView()` | `feed-view.js`（订阅源侧栏 + 条目流 + add/edit dialog） |
 | 2 | `panelLibrary`  | `renderProjects()` | `panel.js`（项目管理） |
-| 3 | `panelSettings` | `initSettings()` | `panel.js`。**层级=使用频率**：常开区仅「接入渠道」（列表+编辑器）与「外观」（缩放）；低频组收进原生 `<details class=settings-fold>` 折叠：外部 API / 搜索与提示词 / 订阅与翻译（含索引维护）/ DOCX 导出模板 / 采集黑名单 / AI 记忆 / **子代理** / 关于与更新。视觉请求走当前渠道，设置里不再单列视觉模型。渠道列表无「当前渠道」下拉（非激活行整行点击即切换）；行内「编辑/删除」是 `.channel-icon-btn` 图标按钮（铅笔/垃圾桶 SVG，panel.js 顶部 `PENCIL_SVG`/`TRASH_SVG`），切换不再弹「已切换到…」状态文字。渠道编辑器的预设填充是**点击式芯片**（#chPresetChips）——曾用原生 select 弹层在侧栏里收不起来，勿改回下拉 |
+| 3 | `panelSettings` | `initSettings()` | `panel.js`。**层级=使用频率**：常开区仅「接入渠道」（列表+编辑器）与「外观」（缩放）；低频组收进原生 `<details class=settings-fold>` 折叠：外部 API / 搜索与提示词 / 订阅与翻译（含索引维护）/ DOCX 导出模板 / 采集黑名单 / AI 记忆 / **子代理** / 关于。视觉请求走当前渠道，设置里不再单列视觉模型。渠道列表无「当前渠道」下拉（非激活行整行点击即切换）；行内「编辑/删除」是 `.channel-icon-btn` 图标按钮（铅笔/垃圾桶 SVG，panel.js 顶部 `PENCIL_SVG`/`TRASH_SVG`），切换不再弹「已切换到…」状态文字。渠道编辑器的预设填充是**点击式芯片**（#chPresetChips）——曾用原生 select 弹层在侧栏里收不起来，勿改回下拉 |
 
 切换由 `switchPanel(targetIdx)` 控制，CSS 用 `display:none` 隐藏非活动 Panel。底部 Tab Bar 必须保持为 `#app` 的直接子元素（与 `#panelContainer` 同级）；Feed 编辑弹窗等中间区域若多写闭合标签，浏览器会提前闭合 `#app`，令 Tab Bar 落到 `body` 下并被视口裁掉。当前底栏由 `.tab-bar` 固定为 60px。
 
@@ -1008,11 +1006,7 @@ AI: create_document(format="docx", content="...\n![标题](chart:cht_xxx)\n...")
 
 > `youtubei.js` 已移除。YouTube 字幕改走 fetch watch 页 HTML + 正则 `ytInitialPlayerResponse` + captionTracks JSON（见 `video-extractor.js`）。
 
-**外部服务**（非 npm 包）：
-
-| 服务 | 用途 | 用在哪 |
-|---|---|---|
-| Update Server (`http://47.104.128.124/citecat/update.xml`) | 扩展自更新 | `manifest.json` |
+**外部服务**（非 npm 包）：无自托管更新服务器。扩展不带 `update_url`，也不检查远程版本。
 
 > 没有 Vue/任何主 UI 框架 -- sidepanel/reader 用原生 DOM 操作 + 手写事件绑定。React 仅用于 ThinkingOrb 动画组件（浮动聊天加载指示器）。新功能也请保持原生 DOM 风格。
 > 没有 TypeScript -- 全部纯 JS + JSDoc 注释（如有）。

@@ -31370,7 +31370,7 @@ const RESEARCH_PROMPTS = {
 };
 
 const RESEARCH_LABELS = {
-  gather: '调研未完成，继续',
+  gather: 'Continue',
   memo: '继续写分析师备忘录',
   write: '继续写成文档',
   review: '继续评审观点',

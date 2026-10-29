@@ -3,7 +3,6 @@
   "name": "SuperCat",
   "version": "0.3.0",
   "description": "浏览器侧栏 AI：采集网页、联网调研、写出文档",
-  "update_url": "http://47.104.128.124/citecat/update.xml",
   "permissions": [
     "storage",
     "sidePanel",

@@ -6858,62 +6858,8 @@ function bindSettingsEvents() {
     }
   });
   refreshTranslateProgress();
-  // Check for extension updates
   const versionEl = document.getElementById('extVersion');
   if (versionEl) versionEl.textContent = chrome.runtime.getManifest().version;
-
-  // Auto-reload when Chrome has downloaded an update
-  chrome.runtime.onUpdateAvailable.addListener((details) => {
-    const statusEl = document.getElementById('updateStatus');
-    if (statusEl) { statusEl.textContent = `新版本 v${details.version} 已就绪，正在重启...`; statusEl.className = 'status-msg success'; }
-    setTimeout(() => chrome.runtime.reload(), 1000);
-  });
-
-  const checkUpdateBtn = document.getElementById('checkUpdateBtn');
-  if (checkUpdateBtn) {
-    checkUpdateBtn.addEventListener('click', async () => {
-      const statusEl = document.getElementById('updateStatus');
-      checkUpdateBtn.disabled = true;
-      if (statusEl) { statusEl.textContent = '检查中...'; statusEl.className = 'status-msg'; }
-      try {
-        const resp = await fetch('http://47.104.128.124/citecat/update.xml?t=' + Date.now(), { cache: 'no-store' });
-        if (!resp.ok) throw new Error('服务器不可达');
-        const xml = await resp.text();
-        const verMatch = xml.match(/<updatecheck[^>]*version=['"]([^'"]+)['"]/);
-        const serverVersion = verMatch ? verMatch[1] : null;
-        const currentVersion = chrome.runtime.getManifest().version;
-        if (!serverVersion) {
-          if (statusEl) { statusEl.textContent = '无法解析服务器版本信息'; statusEl.className = 'status-msg'; }
-        } else if (serverVersion !== currentVersion) {
-          if (statusEl) { statusEl.textContent = `发现新版本 v${serverVersion}，正在下载...`; statusEl.className = 'status-msg success'; }
-          chrome.runtime.requestUpdateCheck(() => {});
-          // If Chrome doesn't fire onUpdateAvailable within 15s, guide user to manual update
-          let updated = false;
-          const timeout = setTimeout(() => {
-            if (!updated) {
-              const isEdge = navigator.userAgent.includes('Edg/');
-              const extPage = isEdge ? 'edge://extensions' : 'chrome://extensions';
-              chrome.tabs.create({ url: extPage });
-              if (statusEl) { statusEl.textContent = `新版本 v${serverVersion} 已就绪，已为你打开扩展管理页，请点击「更新」完成安装`; statusEl.className = 'status-msg'; }
-              checkUpdateBtn.disabled = false;
-            }
-          }, 15000);
-          chrome.runtime.onUpdateAvailable.addListener(function listener(details) {
-            updated = true;
-            clearTimeout(timeout);
-            chrome.runtime.onUpdateAvailable.removeListener(listener);
-            if (statusEl) { statusEl.textContent = `新版本 v${details.version} 已就绪，正在重启...`; statusEl.className = 'status-msg success'; }
-            setTimeout(() => chrome.runtime.reload(), 1000);
-          });
-        } else {
-          if (statusEl) { statusEl.textContent = `已是最新版本 v${currentVersion}`; statusEl.className = 'status-msg'; }
-        }
-      } catch (err) {
-        if (statusEl) { statusEl.textContent = '检查失败：' + (err.message || '网络错误'); statusEl.className = 'status-msg'; }
-      }
-      checkUpdateBtn.disabled = false;
-    });
-  }
 }
 
 function showSettingsStatus(id, msg, type) {
