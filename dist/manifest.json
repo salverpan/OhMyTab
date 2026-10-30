@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "SuperCat",
+  "name": "OhMyTab",
   "version": "0.3.0",
   "description": "浏览器侧栏 AI：采集网页、联网调研、写出文档",
   "permissions": [
@@ -32,7 +32,7 @@
     }
   ],
   "action": {
-    "default_title": "SuperCat"
+    "default_title": "OhMyTab"
   },
   "icons": {
     "16": "icon/logo.png",

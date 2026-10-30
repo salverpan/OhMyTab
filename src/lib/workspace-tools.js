@@ -88,7 +88,7 @@ export async function spillOversizedOutput(text, ctx, {
       });
     }
   } catch (err) {
-    console.warn('[SuperCat] spill oversized output failed:', err);
+    console.warn('[OhMyTab] spill oversized output failed:', err);
   }
   return raw;
 }

@@ -1,4 +1,4 @@
-/* ---- SuperCat content script ---- */
+/* ---- OhMyTab content script ---- */
 
 import { Readability } from '@mozilla/readability';
 import {
@@ -670,7 +670,7 @@ function extractStructuredMarkdown() {
       mode: 'markdown',
     };
   } catch (err) {
-    console.warn('[SuperCat] structured extraction failed:', err);
+    console.warn('[OhMyTab] structured extraction failed:', err);
     return null;
   }
 }
@@ -785,7 +785,7 @@ async function init() {
       await createPageCheckbox();
       injectAnnotationStyles();
     } catch (err) {
-      console.warn('[SuperCat] 页面按钮初始化失败:', err.message);
+      console.warn('[OhMyTab] 页面按钮初始化失败:', err.message);
     }
   }
 }
@@ -3225,7 +3225,7 @@ async function processResults() {
       } catch { continue; }
 
       if (isUrlBlacklisted(url)) {
-        console.log('[SuperCat] 黑名单隐藏:', url);
+        console.log('[OhMyTab] 黑名单隐藏:', url);
         el.classList.add('tsc-filtered');
         continue;
       }
@@ -3305,7 +3305,7 @@ function reprocessAll() {
 const themeHosts = [];
 let pageThemeMode = 'auto';
 
-function paintSuperCatTheme(mode) {
+function paintOhMyTabTheme(mode) {
   pageThemeMode = normalizeThemeMode(mode);
   const resolved = resolveTheme(pageThemeMode);
   document.documentElement.dataset.citecatTheme = resolved;
@@ -3316,24 +3316,24 @@ function paintSuperCatTheme(mode) {
 
 function registerThemeHost(el) {
   if (el && !themeHosts.includes(el)) themeHosts.push(el);
-  paintSuperCatTheme(pageThemeMode);
+  paintOhMyTabTheme(pageThemeMode);
 }
 
-function initSuperCatTheme() {
-  loadThemeMode().then((mode) => paintSuperCatTheme(mode)).catch(() => {});
+function initOhMyTabTheme() {
+  loadThemeMode().then((mode) => paintOhMyTabTheme(mode)).catch(() => {});
   try {
     matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-      if (pageThemeMode === 'auto') paintSuperCatTheme('auto');
+      if (pageThemeMode === 'auto') paintOhMyTabTheme('auto');
     });
   } catch (_) {}
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local' || !changes[THEME_KEY]) return;
-      paintSuperCatTheme(changes[THEME_KEY].newValue);
+      paintOhMyTabTheme(changes[THEME_KEY].newValue);
     });
   } catch (_) {}
 }
-initSuperCatTheme();
+initOhMyTabTheme();
 
 /* ======== Regular page: floating button ======== */
 
@@ -3947,7 +3947,7 @@ function handleChatPortMessage(m) {
     }
     try { finishAiChunk(); }
     catch (err) {
-      console.warn('[SuperCat] finish float chat failed', err);
+      console.warn('[OhMyTab] finish float chat failed', err);
       chatBusy = false;
       updateSendBtn();
     }
@@ -4064,7 +4064,7 @@ function sendChatMessage() {
   const ai = document.createElement('div');
   ai.className = 'cw-msg ai';
   // 全程常驻：orb + 右侧 shimmer 文字一行，流式正文在下方独立容器填充（不再用竖杠光标）
-  ai.innerHTML = '<div class="cw-msg-label">SuperCat</div>' +
+  ai.innerHTML = '<div class="cw-msg-label">OhMyTab</div>' +
     '<div class="cw-subagents"></div>' +
     '<p class="cw-stream"></p>' +
     '<div class="cw-thinking-row"><span class="cw-thinking-orb"></span><span class="cw-thinking-text">Thinking</span></div>';
@@ -4373,7 +4373,7 @@ function resetChatBody() {
   const body = win.querySelector('.cw-body');
   disposeChatCharts(body);
   body.innerHTML =
-    '<div class="cw-msg ai"><div class="cw-msg-label">SuperCat</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
+    '<div class="cw-msg ai"><div class="cw-msg-label">OhMyTab</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
 }
 
 function appendAiChunk(t) {
@@ -4883,7 +4883,7 @@ function onInspectClick(e) {
 }
 
 /* 从标题元素提取干净文本：跳过 svg/symbol/use/img 等图标/非文字节点，
-   避免 <h1><svg/><use href="#i-brand"/></svg>CiteCat</h1> 取出噪声。
+   避免 <h1><svg/><use href="#i-brand"/></svg>OhMyTab</h1> 取出噪声。
    textContent 会吞进 SVG 内部文本，必须手动遍历子节点。 */
 function cleanHeadingText(heading) {
   if (!heading) return '';
@@ -5440,7 +5440,7 @@ function bindCollectEvent(cb, url, title) {
       } else {
         markFail(`采集失败: ${resp.error || '未知错误'}`);
         if (resp.needsVerification) {
-          alert('SuperCat 检测到人机验证。请在当前页面完成 Cloudflare / 验证码后，再重新勾选采集。');
+          alert('OhMyTab 检测到人机验证。请在当前页面完成 Cloudflare / 验证码后，再重新勾选采集。');
         }
       }
     } catch (err) {

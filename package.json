@@ -1,7 +1,7 @@
 {
-  "name": "trusted-source-collector",
+  "name": "ohmytab",
   "version": "0.1.0",
-  "description": "SuperCat - Chrome Extension",
+  "description": "OhMyTab - Chrome Extension",
   "license": "MIT",
   "type": "module",
   "scripts": {

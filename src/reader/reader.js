@@ -1,5 +1,5 @@
 /**
- * SuperCat 文档阅读器 —— PDF / Word (.docx / .doc) / Excel (.xlsx / .csv) 在网页中的
+ * OhMyTab 文档阅读器 —— PDF / Word (.docx / .doc) / Excel (.xlsx / .csv) 在网页中的
  * 划词 / 荧光笔 / 下划线 / 片段收藏 / AI 提问。
  *
  * 浏览器内置 PDF viewer 是受保护扩展页面，content script 无法注入，
@@ -205,7 +205,7 @@ async function loadArrayBufferInner(name, ab, urlForAnnotations) {
   } catch (err) {
     viewerEl.innerHTML = '';
     showStatus('渲染失败：' + (err.message || String(err)), 6000);
-    console.error('[SuperCat reader] render failed:', err);
+    console.error('[OhMyTab reader] render failed:', err);
     return false;
   }
 }
@@ -804,7 +804,7 @@ function handleChatPortMessage(m) {
     }
     try { finishAiChunk(); }
     catch (err) {
-      console.warn('[SuperCat] finish float chat failed', err);
+      console.warn('[OhMyTab] finish float chat failed', err);
       chatBusy = false;
       updateSendBtn();
     }
@@ -919,7 +919,7 @@ function sendChatMessage() {
   const ai = document.createElement('div');
   ai.className = 'cw-msg ai';
   // 全程常驻：orb + 右侧 shimmer 文字一行，流式正文在下方独立容器填充（不再用竖杠光标）
-  ai.innerHTML = '<div class="cw-msg-label">SuperCat</div>' +
+  ai.innerHTML = '<div class="cw-msg-label">OhMyTab</div>' +
     '<div class="cw-subagents"></div>' +
     '<p class="cw-stream"></p>' +
     '<div class="cw-thinking-row"><span class="cw-thinking-orb"></span><span class="cw-thinking-text">Thinking</span></div>';
@@ -1241,7 +1241,7 @@ function resetChatBody() {
   const body = chatWin.querySelector('.cw-body');
   disposeChatCharts(body);
   body.innerHTML =
-    '<div class="cw-msg ai"><div class="cw-msg-label">SuperCat</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
+    '<div class="cw-msg ai"><div class="cw-msg-label">OhMyTab</div><p>对话上下文已清空。可以继续追问这段内容。</p></div>';
 }
 
 /* ================= 聊天窗 DOM ================= */
@@ -1517,7 +1517,7 @@ async function enterEditMode() {
   } catch (err) {
     editorHost.hidden = true;
     viewerEl.hidden = false;
-    console.error('[SuperCat reader] 编辑器初始化失败:', err);
+    console.error('[OhMyTab reader] 编辑器初始化失败:', err);
     showStatus('编辑器打开失败: ' + (err.message || String(err)), 6000);
   }
 }
@@ -1547,7 +1547,7 @@ async function exitEditMode(confirmIfDirty = true) {
     try {
       await loadArrayBuffer(docTitle, currentAb, docUrl);
     } catch (err) {
-      console.error('[SuperCat reader] 退出编辑后重渲染失败:', err);
+      console.error('[OhMyTab reader] 退出编辑后重渲染失败:', err);
     }
   }
   return true;
@@ -1636,7 +1636,7 @@ async function saveEdit() {
     showStatus('已保存：下载回本地' + (libDocId ? '，并已更新库内副本' : ''));
     return true;
   } catch (err) {
-    console.error('[SuperCat reader] 保存失败:', err);
+    console.error('[OhMyTab reader] 保存失败:', err);
     showStatus('保存失败: ' + (err.message || String(err)), 6000);
     return false;
   } finally {

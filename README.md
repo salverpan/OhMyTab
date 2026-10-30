@@ -1,4 +1,4 @@
-# SuperCat
+# OhMyTab
 
 浏览器侧栏里的 AI 采集、调研与成文助手。
 
@@ -38,7 +38,7 @@ Chrome MV3 扩展。点工具栏图标打开 Side Panel，就能读当前网页�
 3. **项目** — 多项目切换与管理。每个项目有独立的来源、笔记、产出、心跳和对话。
 4. **设置** — AI 渠道、搜索渠道、翻译、记忆、主题与清空。
 
-网页上还有：圆形勾选、检视模式、划词标注、片段收藏、浮动聊天窗。PDF / Office 直链会改写到 SuperCat 阅读器，避免落到浏览器内置 viewer（content script 进不去）。
+网页上还有：圆形勾选、检视模式、划词标注、片段收藏、浮动聊天窗。PDF / Office 直链会改写到 OhMyTab 阅读器，避免落到浏览器内置 viewer（content script 进不去）。
 
 ## 快速开始
 
@@ -54,7 +54,7 @@ npm run build
 1. 打开 `chrome://extensions`
 2. 打开「开发者模式」
 3. 「加载已解压的扩展程序」，选仓库里的 `dist/`
-4. 点工具栏 SuperCat 图标打开侧栏
+4. 点工具栏 OhMyTab 图标打开侧栏
 5. 到「设置」加一条 AI 渠道（DeepSeek / 智谱 / OpenAI / Claude / Gemini / 本地 Ollama 等）
 
 改源码后必须重新 `npm run build`，再在扩展页点「重新加载」。只改 Side Panel UI 也要 build；改 Service Worker 后必须重新加载扩展，否则还在跑旧 SW。

@@ -60,9 +60,9 @@ import { SUBAGENT_MAX_PARALLEL } from '../lib/limits.js';
 // v62: 调查员交判断、数字和对不上的地方；写稿在这个判断上再推进一步。
 // v63: DeepSeek 搜索改用 Search API，默认返回正文；结果过长溢出入库。
 // v54: 主代理看到的 task 结果按判断分组，不再平铺 claims；verification 只留未通过项。
-const PROMPT_PROTOCOL_VERSION = 'citecat-v69-2026-10-28';
+const PROMPT_PROTOCOL_VERSION = 'citecat-v70-2026-10-30';
 
-const STATIC_PREFIX = `你是 SuperCat，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
+const STATIC_PREFIX = `你是 OhMyTab，浏览器侧栏里的 AI 采集与管理助手。协议版本：${PROMPT_PROTOCOL_VERSION}。
 
 ## 决策优先级（自上而下，冲突时上层胜出）
 P1. **上下文变化 > 一切**：若「本轮上下文变化」提示项目切换或勾选变化，忽略历史消息中冲突的 id、全文、结论；确需引用旧条目时，重新用 fetch_entry 拉取当前项目里的条目。

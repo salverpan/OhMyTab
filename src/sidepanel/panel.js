@@ -112,7 +112,7 @@ function setThinkingText(text, isError) {
 
 function unmountThinkingOrb() {
   if (orbRoot) {
-    try { orbRoot.unmount(); } catch (err) { console.warn('[SuperCat] orb unmount failed:', err); }
+    try { orbRoot.unmount(); } catch (err) { console.warn('[OhMyTab] orb unmount failed:', err); }
     orbRoot = null;
   }
 }
@@ -137,7 +137,7 @@ function mountToolOrb(bubbleEl, state) {
 
 function unmountToolOrb() {
   if (toolOrbRoot) {
-    try { toolOrbRoot.unmount(); } catch (err) { console.warn('[SuperCat] tool orb unmount failed:', err); }
+    try { toolOrbRoot.unmount(); } catch (err) { console.warn('[OhMyTab] tool orb unmount failed:', err); }
     toolOrbRoot = null;
   }
   if (toolOrbEl) {
@@ -1428,7 +1428,7 @@ async function saveChatSession(pid = currentProject) {
     }
     await chrome.storage.local.set({ [chatSessionKey(pid)]: payload });
   } catch (err) {
-    console.warn('[SuperCat] save chat session failed:', err.message);
+    console.warn('[OhMyTab] save chat session failed:', err.message);
   }
 }
 
@@ -2943,9 +2943,9 @@ async function sendChatMessage(text, opts = {}) {
         const undos = [...run.toolUndos];
         run.toolUndos = [];
         toolUndos = run.toolUndos;
-        console.log(`[SuperCat] undo toast shown: ${count} 项可撤销`);
+        console.log(`[OhMyTab] undo toast shown: ${count} 项可撤销`);
         showUndoToast(`已执行 ${count} 项操作`, async () => {
-          console.log('[SuperCat] undo clicked, steps:', undos.length);
+          console.log('[OhMyTab] undo clicked, steps:', undos.length);
           let undoFailed = false;
           for (const fn of undos.reverse()) {
             try { await fn(); } catch (err) {
@@ -2953,7 +2953,7 @@ async function sendChatMessage(text, opts = {}) {
               console.error('undo step failed:', err);
             }
           }
-          console.log('[SuperCat] undo steps done, refreshing...');
+          console.log('[OhMyTab] undo steps done, refreshing...');
           try {
             const fresh = await getEntries(run.pid);
             run.entries = fresh;
@@ -2964,7 +2964,7 @@ async function sendChatMessage(text, opts = {}) {
             }
           } catch (err) {
             undoFailed = true;
-            console.error('[SuperCat] undo refresh failed:', err);
+            console.error('[OhMyTab] undo refresh failed:', err);
           }
           if (undoFailed) showToast('撤销部分失败', true);
         });
@@ -3365,7 +3365,7 @@ if (chatExportBtn) {
       return;
     }
     const dump = {
-      app: 'SuperCat',
+      app: 'OhMyTab',
       schema: 'citecat-session/v1',
       project: currentProject,
       exportedAt: new Date().toISOString(),
@@ -3378,7 +3378,7 @@ if (chatExportBtn) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `supercat-session-${currentProject}-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `ohmytab-session-${currentProject}-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   });
@@ -3731,7 +3731,7 @@ async function refreshEntriesAndRender() {
     render();
   } catch (err) {
     // 刷新的任何异常都打日志：静默吞错会让"入库不显示/删除还在"无迹可查
-    console.error('[SuperCat] refreshEntriesAndRender failed:', err);
+    console.error('[OhMyTab] refreshEntriesAndRender failed:', err);
   }
 }
 
@@ -3787,13 +3787,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
 async function init() {
   await prepareSurface();
   await ensureWorkspaceMigration().catch((err) => {
-    console.error('[SuperCat] workspace migration failed:', err);
+    console.error('[OhMyTab] workspace migration failed:', err);
   });
   await loadProjects();
   try {
     await initWorkspaceUi();
   } catch (err) {
-    console.error('[SuperCat] workspace init failed:', err);
+    console.error('[OhMyTab] workspace init failed:', err);
   }
   // 渠道系统初始化：首次运行把旧配置合成「默认」渠道；聊天头部触发按钮 + 弹出菜单
   try {
@@ -3817,7 +3817,7 @@ async function init() {
         }
       });
     }
-  } catch (err) { console.warn('[SuperCat] channel init failed:', err); }
+  } catch (err) { console.warn('[OhMyTab] channel init failed:', err); }
   chrome.storage.local.remove(['visionConfig', 'visionProbeCache', 'visionProbeCacheVer']).catch(() => {});
   entries = await getEntries(currentProject);
   await loadChatSession(); // 恢复当前项目的对话（关面板/SW 重启不丢）
@@ -3831,7 +3831,7 @@ async function init() {
 }
 
 function render() {
-  workspaceApi?.refresh().catch((err) => console.error('[SuperCat] workspace refresh failed:', err));
+  workspaceApi?.refresh().catch((err) => console.error('[OhMyTab] workspace refresh failed:', err));
   updateToolbar();
 }
 
@@ -4698,7 +4698,7 @@ function renderProjects() {
       await chrome.storage.sync.set({ projects });
       // 先留快照再清（原件字节超过上限时只恢复记录，见 project-purge.js）
       const snap = await purgeProject(id).catch((err) => {
-        console.error('[SuperCat] purgeProject failed:', err);
+        console.error('[OhMyTab] purgeProject failed:', err);
         return null;
       });
       if (wasCurrent) {
