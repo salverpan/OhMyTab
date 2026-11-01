@@ -1,9 +1,10 @@
 /**
  * 心跳定时任务（ChatGPT Tasks / agent heartbeat 模式）。
  *
- * 调度走 chrome.alarms 分钟 tick（MV3 最小粒度）。到期后由 Service Worker
- * 直接后台执行，不依赖侧栏是否打开；同一 tick 的多个到期任务并行启动。
- * 每个任务有独立 API 线程，避免并行时互相覆盖历史。任务按项目隔离。
+ * 调度走 chrome.alarms 分钟 tick（MV3 最小粒度）。到期后本质是一次定时发送：
+ * 侧栏开着就交给它走同一条对话发送（看得见、点停止就能停）；侧栏没开才由
+ * Service Worker 后台执行。后台结果写入 heartbeatInbox_<pid>，侧栏只读合并。
+ * 同一 tick 多个到期任务可并行领取，再按宿主串行或并行跑。任务按项目隔离。
  *
  * 时间模型见下方「调度模型」：once / interval / daily / weekly / cron，
  * 全部按用户本地时区解释；旧的 everyMin / dailyAt 字段仍可读。
@@ -319,6 +320,60 @@ export function computeNextRunAt(task, from = Date.now()) {
   return (until && next > until) ? null : next; // 超出截止范围就停
 }
 
+/** 两个时间戳是否落在用户本地的同一天。 */
+export function sameLocalDay(a, b = Date.now()) {
+  const x = new Date(Number(a));
+  const y = new Date(Number(b));
+  if (!Number.isFinite(x.getTime()) || !Number.isFinite(y.getTime())) return false;
+  return x.getFullYear() === y.getFullYear() && x.getMonth() === y.getMonth() && x.getDate() === y.getDate();
+}
+
+/**
+ * 错过的计划只在当天补跑。隔日的那一轮丢掉：把 nextRunAt 推到今天或未来，
+ * 跨夜卡住的 running 也清掉，不再把昨天的任务拿出来重试。
+ * 直接改传入的 task（claim 落盘 / 调用方可先拷一份做预览）。
+ */
+export function skipExpiredRun(task, now = Date.now()) {
+  if (!task) return false;
+  let changed = false;
+  const started = Number(task.runStartedAt || task.updatedAt || 0);
+  if (task.lastStatus === 'running' && started && !sameLocalDay(started, now)) {
+    task.lastStatus = 'ok';
+    task.lastError = '';
+    task.runner = null;
+    task.runStartedAt = null;
+    task.queued = false;
+    changed = true;
+  }
+  const due = Number(task.nextRunAt) || 0;
+  if (!due || due > now || sameLocalDay(due, now)) {
+    if (changed) task.updatedAt = now;
+    return changed;
+  }
+  const startToday = new Date(now);
+  startToday.setHours(0, 0, 0, 0);
+  const next = computeNextRunAt(task, startToday.getTime() - 1);
+  if (next == null) {
+    task.enabled = false;
+    task.nextRunAt = null;
+  } else {
+    task.nextRunAt = next;
+  }
+  task.updatedAt = now;
+  return true;
+}
+
+/** 展示用：隔日过期时预览跳过后的下次，不改存储。 */
+export function effectiveNextRunAt(task, now = Date.now()) {
+  if (!task) return null;
+  const due = Number(task.nextRunAt) || 0;
+  if (!due) return null;
+  if (due > now || sameLocalDay(due, now)) return due;
+  const probe = { ...task, nextRunAt: due };
+  skipExpiredRun(probe, now);
+  return probe.nextRunAt || null;
+}
+
 function computeNextRaw(s, task, from) {
   if (s.type === 'once') return Number(s.at) > from ? Number(s.at) : null;
   if (s.type === 'cron') return cronNext(s.cron, from);
@@ -353,6 +408,17 @@ async function readAll() {
 async function writeAll(tasks) {
   await chrome.storage.local.set({ [HEARTBEAT_STORAGE_KEY]: tasks });
   await ensureHeartbeatAlarm(tasks);
+}
+
+/** 跨 SW / 侧栏串行化任务表读改写，避免收尾把刚删的任务写回去。 */
+let heartbeatTasksLockTail = Promise.resolve();
+export async function withHeartbeatTasksLock(fn) {
+  if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
+    return navigator.locks.request('citecat-heartbeat-tasks', fn);
+  }
+  const run = heartbeatTasksLockTail.then(() => fn(), () => fn());
+  heartbeatTasksLockTail = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 /** 缺省 / 旧数据一律归 default，避免切项目时漏网或串库。 */
@@ -392,17 +458,37 @@ export async function getHeartbeatTask(id) {
   return (await readAll()).find((t) => t.id === id) || null;
 }
 
+/** 删掉全部心跳（含无主项目的孤儿）。设置页「删除所有项目」用。撤销走 restoreHeartbeatTasks。 */
+export async function purgeAllHeartbeatTasks() {
+  return withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const pids = new Set(all.map((t) => heartbeatProjectId(t)));
+    await writeAll([]);
+    const keys = [];
+    for (const pid of pids) {
+      keys.push(heartbeatSessionsKey(pid), heartbeatInboxKey(pid));
+    }
+    if (keys.length) {
+      try { await chrome.storage.local.remove(keys); } catch (_) {}
+    }
+    return all;
+  });
+}
+
 /** 删库时抽走该项目的心跳任务；撤销用 restoreHeartbeatTasks 写回。 */
 export async function purgeHeartbeatTasks(projectId) {
   const pid = String(projectId || 'default');
-  const all = await readAll();
-  const keep = [];
-  const removed = [];
-  for (const t of all) {
-    if (taskBelongsToProject(t, pid)) removed.push(t);
-    else keep.push(t);
-  }
-  if (removed.length) await writeAll(keep);
+  const removed = await withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const keep = [];
+    const gone = [];
+    for (const t of all) {
+      if (taskBelongsToProject(t, pid)) gone.push(t);
+      else keep.push(t);
+    }
+    if (gone.length) await writeAll(keep);
+    return gone;
+  });
   // 心跳线程与后台结果气泡跟项目一起删；否则删库后仍留孤儿历史。
   try {
     await chrome.storage.local.remove([heartbeatSessionsKey(pid), heartbeatInboxKey(pid)]);
@@ -412,63 +498,68 @@ export async function purgeHeartbeatTasks(projectId) {
 
 export async function restoreHeartbeatTasks(tasks) {
   if (!tasks || !tasks.length) return;
-  const all = await readAll();
-  const ids = new Set(all.map((t) => t.id));
-  let changed = false;
-  for (const t of tasks) {
-    if (!t || !t.id || ids.has(t.id)) continue;
-    all.push(t);
-    ids.add(t.id);
-    changed = true;
-  }
-  if (changed) await writeAll(all);
+  await withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const ids = new Set(all.map((t) => t.id));
+    let changed = false;
+    for (const t of tasks) {
+      if (!t || !t.id || ids.has(t.id)) continue;
+      all.push(t);
+      ids.add(t.id);
+      changed = true;
+    }
+    if (changed) await writeAll(all);
+  });
 }
 
 export async function upsertHeartbeatTask(fields, { projectId, createdBy = 'user' } = {}) {
-  const all = await readAll();
-  const now = Date.now();
-  if (fields.id) {
-    const idx = all.findIndex((t) => t.id === fields.id);
-    if (idx < 0) throw new Error('找不到该心跳任务');
-    const { projectId: _ignorePid, ...patch } = fields;
-    const next = { ...all[idx], ...patch, updatedAt: now, projectId: heartbeatProjectId(all[idx]) };
-    for (const k of SCHEDULE_FIELD_KEYS) delete next[k]; // 原始字段不落库，只留 schedule
-    if (applyCadence(next, fields) && next.enabled !== false) {
-      next.nextRunAt = null; // 改了周期就重排，不继承旧时刻
-      next.nextRunAt = computeNextRunAt(next, now);
+  return withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const now = Date.now();
+    if (fields.id) {
+      const idx = all.findIndex((t) => t.id === fields.id);
+      if (idx < 0) throw new Error('找不到该心跳任务');
+      const { projectId: _ignorePid, ...patch } = fields;
+      const next = { ...all[idx], ...patch, updatedAt: now, projectId: heartbeatProjectId(all[idx]) };
+      for (const k of SCHEDULE_FIELD_KEYS) delete next[k]; // 原始字段不落库，只留 schedule
+      if (applyCadence(next, fields) && next.enabled !== false) {
+        next.nextRunAt = null; // 改了周期就重排，不继承旧时刻
+        next.nextRunAt = computeNextRunAt(next, now);
+      }
+      all[idx] = next;
+      if (fields.enabled === true) next.nextRunAt = computeNextRunAt(next, now);
+      await writeAll(all);
+      return next;
     }
-    all[idx] = next;
-    if (fields.enabled === true) next.nextRunAt = computeNextRunAt(next, now);
+    const pid = String(projectId || 'default');
+    const mine = all.filter((t) => taskBelongsToProject(t, pid));
+    if (mine.length >= HEARTBEAT_MAX_TASKS) {
+      throw new Error(`该项目心跳任务最多 ${HEARTBEAT_MAX_TASKS} 条，请先删掉不用的`);
+    }
+    const task = {
+      id: 'hb_' + now.toString(36) + Math.random().toString(36).slice(2, 6),
+      projectId: pid,
+      name: String(fields.name || '').trim() || '未命名任务',
+      prompt: String(fields.prompt || '').trim(),
+      enabled: fields.enabled !== false,
+      schedule: { type: 'interval', everyMin: 30 },
+      createdAt: now,
+      updatedAt: now,
+      lastRunAt: null,
+      nextRunAt: null,
+      lastStatus: null,
+      lastError: '',
+      queued: false,
+      runner: null,
+      createdBy,
+    };
+    applyCadence(task, fields);
+    if (!task.prompt) throw new Error('心跳任务需要 prompt（到期后 AI 要做的事）');
+    task.nextRunAt = computeNextRunAt(task, now);
+    all.push(task);
     await writeAll(all);
-    return next;
-  }
-  const pid = String(projectId || 'default');
-  const mine = all.filter((t) => taskBelongsToProject(t, pid));
-  if (mine.length >= HEARTBEAT_MAX_TASKS) {
-    throw new Error(`该项目心跳任务最多 ${HEARTBEAT_MAX_TASKS} 条，请先删掉不用的`);
-  }
-  const task = {
-    id: 'hb_' + now.toString(36) + Math.random().toString(36).slice(2, 6),
-    projectId: pid,
-    name: String(fields.name || '').trim() || '未命名任务',
-    prompt: String(fields.prompt || '').trim(),
-    enabled: fields.enabled !== false,
-    schedule: { type: 'interval', everyMin: 30 },
-    createdAt: now,
-    updatedAt: now,
-    lastRunAt: null,
-    nextRunAt: null,
-    lastStatus: null,
-    lastError: '',
-    queued: false,
-    createdBy,
-  };
-  applyCadence(task, fields);
-  if (!task.prompt) throw new Error('心跳任务需要 prompt（到期后 AI 要做的事）');
-  task.nextRunAt = computeNextRunAt(task, now);
-  all.push(task);
-  await writeAll(all);
-  return task;
+    return task;
+  });
 }
 
 const SCHEDULE_FIELD_KEYS = ['every', 'everyMin', 'dailyAt', 'time', 'weekdays', 'at', 'cron', 'until'];
@@ -506,11 +597,14 @@ async function clearHeartbeatTaskData(task) {
 }
 
 export async function deleteHeartbeatTask(id) {
-  const all = await readAll();
-  const task = all.find((t) => t.id === id) || null;
-  const next = all.filter((t) => t.id !== id);
-  if (next.length === all.length) throw new Error('找不到该心跳任务');
-  await writeAll(next);
+  const task = await withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const found = all.find((t) => t.id === id) || null;
+    const next = all.filter((t) => t.id !== id);
+    if (next.length === all.length) throw new Error('找不到该心跳任务');
+    await writeAll(next);
+    return found;
+  });
   await clearHeartbeatTaskData(task);
 }
 
@@ -523,6 +617,7 @@ export async function dueHeartbeatTasks(now = Date.now()) {
     if (t.enabled === false) return false;
     if (!t.nextRunAt) return false; // 一次性任务跑完 nextRunAt=null 且已停用，双保险
     if (Number(t.nextRunAt) > now) return false;
+    if (!sameLocalDay(t.nextRunAt, now)) return false; // 隔日过期不补跑
     if (t.lastStatus === 'running') {
       return now - Number(t.updatedAt || 0) > HEARTBEAT_STALE_RUNNING_MS;
     }
@@ -532,24 +627,55 @@ export async function dueHeartbeatTasks(now = Date.now()) {
 
 /**
  * 原子领取到期任务：一次读改写把 lastStatus 标成 running，避免同一 tick / 多上下文重复执行。
- * 旧版本留下的 queued 任务也会在此直接领取，不再等侧栏打开。
+ * 领取后 runner 仍为空，侧栏或 SW 再 adoptHeartbeatRun 争谁来发这一轮。
  */
 export async function claimDueHeartbeatTasks(now = Date.now()) {
-  const all = await readAll();
-  const claimed = [];
-  let changed = false;
-  for (const t of all) {
-    if (t.enabled === false || !t.nextRunAt || Number(t.nextRunAt) > now) continue;
-    if (t.lastStatus === 'running' && now - Number(t.updatedAt || 0) <= HEARTBEAT_STALE_RUNNING_MS) continue;
-    t.lastStatus = 'running';
-    t.runStartedAt = now;
-    t.queued = false;
-    t.updatedAt = now;
-    changed = true;
-    claimed.push({ ...t });
-  }
-  if (changed) await writeAll(all);
-  return claimed;
+  return withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const claimed = [];
+    let changed = false;
+    for (const t of all) {
+      if (t.enabled === false || !t.nextRunAt) continue;
+      if (skipExpiredRun(t, now)) changed = true;
+      if (t.enabled === false || !t.nextRunAt || Number(t.nextRunAt) > now) continue;
+      if (!sameLocalDay(t.nextRunAt, now)) continue;
+      const started = Number(t.runStartedAt || t.updatedAt || 0);
+      if (
+        t.lastStatus === 'running'
+        && now - Number(t.updatedAt || 0) <= HEARTBEAT_STALE_RUNNING_MS
+        && sameLocalDay(started || t.nextRunAt, now)
+      ) continue;
+      t.lastStatus = 'running';
+      t.runner = null;
+      t.runStartedAt = now;
+      t.queued = false;
+      t.updatedAt = now;
+      changed = true;
+      claimed.push({ ...t });
+    }
+    if (changed) await writeAll(all);
+    return claimed;
+  });
+}
+
+/**
+ * 侧栏 / SW 争这一轮的执行权。同一 runner 再 adopt 是幂等成功。
+ * 返回 false 表示任务没了、已经结束，或被另一方抢走。
+ */
+export async function adoptHeartbeatRun(id, runner) {
+  const role = String(runner || '');
+  if (!id || (role !== 'panel' && role !== 'sw')) return false;
+  return withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const t = all.find((x) => x.id === id);
+    if (!t || t.lastStatus !== 'running') return false;
+    if (t.runner && t.runner !== role) return false;
+    if (t.runner === role) return true;
+    t.runner = role;
+    t.updatedAt = Date.now();
+    await writeAll(all);
+    return true;
+  });
 }
 
 export async function queuedHeartbeatTasks(projectId) {
@@ -560,28 +686,33 @@ export async function queuedHeartbeatTasks(projectId) {
 export async function markHeartbeatQueued(ids) {
   if (!ids || !ids.length) return;
   const set = new Set(ids);
-  const all = await readAll();
-  let changed = false;
-  for (const t of all) {
-    if (set.has(t.id) && !t.queued) {
-      t.queued = true;
-      t.updatedAt = Date.now();
-      changed = true;
+  await withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    let changed = false;
+    for (const t of all) {
+      if (set.has(t.id) && !t.queued) {
+        t.queued = true;
+        t.updatedAt = Date.now();
+        changed = true;
+      }
     }
-  }
-  if (changed) await writeAll(all);
+    if (changed) await writeAll(all);
+  });
 }
 
 export async function markHeartbeatRunning(id) {
-  const all = await readAll();
-  const t = all.find((x) => x.id === id);
-  if (!t) return null;
-  t.lastStatus = 'running';
-  t.runStartedAt = Date.now();
-  t.queued = false;
-  t.updatedAt = Date.now();
-  await writeAll(all);
-  return t;
+  return withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const t = all.find((x) => x.id === id);
+    if (!t) return null;
+    t.lastStatus = 'running';
+    t.runner = t.runner || 'sw';
+    t.runStartedAt = Date.now();
+    t.queued = false;
+    t.updatedAt = Date.now();
+    await writeAll(all);
+    return t;
+  });
 }
 
 /** 每次运行留一条流水，供项目概览时间线使用；只保留最近 HEARTBEAT_MAX_RUNS 条。 */
@@ -591,44 +722,51 @@ export function appendRunRecord(runs, record) {
   return list.slice(-HEARTBEAT_MAX_RUNS);
 }
 
-export async function markHeartbeatFinished(id, { ok, error, result } = {}) {
-  const all = await readAll();
-  const t = all.find((x) => x.id === id);
-  if (!t) return null;
-  const now = Date.now();
-  t.lastStatus = ok ? 'ok' : 'error';
-  t.lastError = ok ? '' : String(error || '失败');
-  t.lastRunAt = now;
-  t.queued = false;
-  if (result != null) t.lastResult = String(result || '').slice(0, 4000);
-  t.runs = appendRunRecord(t.runs, {
-    at: Number(t.runStartedAt) || now,
-    endedAt: now,
-    status: ok ? 'ok' : 'error',
-    durationMs: t.runStartedAt ? Math.max(0, now - Number(t.runStartedAt)) : 0,
-    error: ok ? '' : String(error || '失败').slice(0, 200),
-    result: result != null ? String(result || '').slice(0, 240) : '',
-  });
-  t.runStartedAt = null;
-  const s = normalizeSchedule(t);
-  if (t.enabled === false) {
-    // 暂停中：保持原计划不动
-  } else if (s.type === 'once') {
-    t.enabled = false;      // 一次性任务跑完自动停用
-    t.nextRunAt = null;
-  } else {
-    const next = computeNextRunAt(t, now);
-    if (next == null) {
-      // until 已过且没完成：停用但保留（用户要看得见它没成）
-      t.enabled = false;
+export async function markHeartbeatFinished(id, { ok, error, result, runStartedAt } = {}) {
+  return withHeartbeatTasksLock(async () => {
+    const all = await readAll();
+    const t = all.find((x) => x.id === id);
+    if (!t) return null;
+    if (t.lastStatus !== 'running') return t;
+    if (runStartedAt && Number(t.runStartedAt || 0) && Number(t.runStartedAt) !== Number(runStartedAt)) {
+      return t;
+    }
+    const now = Date.now();
+    t.lastStatus = ok ? 'ok' : 'error';
+    t.lastError = ok ? '' : String(error || '失败');
+    t.lastRunAt = now;
+    t.queued = false;
+    t.runner = null;
+    if (result != null) t.lastResult = String(result || '').slice(0, 4000);
+    t.runs = appendRunRecord(t.runs, {
+      at: Number(t.runStartedAt) || now,
+      endedAt: now,
+      status: ok ? 'ok' : 'error',
+      durationMs: t.runStartedAt ? Math.max(0, now - Number(t.runStartedAt)) : 0,
+      error: ok ? '' : String(error || '失败').slice(0, 200),
+      result: result != null ? String(result || '').slice(0, 240) : '',
+    });
+    t.runStartedAt = null;
+    const s = normalizeSchedule(t);
+    if (t.enabled === false) {
+      // 暂停中：保持原计划不动
+    } else if (s.type === 'once') {
+      t.enabled = false;      // 一次性任务跑完自动停用
       t.nextRunAt = null;
     } else {
-      t.nextRunAt = next;
+      const next = computeNextRunAt(t, now);
+      if (next == null) {
+        // until 已过且没完成：停用但保留（用户要看得见它没成）
+        t.enabled = false;
+        t.nextRunAt = null;
+      } else {
+        t.nextRunAt = next;
+      }
     }
-  }
-  t.updatedAt = now;
-  await writeAll(all);
-  return t;
+    t.updatedAt = now;
+    await writeAll(all);
+    return t;
+  });
 }
 
 export async function queuedOrDueCount(projectId) {
@@ -636,7 +774,8 @@ export async function queuedOrDueCount(projectId) {
   const list = await listHeartbeatTasks(projectId);
   return list.filter((t) => t.enabled !== false
     && t.lastStatus !== 'running'
-    && (t.queued || Number(t.nextRunAt || 0) <= now)).length;
+    && (t.queued || Number(t.nextRunAt || 0) <= now)
+    && sameLocalDay(Number(t.nextRunAt || t.updatedAt || 0), now)).length;
 }
 
 export async function ensureHeartbeatAlarm(tasks) {

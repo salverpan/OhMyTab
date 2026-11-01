@@ -381,7 +381,7 @@
               <div class="feed-dialog-field">
                 <label class="feed-dialog-checkbox">
                   <input type="checkbox" id="feedEditAutoTranslate">
-                  <span>自动翻译为中文</span>
+                  <span>自动翻译到目标语言</span>
                 </label>
               </div>
               <div id="feedEditStatus" class="feed-dialog-status"></div>
@@ -574,6 +574,15 @@
                 <input type="number" id="sgBudgetTokens" min="0" max="50000000" step="100000" placeholder="0">
               </div>
               <div class="form-group">
+                <label for="sgMainMaxRounds">主代理最多轮次（0 = 不限）</label>
+                <input type="number" id="sgMainMaxRounds" min="0" max="500" step="1" placeholder="100">
+              </div>
+              <div class="form-group">
+                <label for="sgSubMaxRounds">子代理最多轮次（0 = 不限）</label>
+                <input type="number" id="sgSubMaxRounds" min="0" max="500" step="1" placeholder="0">
+              </div>
+              <p class="sg-limit-note">接近上限前会提醒模型收尾。</p>
+              <div class="form-group">
                 <label for="sgCheckChannel">核验审查模型</label>
                 <select id="sgCheckChannel"></select>
               </div>
@@ -667,6 +676,7 @@
               <div class="form-group">
                 <label for="feedTargetLang">目标语言</label>
                 <select id="feedTargetLang">
+                  <option value="auto">跟随浏览器语言</option>
                   <option value="zh-Hans">简体中文</option>
                   <option value="zh-Hant">繁體中文</option>
                   <option value="en">English</option>
@@ -716,6 +726,14 @@
 <div class="settings-section">
             <h3>外观</h3>
             <div class="form-group">
+              <label for="uiLocaleSelect">界面语言</label>
+              <select id="uiLocaleSelect">
+                <option value="auto">自动（跟随浏览器）</option>
+                <option value="zh">简体中文</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+            <div class="form-group">
               <label for="colorSchemeSelect">颜色</label>
               <select id="colorSchemeSelect">
                 <option value="light">白天</option>
@@ -755,12 +773,12 @@
             </div>
           </div>
           <div class="settings-section is-danger">
-            <h3>清空库内容</h3>
-              <p class="settings-note">
-                清空所有项目的内容：来源、产出、文档原件、证据、笔记、标签和会话存档。保留 AI 记忆与订阅内容。清空后 4 秒内可撤销。
+            <h3>删除所有项目</h3>
+              <p class="settings-note" id="purgeAllNote">
+                删除全部项目（默认库会清空后保留），含来源、产出、文档原件、证据、笔记、标签、会话和心跳任务。保留 AI 记忆与订阅内容。删除后 4 秒内可撤销。
               </p>
               <div class="form-actions">
-                <button id="purgeAllLibraryBtn" class="btn btn-sm btn-secondary">清空所有库内容</button>
+                <button id="purgeAllLibraryBtn" class="btn btn-sm btn-secondary">删除所有项目</button>
                 <span id="purgeAllStatus" class="status-msg"></span>
               </div>
                       </div>

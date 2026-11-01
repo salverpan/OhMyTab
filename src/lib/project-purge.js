@@ -137,7 +137,7 @@ export async function restoreProject(snap) {
   return { ok: true, entries: (snap.entries || []).length };
 }
 
-/** 清空多个项目（设置页「清空所有库内容」）。返回可撤销的快照数组。 */
+/** 清空多个项目的内容（设置页「删除所有项目」会先调用这个，再从项目列表里拿掉非默认库）。返回可撤销的快照数组。 */
 export async function purgeProjects(pids) {
   const snaps = [];
   for (const pid of pids || []) {

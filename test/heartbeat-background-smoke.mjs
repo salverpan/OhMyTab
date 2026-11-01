@@ -42,7 +42,8 @@ const {
   HEARTBEAT_STORAGE_KEY, HEARTBEAT_ALARM, HEARTBEAT_STALE_RUNNING_MS,
   claimDueHeartbeatTasks, markHeartbeatFinished, queuedOrDueCount,
   heartbeatSessionsKey, heartbeatInboxKey, deleteHeartbeatTask,
-  isHeartbeatTaskRunning, runningHeartbeatProjectIds,
+  isHeartbeatTaskRunning, runningHeartbeatProjectIds, adoptHeartbeatRun,
+  purgeAllHeartbeatTasks, restoreHeartbeatTasks,
 } = await import('../src/lib/heartbeat.js');
 
 let passed = 0;
@@ -92,6 +93,14 @@ const livePids = runningHeartbeatProjectIds([
 ], now);
 ok(livePids.has('alpha') && !livePids.has('beta') && !livePids.has('gamma') && livePids.size === 1, '项目呼吸灯只跟正在跑的心跳绑定');
 
+ok(await adoptHeartbeatRun('due', 'panel') === true, '侧栏可以认领刚领取的任务');
+ok(await adoptHeartbeatRun('due', 'panel') === true, '同一 runner 再认领幂等');
+ok(await adoptHeartbeatRun('due', 'sw') === false, 'SW 抢不走已被侧栏认领的任务');
+ok(await adoptHeartbeatRun('fresh-running', 'sw') === true, '未认领的 running 可被 SW 认领');
+const staleSnap = mem.get(HEARTBEAT_STORAGE_KEY).find((t) => t.id === 'stale');
+const skippedOld = await markHeartbeatFinished('stale', { ok: true, result: 'old-run', runStartedAt: Number(staleSnap.runStartedAt) - 5 });
+ok(skippedOld.lastStatus === 'running', '过期轮次的收尾不会结束新一轮');
+
 const finished = await markHeartbeatFinished('due', { ok: true, result: '本轮结果：油价 80 美元' });
 ok(finished.lastStatus === 'ok' && finished.lastResult.includes('油价'), '成功收尾并写入最近结果');
 ok(finished.nextRunAt > now, '收尾后安排下一次');
@@ -115,5 +124,46 @@ await deleteHeartbeatTask('delete-me');
 ok(!(mem.get(heartbeatSessionsKey('p1')) || {})['delete-me'], '删任务清理任务线程');
 ok(mem.get(heartbeatInboxKey('p1')).length === 1 && mem.get(heartbeatInboxKey('p1'))[0].taskId === 'keep', '删任务只清该任务 UI 气泡');
 ok(alarms.has(HEARTBEAT_ALARM), '有启用任务时保留 1 分钟 alarm');
+
+const reviveId = 'revive-me';
+const afterDel = mem.get(HEARTBEAT_STORAGE_KEY).slice();
+afterDel.push(task(reviveId, { nextRunAt: now + 60_000, lastStatus: 'running', runStartedAt: now, updatedAt: now }));
+mem.set(HEARTBEAT_STORAGE_KEY, afterDel);
+await deleteHeartbeatTask(reviveId);
+const revived = await markHeartbeatFinished(reviveId, { ok: true, result: 'ghost' });
+ok(revived == null, '删掉后再收尾不会把任务写回来');
+ok(!(mem.get(HEARTBEAT_STORAGE_KEY) || []).some((t) => t.id === reviveId), '任务表里没有被复活的条目');
+
+const noon = new Date();
+noon.setHours(12, 0, 0, 0);
+const nineToday = new Date(noon);
+nineToday.setHours(9, 0, 0, 0);
+const nineYest = new Date(nineToday);
+nineYest.setDate(nineYest.getDate() - 1);
+mem.set(HEARTBEAT_STORAGE_KEY, [
+  task('daily-yest', { schedule: { type: 'daily', time: '09:00' }, nextRunAt: nineYest.getTime(), lastStatus: null }),
+  task('once-yest', { schedule: { type: 'once', at: nineYest.getTime() }, nextRunAt: nineYest.getTime(), lastStatus: null }),
+  task('today-overdue', { schedule: { type: 'daily', time: '09:00' }, nextRunAt: nineToday.getTime(), lastStatus: null }),
+]);
+const catchUp = await claimDueHeartbeatTasks(noon.getTime());
+const catchIds = catchUp.map((t) => t.id).sort();
+ok(catchIds.includes('daily-yest') && catchIds.includes('today-overdue'), '隔日 daily 跳到今天后仍可当天补跑；当天过期直接补');
+ok(!catchIds.includes('once-yest'), '隔日一次性任务不再领取');
+const onceSaved = mem.get(HEARTBEAT_STORAGE_KEY).find((t) => t.id === 'once-yest');
+ok(onceSaved.enabled === false && !onceSaved.nextRunAt, '隔日 once 停用且不再排期');
+
+mem.set(HEARTBEAT_STORAGE_KEY, [
+  task('orphan', { projectId: 'gone-pid', nextRunAt: now + 60_000 }),
+  task('keep-default', { projectId: 'default', nextRunAt: now + 60_000 }),
+]);
+mem.set(heartbeatSessionsKey('gone-pid'), { orphan: { history: [] } });
+mem.set(heartbeatInboxKey('gone-pid'), [{ taskId: 'orphan' }]);
+const wiped = await purgeAllHeartbeatTasks();
+ok(wiped.map((t) => t.id).sort().join(',') === 'keep-default,orphan', '全量删除返回全部任务');
+ok((mem.get(HEARTBEAT_STORAGE_KEY) || []).length === 0, '全量删除后任务表为空');
+ok(!mem.has(heartbeatSessionsKey('gone-pid')), '全量删除清掉无主项目线程');
+ok(!alarms.has(HEARTBEAT_ALARM), '没有启用任务时清掉 heartbeat alarm');
+await restoreHeartbeatTasks(wiped);
+ok((mem.get(HEARTBEAT_STORAGE_KEY) || []).some((t) => t.id === 'orphan'), '撤销能把无主心跳写回');
 
 console.log(`heartbeat-background-smoke: ${passed} ok`);

@@ -11,15 +11,15 @@ import { PROVIDER_PRESETS, PROVIDER_CATALOG } from '../lib/providers/presets.js'
 import { skinNativeSelect } from '../lib/native-select-skin.js';
 import { inferModelCaps, formatContextLabel, contextPresets, EFFORT_LEVELS, probeModelMeta, refreshModelCatalog, catalogSourceLabel, defaultWorkingContext, resolveEffortId } from '../lib/model-limits.js';
 import { peekEffortProbe, clearEffortProbe } from '../lib/effort-probe.js';
-import { AGENT_MAX_ROUNDS, AGENT_WRAP_HINT_ROUND } from '../lib/limits.js';
 import {
-  routeResearchMode, resolveLoopRounds, resolveWrapRound, nextResearchHold,
+  routeResearchMode, resolveTurnRoundCaps, nextResearchHold,
   toolsForResearchStep, researchCarryFromHistory, RESEARCH_CHILD_WAIT_MS,
 } from '../lib/research-mode.js';
 import {
   inspectTurnBudget,
   shouldFinalizeEmptyAnswer,
   FINALIZE_EMPTY_AFTER_TOOLS,
+  WRAP_HINT_APPROACHING,
   emptyToolFallbackText,
 } from '../lib/agent-finalize.js';
 import { isImageUnsupportedError } from '../lib/vision-client.js';
@@ -30,6 +30,8 @@ import {
   formatCadence, queuedOrDueCount, ensureHeartbeatAlarm, heartbeatInboxKey,
   parseEvery, normalizeSchedule, WEEKDAY_LABEL,
   isHeartbeatTaskRunning, runningHeartbeatProjectIds, HEARTBEAT_STALE_RUNNING_MS,
+  heartbeatUserText, heartbeatProjectId, markHeartbeatFinished, adoptHeartbeatRun,
+  effectiveNextRunAt, purgeAllHeartbeatTasks, restoreHeartbeatTasks,
 } from '../lib/heartbeat.js';
 import { buildChatTools } from '../lib/tools.js';
 import { initFeedView, startManualIndexRebuild } from './feed-view.js';
@@ -67,6 +69,7 @@ import { chartHostHtml, mountChatCharts, disposeChatCharts, appendChartInMessage
 import { loadConnectors, saveConnectors, formatApiCatalog, API_PRESETS, executeApiCall } from '../lib/api-call.js';
 import { usageTotalTokens } from '../lib/usage.js';
 import { THEME_KEY, applyDocumentTheme, loadThemeMode, normalizeThemeMode, saveThemeMode, watchSystemTheme } from '../lib/theme.js';
+import { initI18n, t, applyDomI18n, getUiLocalePref, setUiLocalePref } from '../lib/i18n.js';
 import gsap from 'gsap';
 // AI 思考指示器：thinking-orbs（canvas 点阵球，9 状态 / 20px 行内 / 自动深浅色）
 // 工具 → 动画状态映射抽到 lib/orb-state.js（侧栏 / 浮动 / 阅读器三处共用，保证一致）
@@ -74,6 +77,8 @@ import { createElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ThinkingOrb } from 'thinking-orbs';
 import { ORB_STATE_BY_TOOL } from '../lib/orb-state.js';
+
+applyDomI18n(document);
 
 let orbRoot = null; // ThinkingOrb 的 React root（AI 等待首个 chunk 期间显示）
 let toolOrbEl = null; // 工具执行期间的临时 orb（AI 已输出文字、主 orb 卸载后补挂）
@@ -1590,7 +1595,10 @@ async function syncHeartbeatLivePids() {
     }
   }
   heartbeatLivePids = next;
-  if (changed) renderProjectsIfIdle();
+  if (changed) {
+    renderProjectsIfIdle();
+    refreshHeartbeatBadge();
+  }
 }
 
 function ensureRun(pid) {
@@ -1623,6 +1631,7 @@ function ensureRun(pid) {
       toolUndos: [],
       backgroundAborts: new Set(),
       heartbeatTaskId: null,
+      heartbeatRunStartedAt: null,
       draining: false,
       entries: [],
       selectedIds: new Set(),
@@ -1842,12 +1851,27 @@ function mirrorScalars(run) {
   activeHeartbeatTaskId = run.heartbeatTaskId;
 }
 
+function stopAllProjectRuns() {
+  for (const run of projectRuns.values()) {
+    run.discarded = true;
+    stopRun(run);
+  }
+  projectRuns.clear();
+}
+
 function stopRun(run) {
   if (!run) return;
+  const dropped = run.queue.slice();
   run.queue = [];
   if (viewing(run)) {
     chatQueue = run.queue;
     if (chatMessagesEl) chatMessagesEl.querySelectorAll('.chat-msg.queued').forEach((el) => el.remove());
+  }
+  for (const item of dropped) {
+    if (!item || !item.heartbeatTaskId) continue;
+    markHeartbeatFinished(item.heartbeatTaskId, {
+      ok: false, error: '已中断', runStartedAt: item.heartbeatRunStartedAt,
+    }).catch(() => {});
   }
   if (run.abort) {
     try { run.abort.abort(); } catch (_) {}
@@ -2171,7 +2195,15 @@ async function continueAfterTurn(run) {
       const qb = chatMessagesEl?.querySelector(`[data-queue-id="${next.id}"]`);
       if (qb) qb.remove();
     }
-    sendChatMessage(next.text, { run, attachments: [] });
+    sendChatMessage(next.text, {
+      run,
+      attachments: next.attachments || [],
+      heartbeat: !!next.heartbeat,
+      heartbeatName: next.heartbeatName || '',
+      heartbeatTaskId: next.heartbeatTaskId || '',
+      heartbeatRunStartedAt: next.heartbeatRunStartedAt,
+      subagentFollowup: !!next.subagentFollowup,
+    });
     return;
   }
   drainRun(run);
@@ -2269,6 +2301,8 @@ function syncHeartbeatUi() {
 
 async function refreshHeartbeatBadge() {
   if (!cmdHeartbeatBtn) return;
+  const live = heartbeatLivePids.has(String(currentProject || 'default'));
+  cmdHeartbeatBtn.classList.toggle('is-live', live);
   const n = await queuedOrDueCount(currentProject);
   const old = cmdHeartbeatBtn.querySelector('.cmd-hb-badge');
   if (old) old.remove();
@@ -2276,6 +2310,11 @@ async function refreshHeartbeatBadge() {
     const b = document.createElement('span');
     b.className = 'cmd-hb-badge';
     b.textContent = n > 9 ? '9+' : String(n);
+    cmdHeartbeatBtn.appendChild(b);
+  } else if (live) {
+    const b = document.createElement('span');
+    b.className = 'cmd-hb-badge is-live';
+    b.textContent = '';
     cmdHeartbeatBtn.appendChild(b);
   }
   try {
@@ -2379,25 +2418,30 @@ async function renderHeartbeatList() {
   const cards = tasks.map((t) => {
     if (heartbeatEditingId === t.id) return hbFormHtml(t);
     const running = isHeartbeatTaskRunning(t);
+    const nextLabel = formatNextRun(effectiveNextRunAt(t) || t.nextRunAt);
     const st = running
-      ? '后台执行中'
+      ? (t.runner === 'sw' ? '后台执行中' : '执行中')
       : t.queued
-        ? '等待后台执行'
+        ? '排队中'
         : t.lastStatus === 'error'
-          ? (`上次失败${formatNextRun(t.nextRunAt) ? ' · ' + formatNextRun(t.nextRunAt) : ''}`)
-          : formatNextRun(t.nextRunAt);
+          ? (`上次失败${nextLabel ? ' · ' + nextLabel : ''}`)
+          : nextLabel;
     // 正在跑时不展示上一轮失败文案，否则会「显示失败了、任务还在进行」。
     const lastResult = (!running && t.lastResult)
       ? `<div class="hb-card-result">${escHtml(String(t.lastResult).replace(/\s+/g, ' ').slice(0, 220))}</div>`
       : '';
-    return `<div class="hb-card" data-id="${escAttr(t.id)}">
+    const stopBtn = running
+      ? '<button type="button" class="hb-icon-btn danger" data-act="stop" title="停止本次">■</button>'
+      : '';
+    return `<div class="hb-card${running ? ' is-running' : ''}" data-id="${escAttr(t.id)}">
       <div class="hb-card-top">
         <button type="button" class="hb-toggle${t.enabled !== false ? ' on' : ''}" data-act="toggle" title="启用/暂停"></button>
         <div style="min-width:0;flex:1">
           <div class="hb-card-name">${escHtml(t.name)}</div>
-          <div class="hb-card-meta">${escHtml(formatCadence(t))} · ${escHtml(st || '')}</div>
+          <div class="hb-card-meta${running ? ' is-live' : ''}">${escHtml(formatCadence(t))} · ${escHtml(st || '')}</div>
         </div>
         <div class="hb-card-actions">
+          ${stopBtn}
           <button type="button" class="hb-icon-btn" data-act="edit" title="编辑">✎</button>
           <button type="button" class="hb-icon-btn danger" data-act="del" title="删除">✕</button>
         </div>
@@ -2480,7 +2524,14 @@ heartbeatListEl?.addEventListener('click', async (e) => {
   if (!id) return;
   const act = actBtn.dataset.act;
   if (act === 'edit') { heartbeatEditingId = id; renderHeartbeatList(); return; }
+  if (act === 'stop') {
+    await abortHeartbeatTask(id);
+    await renderHeartbeatList();
+    refreshHeartbeatBadge();
+    return;
+  }
   if (act === 'del') {
+    await abortHeartbeatTask(id);
     await deleteHeartbeatTask(id);
     await renderHeartbeatList();
     refreshHeartbeatBadge();
@@ -2489,7 +2540,9 @@ heartbeatListEl?.addEventListener('click', async (e) => {
   if (act === 'toggle') {
     const tasks = await listHeartbeatTasks(currentProject);
     const t = tasks.find((x) => x.id === id);
-    await upsertHeartbeatTask({ id, enabled: !(t && t.enabled !== false) });
+    const nextEnabled = !(t && t.enabled !== false);
+    await upsertHeartbeatTask({ id, enabled: nextEnabled });
+    if (!nextEnabled) await abortHeartbeatTask(id);
     await renderHeartbeatList();
     refreshHeartbeatBadge();
   }
@@ -2497,7 +2550,78 @@ heartbeatListEl?.addEventListener('click', async (e) => {
 
 let activeHeartbeatTaskId = null;
 
-// 心跳任务现在由 Service Worker 后台执行；侧栏只负责展示状态与结果，不再从 UI 领取队列。
+async function abortHeartbeatTask(id) {
+  if (!id) return;
+  for (const run of projectRuns.values()) {
+    const dropped = run.queue.filter((q) => q && q.heartbeatTaskId === id);
+    if (dropped.length) {
+      run.queue = run.queue.filter((q) => !q || q.heartbeatTaskId !== id);
+      if (viewing(run)) {
+        chatQueue = run.queue;
+        for (const item of dropped) {
+          chatMessagesEl?.querySelector(`[data-queue-id="${item.id}"]`)?.remove();
+        }
+      }
+      for (const item of dropped) {
+        markHeartbeatFinished(item.heartbeatTaskId, {
+          ok: false, error: '已取消', runStartedAt: item.heartbeatRunStartedAt,
+        }).catch(() => {});
+      }
+    }
+    if (run.heartbeatTaskId === id) stopRun(run);
+  }
+  try {
+    await chrome.runtime.sendMessage({ type: 'HEARTBEAT_ABORT', taskId: id });
+  } catch (_) {}
+}
+
+async function takeHeartbeatOffer(task) {
+  if (!task || !task.id) return false;
+  const pid = heartbeatProjectId(task);
+  const run = ensureRun(pid);
+  if (run.discarded) return false;
+  const ok = await adoptHeartbeatRun(task.id, 'panel');
+  if (!ok) return false;
+  const userText = heartbeatUserText(task);
+  const opts = {
+    run,
+    attachments: [],
+    heartbeat: true,
+    heartbeatName: task.name || '定时任务',
+    heartbeatTaskId: task.id,
+    heartbeatRunStartedAt: task.runStartedAt,
+  };
+  if (run.inProgress || run.draining) {
+    const id = 'q_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    run.queue.push({
+      id,
+      text: userText,
+      heartbeat: true,
+      heartbeatName: opts.heartbeatName,
+      heartbeatTaskId: task.id,
+      heartbeatRunStartedAt: task.runStartedAt,
+    });
+    if (viewing(run)) {
+      chatQueue = run.queue;
+      appendQueuedBubble(id, userText);
+    } else {
+      showToast(`心跳「${task.name || '定时任务'}」排队等待当前对话结束`);
+    }
+    return true;
+  }
+  sendChatMessage(userText, opts).catch((err) => {
+    console.warn('[hb] panel send failed', err);
+    markHeartbeatFinished(task.id, {
+      ok: false,
+      error: (err && err.message) || '发送失败',
+      runStartedAt: task.runStartedAt,
+    }).catch(() => {});
+  });
+  if (!viewing(run)) showToast(`心跳「${task.name || '定时任务'}」已开始`);
+  return true;
+}
+
+// 心跳到期后由侧栏走同一条 sendChatMessage；侧栏没开才由 SW 后台发。
 // 这里仍保留 pendingFollowups 的续跑逻辑（后台子代理完成后要回到当前对话）。
 async function drainRun(run) {
   if (!run || run.discarded || run.inProgress || run.draining) return;
@@ -2513,12 +2637,27 @@ async function drainRun(run) {
 // 兼容侧栏自己的历史气泡逻辑：后台任务已完成并已由 SW 落库，这里只清理本地标记。
 async function closeHeartbeatTurn(ok, error, run) {
   const id = run ? run.heartbeatTaskId : activeHeartbeatTaskId;
-  if (run) run.heartbeatTaskId = null;
+  const startedAt = run ? run.heartbeatRunStartedAt : null;
+  const lastAi = [...(run && run.messages || [])].reverse().find((m) => m && m.role === 'ai');
+  if (run) {
+    run.heartbeatTaskId = null;
+    run.heartbeatRunStartedAt = null;
+  }
   if (!run || viewing(run)) activeHeartbeatTaskId = null;
-  if (id && (!run || viewing(run))) {
+  if (!id) return;
+  try {
+    await markHeartbeatFinished(id, {
+      ok,
+      error,
+      result: lastAi ? String(lastAi.text || '').slice(0, 4000) : '',
+      runStartedAt: startedAt,
+    });
+  } catch (_) {}
+  if (!run || viewing(run)) {
     renderHeartbeatList();
     refreshHeartbeatBadge();
   }
+  syncHeartbeatLivePids().catch(() => {});
 }
 
 // Update button icon when input changes
@@ -2623,6 +2762,7 @@ async function sendChatMessage(text, opts = {}) {
   }, run);
   if (opts.heartbeatTaskId) {
     run.heartbeatTaskId = opts.heartbeatTaskId;
+    run.heartbeatRunStartedAt = opts.heartbeatRunStartedAt || run.heartbeatRunStartedAt || Date.now();
     if (viewing(run)) activeHeartbeatTaskId = opts.heartbeatTaskId;
   }
 
@@ -2651,6 +2791,9 @@ async function sendChatMessage(text, opts = {}) {
     attachmentCount: turnAttachments.length,
     unfinishedResearch: researchCarryFromHistory(run.history),
   });
+  const agentLimits = await getSubagentLimits().catch(() => ({}));
+  const roundCaps = resolveTurnRoundCaps(researchRoute.policy, agentLimits.mainMaxRounds);
+  researchRoute.maxRounds = Number.isFinite(roundCaps.maxRounds) ? roundCaps.maxRounds : 0;
   run.researchRoute = researchRoute;
   const ctx = makeRunCtx(run);
   ctx.apiConfig = apiCfg;
@@ -2666,7 +2809,7 @@ async function sendChatMessage(text, opts = {}) {
     turnSpawnedSubagents = run.turnSpawned;
   }
   setRunActive(run, true);
-  const chatTools = buildChatTools(await getAgentListCached(), await getSubagentLimits().catch(() => ({})));
+  const chatTools = buildChatTools(await getAgentListCached(), agentLimits);
 
   // Build request. History compaction is deferred until AFTER the response so
   // this turn is not blocked; the next turn will benefit from the shrunken
@@ -2700,9 +2843,8 @@ async function sendChatMessage(text, opts = {}) {
   let firstChunkReceived = false;
   run.toolUndos = [];
   if (viewing(run)) toolUndos = run.toolUndos;
-  // 轮数口径统一来自 lib/limits.js（与 SW 浮动聊天同一来源，不再两边手抄）
-  const MAX_ROUNDS = resolveLoopRounds(researchRoute.policy, AGENT_MAX_ROUNDS);
-  const WRAP_HINT_ROUND = resolveWrapRound(researchRoute.policy, AGENT_WRAP_HINT_ROUND);
+  const MAX_ROUNDS = roundCaps.maxRounds;
+  const WRAP_HINT_ROUND = roundCaps.wrapHintRound;
   const turnStartedAt = Date.now();
   const turnMessages = []; // assistant+tool messages from this turn, saved to chatHistory after
   let overflowRecovered = false; // 上下文超限自动恢复只做一次，防死循环
@@ -2752,7 +2894,7 @@ async function sendChatMessage(text, opts = {}) {
         alreadyFinalized = true;
         paintThinking(run, '正在根据已有材料写回答');
       } else if (!alreadyFinalized && WRAP_HINT_ROUND > 0 && round === WRAP_HINT_ROUND) {
-        messages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
+        messages.push({ role: 'system', content: WRAP_HINT_APPROACHING });
       }
       // 每轮复位：让本轮首 chunk 能清文字+设 orb。
       // 曾是整个 turn 一次（firstChunkReceived 不复位），导致多轮工具后流式正文期间
@@ -3420,8 +3562,16 @@ chatMessagesEl?.addEventListener('click', (e) => {
   const bubble = btn.closest('.chat-msg.queued');
   if (!bubble) return;
   const id = bubble.dataset.queueId;
-  chatQueue = chatQueue.filter(q => q.id !== id);
+  const run = ensureRun(currentProject);
+  const item = run.queue.find((q) => q.id === id) || chatQueue.find((q) => q.id === id);
+  run.queue = run.queue.filter((q) => q.id !== id);
+  chatQueue = run.queue;
   bubble.remove();
+  if (item && item.heartbeatTaskId) {
+    markHeartbeatFinished(item.heartbeatTaskId, {
+      ok: false, error: '已取消', runStartedAt: item.heartbeatRunStartedAt,
+    }).catch(() => {});
+  }
 });
 
 // 输入框随内容增高。先把高度收到 0 再量 scrollHeight，避免 max-height / flex 把测量值卡住。
@@ -3735,12 +3885,18 @@ async function refreshEntriesAndRender() {
   }
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.type === 'COLLECTION_STATUS_CHANGED') {
     refreshEntriesAndRender();
   }
   if (message && (message.type === 'HEARTBEAT_RUN_FINISHED' || message.type === 'HEARTBEAT_RUN_STARTED')) {
     syncHeartbeatLivePids().catch(() => {});
+  }
+  if (message && message.type === 'HEARTBEAT_OFFER') {
+    takeHeartbeatOffer(message.task)
+      .then((taken) => sendResponse({ taken: !!taken }))
+      .catch(() => sendResponse({ taken: false }));
+    return true;
   }
 });
 
@@ -4825,7 +4981,7 @@ async function initSettings() {
   const autoEl = document.getElementById('feedAutoTranslate');
   const langEl = document.getElementById('feedTargetLang');
   if (autoEl) autoEl.checked = !!prefs.defaultAutoTranslate;
-  if (langEl) langEl.value = prefs.defaultTargetLanguage || 'zh-Hans';
+  if (langEl) langEl.value = prefs.defaultTargetLanguage || 'auto';
   const provEl = document.getElementById('translateProvider');
   if (provEl) provEl.value = prefs.translateProvider || 'google';
   const tIdEl = document.getElementById('tencentSecretId');
@@ -4872,6 +5028,21 @@ async function initSettings() {
       scaleEl.addEventListener('change', async () => {
         await setUiScale(scaleEl.value);
         showSettingsStatus('uiScaleStatus', '已应用', 'success');
+      });
+    }
+  }
+
+  const localeEl = document.getElementById('uiLocaleSelect');
+  if (localeEl) {
+    localeEl.value = getUiLocalePref();
+    if (!localeEl.dataset.bound) {
+      localeEl.dataset.bound = '1';
+      localeEl.addEventListener('change', async () => {
+        await setUiLocalePref(localeEl.value);
+        applyDomI18n(document);
+        remountSettingsTabs();
+        workspaceApi?.refresh?.().catch(() => {});
+        showSettingsStatus('colorSchemeStatus', t('settings.uiLang') === '界面语言' ? '已应用' : 'Applied', 'success');
       });
     }
   }
@@ -6186,10 +6357,14 @@ async function renderSubagentSettings() {
   const pEl = document.getElementById('sgMaxParallel');
   const tEl = document.getElementById('sgMaxTabs');
   const btEl = document.getElementById('sgBudgetTokens');
+  const mainREl = document.getElementById('sgMainMaxRounds');
+  const subREl = document.getElementById('sgSubMaxRounds');
   const ckSel = document.getElementById('sgCheckChannel');
   if (pEl && limits) pEl.value = limits.maxParallel;
   if (tEl && limits) tEl.value = limits.maxTabs;
   if (btEl && limits) btEl.value = limits.budgetTokens;
+  if (mainREl && limits) mainREl.value = limits.mainMaxRounds;
+  if (subREl && limits) subREl.value = limits.subMaxRounds;
   if (ckSel) {
     const chans = await getAiChannels().catch(() => []);
     ckSel.innerHTML = '<option value="">跟随子代理所用模型（不推荐）</option>' +
@@ -6255,10 +6430,10 @@ async function saveCustomSubagentFromForm() {
 }
 
 const SETTINGS_TABS = [
-  { id: 'talk', label: '对话' },
-  { id: 'feed', label: '订阅' },
-  { id: 'look', label: '界面' },
-  { id: 'keep', label: '维护' },
+  { id: 'talk', get label() { return t('settings.tab.talk'); } },
+  { id: 'feed', get label() { return t('settings.tab.feed'); } },
+  { id: 'look', get label() { return t('settings.tab.look'); } },
+  { id: 'keep', get label() { return t('settings.tab.keep'); } },
 ];
 const SETTINGS_PANE_KEY = 'citecat.settingsPane';
 const settingsPaneScroll = new Map();
@@ -6304,6 +6479,14 @@ function showSettingsPane(id) {
   placeSettingsTabPill();
 }
 
+function remountSettingsTabs() {
+  const bar = document.getElementById('settingsTabBar');
+  if (!bar) return;
+  delete bar.dataset.ready;
+  bar.innerHTML = '';
+  mountSettingsTabs();
+}
+
 function mountSettingsTabs() {
   const bar = document.getElementById('settingsTabBar');
   if (!bar || bar.dataset.ready) return;
@@ -6336,6 +6519,10 @@ function mountSettingsTabs() {
 
 // 设置面板此时还是 display:none，滑块等打开后再量。先把标签画上，避免等数据时出现空轨道。
 mountSettingsTabs();
+initI18n().then(() => {
+  applyDomI18n(document);
+  remountSettingsTabs();
+}).catch(() => {});
 
 function bindSettingsEvents() {
   if (settingsEventsBound) return;
@@ -6352,33 +6539,76 @@ function bindSettingsEvents() {
     });
   }
 
-  // 数据维护：清空所有库内容（保留 AI 记忆与订阅）
+  // 数据维护：删除所有项目（默认库清空后保留；顺带清掉跨项目残留心跳）
   const purgeAllBtn = document.getElementById('purgeAllLibraryBtn');
   if (purgeAllBtn) {
     purgeAllBtn.addEventListener('click', async () => {
       const status = document.getElementById('purgeAllStatus');
-      const ids = projects.map((p) => p.id);
-      if (!ids.length) { if (status) status.textContent = '没有库'; return; }
+      const savedProjects = projects.slice();
+      const savedCurrent = currentProject;
+      const ids = [...new Set([...savedProjects.map((p) => p.id), 'default'])];
+      const extraCount = savedProjects.filter((p) => p.id !== 'default').length;
       purgeAllBtn.disabled = true;
-      if (status) status.textContent = '正在清空…';
+      if (status) status.textContent = '正在删除…';
       try {
+        try { await chrome.runtime.sendMessage({ type: 'HEARTBEAT_ABORT_ALL' }); } catch (_) {}
+        const hbAll = await listHeartbeatTasks().catch(() => []);
+        for (const t of hbAll) {
+          if (t && t.id) await abortHeartbeatTask(t.id);
+        }
+        stopAllProjectRuns();
+
         const snaps = await purgeProjects(ids);
+        const leftoverHb = await purgeAllHeartbeatTasks();
+
+        const defaultProj = savedProjects.find((p) => p.id === 'default') || { id: 'default', name: '默认' };
+        projects = [defaultProj];
+        currentProject = 'default';
+        await chrome.storage.sync.set({ projects, currentProject });
+
+        resetChatRuntimeState();
+        selectedIds.clear();
         entries = await getEntries(currentProject);
+        await restoreChatWidth();
+        await restoreLibCollapsed();
+        await loadChatSession();
+        adoptVisible(ensureRun(currentProject));
+        if (workspaceApi) await workspaceApi.projectChanged();
+        syncHeartbeatUi();
+        renderChat();
         render();
         renderProjects();
         notifyCollectionStatusChanged({ refreshAll: true });
-        const total = snaps.reduce((n, s) => n + (s.entries || []).length, 0);
-        if (status) status.textContent = `已清空 ${total} 个条目（${snaps.length} 个库）`;
-        showUndoToast(`已清空 ${snaps.length} 个库的全部内容`, async () => {
+
+        if (status) {
+          status.textContent = extraCount
+            ? `已删除 ${extraCount} 个项目，默认库已清空`
+            : '已清空默认项目（含全部心跳任务）';
+        }
+        showUndoToast('已删除全部项目', async () => {
+          projects = savedProjects;
+          currentProject = savedCurrent;
+          await chrome.storage.sync.set({ projects, currentProject });
           await restoreProjects(snaps);
+          await restoreHeartbeatTasks(leftoverHb);
+          resetChatRuntimeState();
+          projectRuns.clear();
+          selectedIds.clear();
           entries = await getEntries(currentProject);
+          await restoreChatWidth();
+          await restoreLibCollapsed();
+          await loadChatSession();
+          adoptVisible(ensureRun(currentProject));
+          if (workspaceApi) await workspaceApi.projectChanged();
+          syncHeartbeatUi();
+          renderChat();
           render();
           renderProjects();
           notifyCollectionStatusChanged({ refreshAll: true });
           if (status) status.textContent = '已撤销';
         });
       } catch (err) {
-        if (status) status.textContent = '清空失败：' + ((err && err.message) || err);
+        if (status) status.textContent = '删除失败：' + ((err && err.message) || err);
       } finally {
         purgeAllBtn.disabled = false;
       }
@@ -6392,14 +6622,20 @@ function bindSettingsEvents() {
         maxParallel: document.getElementById('sgMaxParallel')?.value,
         maxTabs: document.getElementById('sgMaxTabs')?.value,
         budgetTokens: document.getElementById('sgBudgetTokens')?.value,
+        mainMaxRounds: document.getElementById('sgMainMaxRounds')?.value,
+        subMaxRounds: document.getElementById('sgSubMaxRounds')?.value,
         checkChannelId: document.getElementById('sgCheckChannel')?.value ?? undefined,
       });
       const pEl = document.getElementById('sgMaxParallel');
       const tEl = document.getElementById('sgMaxTabs');
       const btEl = document.getElementById('sgBudgetTokens');
+      const mainREl = document.getElementById('sgMainMaxRounds');
+      const subREl = document.getElementById('sgSubMaxRounds');
       if (pEl) pEl.value = next.maxParallel;
       if (tEl) tEl.value = next.maxTabs;
       if (btEl) btEl.value = next.budgetTokens;
+      if (mainREl) mainREl.value = next.mainMaxRounds;
+      if (subREl) subREl.value = next.subMaxRounds;
       showSettingsStatus('sgLimitsStatus', '已保存', 'success');
     });
   }

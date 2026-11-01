@@ -33,15 +33,15 @@ import { buildChatTools } from '../lib/tools.js';
 import { listAgents, formatAgentCatalog, parseAgentMentions } from '../lib/subagent.js';
 import { recoverParentLlmCall, waitForLiveChildren, abortAndSettleChildren, hasLiveChildren } from '../lib/run-settle.js';
 import { loadConnectors, formatApiCatalog } from '../lib/api-call.js';
-import { AGENT_MAX_ROUNDS, AGENT_WRAP_HINT_ROUND } from '../lib/limits.js';
 import {
-  routeResearchMode, resolveLoopRounds, resolveWrapRound, nextResearchHold,
+  routeResearchMode, resolveTurnRoundCaps, nextResearchHold,
   toolsForResearchStep, researchCarryFromHistory, RESEARCH_CHILD_WAIT_MS,
 } from '../lib/research-mode.js';
 import {
   inspectTurnBudget,
   shouldFinalizeEmptyAnswer,
   FINALIZE_EMPTY_AFTER_TOOLS,
+  WRAP_HINT_APPROACHING,
   emptyToolFallbackText,
 } from '../lib/agent-finalize.js';
 import { usageTotalTokens } from '../lib/usage.js';
@@ -52,8 +52,10 @@ import * as docEditService from './doc-edit-service.js';
 import {
   HEARTBEAT_ALARM, HEARTBEAT_STALE_RUNNING_MS, claimDueHeartbeatTasks, ensureHeartbeatAlarm, queuedOrDueCount,
   heartbeatUserText, heartbeatProjectId, heartbeatSessionsKey, heartbeatInboxKey,
-  markHeartbeatFinished, getHeartbeatTask,
+  markHeartbeatFinished, getHeartbeatTask, adoptHeartbeatRun,
 } from '../lib/heartbeat.js';
+import { resolveTargetLanguage } from '../lib/locale.js';
+import { initI18n } from '../lib/i18n.js';
 
 const FEED_REFRESH_ALARM = 'citecat-feed-refresh';
 const INDEX_BUILD_ALARM = 'citecat-index-build';
@@ -210,7 +212,7 @@ async function getFeedPrefs() {
     defaultFetchFrom: null,
     defaultFetchTo: null,
     defaultAutoTranslate: false,
-    defaultTargetLanguage: 'zh-Hans',
+    defaultTargetLanguage: 'auto',
     rsshubInstance: 'https://rsshub.app',
     translateProvider: 'google',          // 'google' | 'tencent' | 'local'
     tencentSecretId: '',
@@ -218,6 +220,10 @@ async function getFeedPrefs() {
     tencentRegion: 'ap-shanghai',
     ...(prefs || {}),
   };
+}
+
+function feedTargetLang(prefs) {
+  return resolveTargetLanguage(prefs && prefs.defaultTargetLanguage);
 }
 
 // Inject global defaults provider into feed-fetcher
@@ -346,16 +352,64 @@ async function persistHeartbeatRun({
         updatedAt: now,
       };
       patch[sessionsKey] = sessions;
+      inbox.push(userMsg, aiMsg);
+      patch[inboxKey] = inbox.slice(-200);
     }
-
-    inbox.push(userMsg, aiMsg);
-    patch[inboxKey] = inbox.slice(-200);
-    await chrome.storage.local.set(patch);
+    if (Object.keys(patch).length) await chrome.storage.local.set(patch);
   });
 }
 
+const activeHeartbeatControllers = new Map();
+
+function abortHeartbeatController(taskId) {
+  const c = activeHeartbeatControllers.get(taskId);
+  if (!c) return false;
+  try { c.abort(); } catch (_) {}
+  activeHeartbeatControllers.delete(taskId);
+  return true;
+}
+
+function abortAllHeartbeatControllers() {
+  for (const c of activeHeartbeatControllers.values()) {
+    try { c.abort(); } catch (_) {}
+  }
+  activeHeartbeatControllers.clear();
+}
+
+async function heartbeatHostIsOpen() {
+  try {
+    if (!chrome.runtime.getContexts) return true;
+    const ctxs = await chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL', 'TAB'] });
+    return (ctxs || []).some((ctx) => {
+      if (ctx.contextType === 'SIDE_PANEL') return true;
+      const u = String(ctx.documentUrl || '');
+      return /\/(?:src\/)?sidepanel\/index\.html(?:[?#]|$)/.test(u);
+    });
+  } catch (_) {
+    return true;
+  }
+}
+
+/** 叫醒侧栏：有宿主就让它把这一轮当普通发送；没人接再由 SW 自己跑。 */
+async function offerHeartbeatToForeground(task) {
+  if (!(await heartbeatHostIsOpen())) return;
+  try {
+    await Promise.race([
+      chrome.runtime.sendMessage({ type: 'HEARTBEAT_OFFER', task }),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
+  } catch (_) {}
+}
+
+async function dispatchHeartbeatTask(task) {
+  await offerHeartbeatToForeground(task);
+  const mine = await adoptHeartbeatRun(task.id, 'sw');
+  if (!mine) return;
+  await runHeartbeatTaskInBackground(task);
+}
+
 /**
- * 心跳后台执行器：不依赖侧栏是否打开。
+ * 心跳后台执行器：侧栏没接这一轮时才跑。
  * 每个任务有自己的线程历史；多任务由 tickHeartbeats 并行启动。
  */
 async function runHeartbeatTaskInBackground(task) {
@@ -372,11 +426,15 @@ async function runHeartbeatTaskInBackground(task) {
   let assistantText = '';
   let runOk = true;
   let runError = '';
-  let controller = null;
+  let controller = new AbortController();
   let ctx = null;
+  activeHeartbeatControllers.set(task.id, controller);
 
   // claim 到真正启动之间用户可能删了任务；删了就不要白跑一轮。
-  if (!(await getHeartbeatTask(task.id).catch(() => null))) return;
+  if (!(await getHeartbeatTask(task.id).catch(() => null))) {
+    activeHeartbeatControllers.delete(task.id);
+    return;
+  }
 
   try {
     const sent = chrome.runtime.sendMessage({
@@ -424,7 +482,8 @@ async function runHeartbeatTaskInBackground(task) {
     const currentTabInfo = browsing && isReadableTab(browsing)
       ? `${browsing.url || ''}\n${String(browsing.title || '').slice(0, 100)}`
       : '';
-    const { maxParallel } = await getSubagentLimits().catch(() => ({ maxParallel: undefined }));
+    const agentLimits = await getSubagentLimits().catch(() => ({}));
+    const { maxParallel } = agentLimits;
     const agents = await listAgents().catch(() => []);
     const mentionedAgents = parseAgentMentions(userText, agents.map((a) => a.name));
     const memories = await retrieveMemories(userText, { currentUrl: (browsing && browsing.url) || '' });
@@ -436,6 +495,8 @@ async function runHeartbeatTaskInBackground(task) {
     const researchRoute = routeResearchMode(userText, {
       unfinishedResearch: researchCarryFromHistory(history.slice(0, -1)),
     });
+    const hbRoundCaps = resolveTurnRoundCaps(researchRoute.policy, agentLimits.mainMaxRounds);
+    researchRoute.maxRounds = Number.isFinite(hbRoundCaps.maxRounds) ? hbRoundCaps.maxRounds : 0;
     const preamble = buildDynamicPreamble({
       entryDigest: buildEntriesDigest(entries, new Set(), 40),
       selectedIdList: '',
@@ -454,7 +515,6 @@ async function runHeartbeatTaskInBackground(task) {
       researchRoute,
     });
 
-    controller = new AbortController();
     const { signal } = controller;
     let pendingCollect = null;
     let pendingSuggestions = null;
@@ -531,8 +591,8 @@ async function runHeartbeatTaskInBackground(task) {
     callMessages.push(lastUser);
 
     const chatTools = buildChatTools(agents, { maxParallel });
-    const hbMaxRounds = resolveLoopRounds(researchRoute.policy, AGENT_MAX_ROUNDS);
-    const hbWrapRound = resolveWrapRound(researchRoute.policy, AGENT_WRAP_HINT_ROUND);
+    const hbMaxRounds = hbRoundCaps.maxRounds;
+    const hbWrapRound = hbRoundCaps.wrapHintRound;
     const hbTurnStart = callMessages.length;
     let turnDone = false;
     let alreadyFinalized = false;
@@ -542,12 +602,16 @@ async function runHeartbeatTaskInBackground(task) {
     let researchTools = null;
     for (let round = 0; round < hbMaxRounds; round++) {
       if (signal.aborted) throw new Error('已中断');
+      const live = await getHeartbeatTask(task.id).catch(() => null);
+      if (!live || live.enabled === false || live.lastStatus !== 'running') {
+        throw new Error('已中断');
+      }
       const budget = inspectTurnBudget(researchRoute.policy, { round, maxRounds: hbMaxRounds });
       if (budget.finalize && !alreadyFinalized) {
         callMessages.push({ role: 'system', content: budget.reason });
         alreadyFinalized = true;
       } else if (!alreadyFinalized && hbWrapRound > 0 && round === hbWrapRound) {
-        callMessages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
+        callMessages.push({ role: 'system', content: WRAP_HINT_APPROACHING });
       }
       let roundText = '';
       const rec = await recoverParentLlmCall(
@@ -658,15 +722,20 @@ async function runHeartbeatTaskInBackground(task) {
     history.push({ role: 'assistant', content: assistantText });
   } finally {
     try { controller?.abort(); } catch (_) {}
+    activeHeartbeatControllers.delete(task.id);
     clearInterval(keepAlive);
     const endedAt = Date.now();
     // 子任务停干净后再改 lastStatus / 写失败气泡，避免「显示失败了、任务还在进行」。
     try {
-      await markHeartbeatFinished(task.id, { ok: runOk, error: runError, result: assistantText });
+      await markHeartbeatFinished(task.id, {
+        ok: runOk, error: runError, result: assistantText, runStartedAt: task.runStartedAt,
+      });
     } catch (err) {
       console.warn('[SW] mark heartbeat finished failed:', err);
       try {
-        await markHeartbeatFinished(task.id, { ok: runOk, error: runError, result: assistantText });
+        await markHeartbeatFinished(task.id, {
+          ok: runOk, error: runError, result: assistantText, runStartedAt: task.runStartedAt,
+        });
       } catch (err2) {
         console.warn('[SW] mark heartbeat finished retry failed:', err2);
       }
@@ -711,9 +780,9 @@ async function tickHeartbeats() {
     await updateHeartbeatBadge();
     return;
   }
-  // 同一批到期任务并行启动，后续 alarm tick 也可以继续领取新到期任务。
+  // 先叫醒侧栏当普通发送；没人接再后台跑。后续 alarm tick 仍可领取新到期任务。
   for (const task of claimed) {
-    const run = runHeartbeatTaskInBackground(task)
+    const run = dispatchHeartbeatTask(task)
       .catch((err) => console.warn('[SW] heartbeat run failed:', task.id, err))
       .finally(() => {
         activeHeartbeatRuns.delete(run);
@@ -759,7 +828,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (due.length === 0) return;
   await refreshFeeds(due.map((f) => f.id));
   if (prefs.defaultTargetLanguage) {
-    runBackfill(prefs.defaultTargetLanguage).catch(() => {});
+    runBackfill(feedTargetLang(prefs)).catch(() => {});
   }
 });
 
@@ -769,6 +838,7 @@ async function initOnStartup() {
   try {
     // Step 0: 后台 tab 会话池的 CDP 事件分发（onEvent/onDetach 路由）
     initDebuggerDispatch();
+    await initI18n().catch(() => {});
 
     // Step 1: syncTranslateProvider must finish before runBackfill uses it
     await syncTranslateProvider();
@@ -794,7 +864,7 @@ async function initOnStartup() {
     const prefs = await getFeedPrefs();
     if (prefs.defaultTargetLanguage) {
       tasks.push(
-        runBackfill(prefs.defaultTargetLanguage).catch((err) =>
+        runBackfill(feedTargetLang(prefs)).catch((err) =>
           console.warn('[SW] initial backfill failed:', err)
         )
       );
@@ -1403,7 +1473,10 @@ chrome.runtime.onConnect.addListener((port) => {
         selectedCount,
         unfinishedResearch: researchCarryFromHistory(portState.messages),
       });
-      const { maxParallel } = await getSubagentLimits().catch(() => ({ maxParallel: undefined }));
+      const agentLimits = await getSubagentLimits().catch(() => ({}));
+      const { maxParallel } = agentLimits;
+      const roundCaps = resolveTurnRoundCaps(researchRoute.policy, agentLimits.mainMaxRounds);
+      researchRoute.maxRounds = Number.isFinite(roundCaps.maxRounds) ? roundCaps.maxRounds : 0;
       if (!live()) return;
 
       // 动态前言（与侧栏 buildDynamicContext 同源；tab 信息用发起聊天的页面）
@@ -1475,8 +1548,8 @@ chrome.runtime.onConnect.addListener((port) => {
 
       // ---- 工具循环（与侧栏 sendMessage 同构）----
       const rp = researchRoute.policy || {};
-      const maxRounds = resolveLoopRounds(rp, AGENT_MAX_ROUNDS);
-      const wrapRound = resolveWrapRound(rp, AGENT_WRAP_HINT_ROUND);
+      const maxRounds = roundCaps.maxRounds;
+      const wrapRound = roundCaps.wrapHintRound;
       const researchTurnStart = callMessages.length;
       let alreadyFinalized = false;
       let llmRecoveries = 0;
@@ -1495,7 +1568,7 @@ chrome.runtime.onConnect.addListener((port) => {
           callMessages.push({ role: 'system', content: budget.reason });
           alreadyFinalized = true;
         } else if (!alreadyFinalized && wrapRound > 0 && round === wrapRound) {
-          callMessages.push({ role: 'system', content: '已接近工具调用次数上限。请基于已获取的信息尽快给出最终回答，仅在确有必要时再调用一次工具。' });
+          callMessages.push({ role: 'system', content: WRAP_HINT_APPROACHING });
         }
         roundText = '';
         const rec = await recoverParentLlmCall(
@@ -1866,7 +1939,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     case 'TRANSLATE_RUN':
       getFeedPrefs().then((prefs) => {
-        runBackfill(prefs.defaultTargetLanguage).catch((err) => console.warn('[SW] backfill failed:', err));
+        runBackfill(feedTargetLang(prefs)).catch((err) => console.warn('[SW] backfill failed:', err));
         sendResponse({ success: true });
       });
       return true;
@@ -1880,8 +1953,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'TRANSLATE_RETRY_FAILED':
       (async () => {
         const prefs = await getFeedPrefs();
-        const n = await resetTranslateFailures(prefs.defaultTargetLanguage);
-        runBackfill(prefs.defaultTargetLanguage).catch(() => {});
+        const n = await resetTranslateFailures(feedTargetLang(prefs));
+        runBackfill(feedTargetLang(prefs)).catch(() => {});
         return { success: true, reset: n };
       })().then(sendResponse).catch((err) => sendResponse({ success: false, error: err.message }));
       return true;
@@ -1918,6 +1991,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ts: Date.now(),
         });
       }
+      return false;
+    }
+    case 'HEARTBEAT_ABORT': {
+      const taskId = message.taskId || (message.data && message.data.taskId);
+      abortHeartbeatController(taskId);
+      sendResponse({ ok: true });
+      return false;
+    }
+    case 'HEARTBEAT_ABORT_ALL': {
+      abortAllHeartbeatControllers();
+      sendResponse({ ok: true });
       return false;
     }
     case 'READER_SESSION_GET':
@@ -2808,7 +2892,7 @@ async function handleFeedRefreshOne({ feedId }) {
   try {
     const result = await refreshFeed(feedId);
     const prefs = await getFeedPrefs();
-    if (prefs.defaultTargetLanguage) runBackfill(prefs.defaultTargetLanguage).catch(() => {});
+    if (prefs.defaultTargetLanguage) runBackfill(feedTargetLang(prefs)).catch(() => {});
     return { success: true, ...result };
   } catch (err) {
     return { success: false, error: err.message };
@@ -2826,7 +2910,7 @@ async function handleFeedRefreshAll({ scope, feedIds } = {}) {
   const inserted = results.reduce((s, r) => s + (r.inserted || 0), 0);
   const errors = results.filter((r) => !r.ok).length;
   const prefs = await getFeedPrefs();
-  if (prefs.defaultTargetLanguage) runBackfill(prefs.defaultTargetLanguage).catch(() => {});
+  if (prefs.defaultTargetLanguage) runBackfill(feedTargetLang(prefs)).catch(() => {});
   return { success: true, results, inserted, errors, total: results.length };
 }
 
@@ -2897,7 +2981,7 @@ async function handleFeedItemFetchFull({ itemId, force }) {
   await updateItemFullText(itemId, resp.content, true);
   // Trigger backfill so fullText gets translated too
   const prefs = await getFeedPrefs();
-  if (prefs.defaultTargetLanguage) runBackfill(prefs.defaultTargetLanguage).catch(() => {});
+  if (prefs.defaultTargetLanguage) runBackfill(feedTargetLang(prefs)).catch(() => {});
   return { success: true, fullText: resp.content, title: resp.title, publishedAt: resp.publishedAt, cached: false };
 }
 
@@ -3080,16 +3164,18 @@ async function handleFeedSetPrefs({ prefs }) {
   // Reload translation provider config (covers provider/key/region changes)
   await syncTranslateProvider();
   // Target language changed - run backfill so existing items get re-translated
-  if (prefs && prefs.defaultTargetLanguage && prefs.defaultTargetLanguage !== before.defaultTargetLanguage) {
-    runBackfill(merged.defaultTargetLanguage).catch((err) => console.warn('[SW] backfill on lang change failed:', err));
+  const beforeLang = feedTargetLang(before);
+  const afterLang = feedTargetLang(merged);
+  if (prefs && prefs.defaultTargetLanguage && afterLang !== beforeLang) {
+    runBackfill(afterLang).catch((err) => console.warn('[SW] backfill on lang change failed:', err));
   } else if (prefs && prefs.defaultAutoTranslate && !before.defaultAutoTranslate) {
-    runBackfill(merged.defaultTargetLanguage).catch((err) => console.warn('[SW] backfill on enable failed:', err));
+    runBackfill(afterLang).catch((err) => console.warn('[SW] backfill on enable failed:', err));
   } else if (prefs && (prefs.translateProvider !== undefined || prefs.tencentSecretId !== undefined || prefs.tencentSecretKey !== undefined)) {
     // Provider/credentials changed → reset failure counts so previously-failed
     // items retry under the new provider, then restart backfill.
-    const reset = await resetTranslateFailures(merged.defaultTargetLanguage).catch(() => 0);
+    const reset = await resetTranslateFailures(afterLang).catch(() => 0);
     console.log('[SW] translate provider changed, reset', reset, 'failed items');
-    runBackfill(merged.defaultTargetLanguage).catch(() => {});
+    runBackfill(afterLang).catch(() => {});
   }
   return { success: true, prefs: merged };
 }
@@ -3108,7 +3194,7 @@ async function handleTestTranslateProvider({ provider, tencent } = {}) {
     }
     const result = await testCloudProvider({
       provider: provider || 'google',
-      targetLanguage: 'zh-Hans',
+      targetLanguage: feedTargetLang(await getFeedPrefs()),
       tencent: creds,
     });
     return { success: true, ok: result.ok, sample: result.sample, error: result.error };
